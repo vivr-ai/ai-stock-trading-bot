@@ -1,0 +1,14 @@
+# Railway deployment config. See DEPLOYMENT.md for the full setup walkthrough
+# (required env vars, and the Volume you need for persistent state/logs).
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python main.py"
+# If the process does exit unexpectedly, Railway restarts it. The bot itself
+# also self-heals from most transient failures (see bot/utils/retry.py and
+# bot/scheduler.py's supervisor loop) — this is a last-resort safety net, not
+# the primary resilience mechanism.
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

@@ -1,0 +1,413 @@
+"""One strategy cycle.
+
+Per cycle:
+  1. Build the candidate universe (static, or top-N most mentioned).
+  2. Snapshot the account once (with retries). If that fails, skip the cycle.
+  3. Detect names that exited since last cycle (bracket fills) -> cooldown +
+     realized P/L logged to the closed-trade ledger.
+  4. Check the market filters (don't buy into a falling market / below its
+     long-term trend).
+  5. For each symbol: headlines -> sentiment -> confirmation filters -> risk
+     -> order/log.
+  6. Append a cycle line to the daily summary log.
+
+Buy rule (ALL must hold):
+  * market not down more than market_filter_max_drop_pct today, AND SPY (or
+    the configured proxy) is above its own market_regime_ma_period-day SMA
+  * not already held, no live order pending, not in re-entry cooldown
+  * sentiment score >= buy_threshold (+8) with >= min_headlines (5) headlines
+  * price above its sma_period-day SMA (require_price_above_sma)
+  * today's volume >= min_volume_ratio x its volume_lookback_days-day average
+  * NOT already up more than max_intraday_runup_pct since yesterday's close
+  * under the per-cycle new-position cap AND the per-sector cap
+  * passes the risk manager (size, position count, exposure cap)
+
+Sell rule:
+  * held AND score < sell_threshold (-5) AND >= sell_min_headlines headlines
+  * the -10% / +20% price exits are GTC bracket legs that fire at Alpaca;
+    when they fire, the position simply "disappears" between cycles — caught
+    by BotState.detect_exits() and logged to the closed-trade ledger from
+    there, since we didn't place that closing order ourselves.
+"""
+from __future__ import annotations
+
+import logging
+from collections import Counter
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+from ..universe.static_universe import sector_of
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CycleStats:
+    evaluated: int = 0
+    buys: int = 0
+    sells: int = 0
+    blocked: int = 0
+
+
+class SentimentStrategy:
+    def __init__(self, cfg, broker, universe, news, analyzer, risk,
+                 trade_logger, summary_logger, state, closed_trade_logger=None):
+        self.cfg = cfg
+        self.broker = broker
+        self.universe = universe
+        self.news = news
+        self.analyzer = analyzer
+        self.risk = risk
+        self.trade_logger = trade_logger
+        self.summary_logger = summary_logger
+        self.state = state
+        self.closed_trade_logger = closed_trade_logger
+
+    def run_cycle(self, force: bool = False) -> None:
+        if not force and not self.broker.is_market_open():
+            logger.info("Market closed; skipping cycle.")
+            return
+        if force:
+            logger.info("FORCE: running one cycle ignoring market hours (test mode).")
+
+        try:
+            acct = self.broker.account_snapshot()
+            open_positions = self.broker.open_positions()
+            pending = self.broker.pending_order_symbols()
+            exposure = self.broker.total_exposure()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Account snapshot failed; skipping this cycle: %s", exc)
+            return
+
+        exited = self.state.detect_exits(list(open_positions.keys()))
+        if exited:
+            logger.info("Detected exits since last cycle (cooldown started): %s",
+                        ", ".join(exited))
+            for sym in exited:
+                self._log_auto_exit(sym)
+
+        new_entries_allowed = not self.risk.daily_loss_breached(
+            acct["equity"], acct["last_equity"]
+        )
+        if not new_entries_allowed:
+            logger.warning("Daily loss limit breached; sentiment exits only this cycle.",
+                           extra={"decision": "block_new_entries", "reason": "daily_loss_limit"})
+
+        # Market filter 1: if the broad market is down hard today, don't open longs.
+        if new_entries_allowed and self.cfg.strategy.market_filter_max_drop_pct > 0:
+            mkt = self.broker.market_change_pct(self.cfg.strategy.market_filter_symbol)
+            if mkt is not None and mkt <= -self.cfg.strategy.market_filter_max_drop_pct:
+                logger.warning(
+                    "Market filter: %s down %.2f%% today; pausing new entries.",
+                    self.cfg.strategy.market_filter_symbol, mkt,
+                    extra={"decision": "block_new_entries", "reason": "intraday_drop",
+                           "symbol": self.cfg.strategy.market_filter_symbol, "change_pct": mkt},
+                )
+                new_entries_allowed = False
+
+        # Market filter 2 (regime): skip all new entries if the market proxy
+        # (SPY by default) is below its own long-term (50-day) SMA — i.e. the
+        # broad market is in a downtrend, not just a single bad day.
+        if new_entries_allowed and self.cfg.strategy.market_regime_filter_enabled:
+            spy_snap = self.broker.market_snapshot(
+                self.cfg.strategy.market_filter_symbol,
+                sma_period=self.cfg.strategy.market_regime_ma_period,
+                volume_lookback_days=self.cfg.strategy.market_regime_ma_period,
+            )
+            if spy_snap is None or spy_snap.sma is None:
+                logger.warning(
+                    "Market regime filter: could not read %s's %d-day SMA; "
+                    "pausing new entries (fail-closed).",
+                    self.cfg.strategy.market_filter_symbol, self.cfg.strategy.market_regime_ma_period,
+                    extra={"decision": "block_new_entries", "reason": "regime_data_unavailable"},
+                )
+                new_entries_allowed = False
+            elif spy_snap.last < spy_snap.sma:
+                logger.warning(
+                    "Market regime filter: %s (%.2f) below its %d-day SMA (%.2f); "
+                    "pausing new entries.",
+                    self.cfg.strategy.market_filter_symbol, spy_snap.last,
+                    self.cfg.strategy.market_regime_ma_period, spy_snap.sma,
+                    extra={"decision": "block_new_entries", "reason": "below_market_regime_sma",
+                           "symbol": self.cfg.strategy.market_filter_symbol,
+                           "price": spy_snap.last, "sma": spy_snap.sma},
+                )
+                new_entries_allowed = False
+
+        # Current sector concentration, so we don't pile into one correlated group.
+        sector_counts = Counter(sector_of(s) for s in open_positions)
+
+        symbols = self.universe.get_universe(self.cfg.universe.top_n)
+        stats = CycleStats()
+
+        for symbol in symbols:
+            try:
+                exposure = self._process_symbol(
+                    symbol, acct, exposure, open_positions, pending,
+                    sector_counts, new_entries_allowed, stats,
+                )
+            except Exception as exc:  # noqa: BLE001 - isolate per-symbol failures
+                logger.exception("Error processing %s: %s", symbol, exc,
+                                 extra={"symbol": symbol, "decision": "error"})
+
+        self.summary_logger.log_cycle(
+            portfolio_value=acct["portfolio_value"],
+            open_positions=len(open_positions),
+            exposure=exposure,
+            stats=stats,
+        )
+
+    def _log_auto_exit(self, symbol: str) -> None:
+        """A position vanished since last cycle without us closing it here —
+        almost always a bracket stop-loss/take-profit fill. Look up the fill
+        and log realized P/L against the open-lot entry we recorded at buy
+        time. If we already logged this exit ourselves (see _do_sell), the
+        open lot is already gone and this is a no-op."""
+        if self.closed_trade_logger is None:
+            return
+        lot = self.state.peek_open(symbol)
+        if lot is None:
+            return  # already closed out explicitly by _do_sell this run
+        fill = self.broker.last_fill(symbol, side="sell")
+        exit_price = fill.filled_avg_price if fill else self.broker.latest_price(symbol)
+        if exit_price is None:
+            logger.warning("Could not resolve exit price for auto-exited %s; "
+                           "leaving open-lot record for a later cycle.", symbol)
+            return
+        self.state.pop_open(symbol)
+        pnl = self.closed_trade_logger.log(
+            symbol, lot["qty"], lot["entry_price"], exit_price,
+            exit_reason="auto_exit (stop_loss_or_take_profit)", entry_time=lot.get("entry_time"),
+        )
+        logger.info("Closed trade (auto-exit) %s: entry=%.2f exit=%.2f pnl=%.2f",
+                    symbol, lot["entry_price"], exit_price, pnl,
+                    extra={"symbol": symbol, "decision": "closed_trade",
+                           "entry_price": lot["entry_price"], "exit_price": exit_price,
+                           "pnl": pnl, "exit_reason": "auto_exit"})
+
+    def _process_symbol(self, symbol, acct, exposure, open_positions, pending,
+                        sector_counts, new_entries_allowed, stats) -> float:
+        articles = self.news.fetch(
+            symbol, self.cfg.news.lookback_hours, self.cfg.news.max_articles_per_symbol
+        )
+        sentiment = self.analyzer.analyze(symbol, articles)
+        stats.evaluated += 1
+        logger.info(
+            "%s score=%.1f (%s) headlines=%d (+%d/-%d): %s",
+            symbol, sentiment.score, sentiment.label, sentiment.article_count,
+            sentiment.positive_count, sentiment.negative_count, sentiment.rationale,
+            extra={"symbol": symbol, "decision": "scan", "sentiment_score": sentiment.score,
+                   "sentiment_label": sentiment.label, "headline_count": sentiment.article_count,
+                   "positive_headlines": sentiment.positive_count,
+                   "negative_headlines": sentiment.negative_count},
+        )
+
+        holding = symbol in open_positions and open_positions[symbol] != 0
+
+        # ---- SELL (sentiment leg) ----
+        if holding and sentiment.score < self.cfg.strategy.sell_threshold:
+            if sentiment.article_count < self.cfg.strategy.sell_min_headlines:
+                logger.info("SELL %s skipped: only %d headlines (< %d); leaving price "
+                            "bracket to manage it", symbol, sentiment.article_count,
+                            self.cfg.strategy.sell_min_headlines,
+                            extra={"symbol": symbol, "decision": "sell_skipped",
+                                   "reason": "too_few_headlines"})
+                return exposure
+            self._do_sell(symbol, sentiment,
+                          reason=f"sentiment {sentiment.score:.1f} < {self.cfg.strategy.sell_threshold}")
+            self.state.mark_exit(symbol)
+            sector_counts[sector_of(symbol)] -= 1
+            stats.sells += 1
+            return exposure
+
+        # ---- BUY gates (cheap checks first, API calls last) ----
+        if holding or not new_entries_allowed:
+            return exposure
+        if sentiment.score < self.cfg.strategy.buy_threshold:
+            return exposure
+        if symbol in pending:
+            logger.info("BUY %s skipped: an order is already pending", symbol,
+                       extra={"symbol": symbol, "decision": "buy_skipped", "reason": "order_pending"})
+            return exposure
+        if self.state.in_cooldown(symbol, self.cfg.risk.reentry_cooldown_hours):
+            logger.info("BUY %s skipped: in re-entry cooldown", symbol,
+                       extra={"symbol": symbol, "decision": "buy_skipped", "reason": "cooldown"})
+            return exposure
+        if sentiment.article_count < self.cfg.strategy.min_headlines:
+            logger.info("BUY %s skipped: only %d headlines (< %d)",
+                        symbol, sentiment.article_count, self.cfg.strategy.min_headlines,
+                        extra={"symbol": symbol, "decision": "buy_skipped",
+                               "reason": "too_few_headlines"})
+            return exposure
+        if stats.buys >= self.cfg.risk.max_new_positions_per_cycle:
+            logger.info("BUY %s skipped: per-cycle new-position cap reached (%d)",
+                        symbol, self.cfg.risk.max_new_positions_per_cycle,
+                        extra={"symbol": symbol, "decision": "buy_skipped",
+                               "reason": "per_cycle_cap"})
+            return exposure
+        # Sector cap (skip the 'unknown' bucket so a custom universe isn't blocked).
+        sector = sector_of(symbol)
+        if (self.cfg.risk.max_positions_per_sector > 0 and sector != "unknown"
+                and sector_counts[sector] >= self.cfg.risk.max_positions_per_sector):
+            logger.info("BUY %s skipped: sector '%s' already at cap (%d)",
+                        symbol, sector, self.cfg.risk.max_positions_per_sector,
+                        extra={"symbol": symbol, "decision": "buy_skipped",
+                               "reason": "sector_cap", "sector": sector})
+            return exposure
+
+        # One data call gives price, gap-aware run-up, SMA, and volume ratio.
+        snap = self.broker.market_snapshot(
+            symbol, sma_period=self.cfg.strategy.sma_period,
+            volume_lookback_days=self.cfg.strategy.volume_lookback_days,
+        )
+        if snap is None:
+            return exposure
+
+        runup = snap.change_pct
+        if runup is not None and runup > self.cfg.strategy.max_intraday_runup_pct:
+            logger.info("BUY %s skipped: already up %.1f%% since prev close (> %.1f%%); "
+                        "news likely priced in", symbol, runup,
+                        self.cfg.strategy.max_intraday_runup_pct,
+                        extra={"symbol": symbol, "decision": "buy_skipped",
+                               "reason": "runup", "change_pct": runup})
+            return exposure
+
+        # --- Confirmation filter: price above its N-day SMA ---
+        if self.cfg.strategy.require_price_above_sma:
+            if snap.sma is None:
+                logger.info("BUY %s skipped: %d-day SMA unavailable (fail-closed)",
+                            symbol, self.cfg.strategy.sma_period,
+                            extra={"symbol": symbol, "decision": "buy_skipped",
+                                   "reason": "sma_unavailable"})
+                return exposure
+            if snap.last <= snap.sma:
+                logger.info("BUY %s skipped: price %.2f not above %d-day SMA %.2f",
+                            symbol, snap.last, self.cfg.strategy.sma_period, snap.sma,
+                            extra={"symbol": symbol, "decision": "buy_skipped",
+                                   "reason": "below_sma", "price": snap.last, "sma": snap.sma})
+                return exposure
+
+        # --- Confirmation filter: today's volume >= min_volume_ratio x avg ---
+        if self.cfg.strategy.min_volume_ratio > 0:
+            if snap.volume_ratio is None:
+                logger.info("BUY %s skipped: today's volume not yet confirmable "
+                           "vs %d-day average (fail-closed)",
+                            symbol, self.cfg.strategy.volume_lookback_days,
+                            extra={"symbol": symbol, "decision": "buy_skipped",
+                                   "reason": "volume_unavailable"})
+                return exposure
+            if snap.volume_ratio < self.cfg.strategy.min_volume_ratio:
+                logger.info("BUY %s skipped: volume ratio %.2fx < required %.2fx",
+                            symbol, snap.volume_ratio, self.cfg.strategy.min_volume_ratio,
+                            extra={"symbol": symbol, "decision": "buy_skipped",
+                                   "reason": "low_volume", "volume_ratio": snap.volume_ratio})
+                return exposure
+
+        return self._do_buy(symbol, sentiment, snap.last, acct, exposure,
+                            open_positions, sector_counts, stats)
+
+    def _do_buy(self, symbol, sentiment, price, acct, exposure, open_positions,
+                sector_counts, stats) -> float:
+        if price is None or price <= 0:
+            return exposure
+
+        decision = self.risk.evaluate(
+            symbol, price, acct["portfolio_value"], acct["buying_power"],
+            exposure, open_positions,
+        )
+        if not decision.approved:
+            logger.info("BUY %s blocked by risk: %s", symbol, decision.reason,
+                       extra={"symbol": symbol, "decision": "buy_blocked", "reason": decision.reason})
+            stats.blocked += 1
+            return exposure
+
+        plan = decision.plan
+        reason = (f"score {sentiment.score:.1f} >= {self.cfg.strategy.buy_threshold}, "
+                  f"{sentiment.article_count} headlines")
+
+        if self.cfg.risk.dry_run:
+            logger.info("[DRY RUN] would BUY %d %s @ ~%.2f (stop %.2f / tp %.2f)",
+                        plan.qty, symbol, plan.price, plan.stop_price, plan.take_profit_price,
+                        extra={"symbol": symbol, "decision": "buy", "dry_run": True,
+                               "qty": plan.qty, "price": plan.price, "notional": plan.notional})
+            self.trade_logger.log("buy", symbol, plan.qty, plan.price, plan.notional,
+                                  sentiment, plan.stop_price, plan.take_profit_price,
+                                  reason, dry_run=True, order_id="", status="dry_run")
+        else:
+            # Idempotency key stable within a 30-min slot, so a crash/restart or a
+            # second instance can't open a duplicate of the same intended entry.
+            slot = datetime.now(timezone.utc).strftime("%Y%m%d%H") + (
+                "00" if datetime.now(timezone.utc).minute < 30 else "30")
+            try:
+                order = self.broker.submit_bracket_buy(
+                    symbol, plan.qty, plan.stop_price, plan.take_profit_price,
+                    client_order_id=f"{symbol}-{slot}",
+                )
+            except Exception as exc:  # noqa: BLE001 - order failed even after retries
+                logger.error("BUY %s failed after retries: %s", symbol, exc,
+                            extra={"symbol": symbol, "decision": "buy_failed", "error": str(exc)})
+                return exposure
+            logger.info("Submitted BUY %s: order %s status %s",
+                        symbol, order.order_id, order.status,
+                        extra={"symbol": symbol, "decision": "buy", "dry_run": False,
+                               "qty": plan.qty, "price": plan.price, "notional": plan.notional,
+                               "order_id": order.order_id, "status": order.status})
+            self.trade_logger.log("buy", symbol, plan.qty, plan.price, plan.notional,
+                                  sentiment, plan.stop_price, plan.take_profit_price,
+                                  reason, dry_run=False, order_id=order.order_id,
+                                  status=order.status)
+
+        # Remember what we paid (real or simulated) so the performance report
+        # can compute P/L whenever this position eventually closes.
+        self.state.record_open(symbol, plan.price, plan.qty)
+
+        open_positions[symbol] = plan.qty
+        sector_counts[sector_of(symbol)] += 1
+        stats.buys += 1
+        return exposure + plan.notional
+
+    def _do_sell(self, symbol, sentiment, reason) -> None:
+        if self.cfg.risk.dry_run:
+            exit_price = self.broker.latest_price(symbol)
+            logger.info("[DRY RUN] would CLOSE %s (%s)", symbol, reason,
+                       extra={"symbol": symbol, "decision": "sell", "dry_run": True,
+                              "reason": reason})
+            self.trade_logger.log("sell", symbol, 0, 0.0, 0.0, sentiment, 0.0, 0.0,
+                                  reason, dry_run=True, order_id="", status="dry_run")
+            if self.closed_trade_logger is not None and exit_price is not None:
+                lot = self.state.pop_open(symbol)
+                if lot is not None:
+                    pnl = self.closed_trade_logger.log(
+                        symbol, lot["qty"], lot["entry_price"], exit_price,
+                        exit_reason=f"dry_run: {reason}", entry_time=lot.get("entry_time"),
+                    )
+                    logger.info("Closed trade (dry-run) %s: pnl=%.2f", symbol, pnl,
+                               extra={"symbol": symbol, "decision": "closed_trade",
+                                      "pnl": pnl, "dry_run": True})
+            return
+
+        order = self.broker.close_position(symbol)
+        if order is None:
+            logger.error("SELL %s failed (close_position returned no order)", symbol,
+                        extra={"symbol": symbol, "decision": "sell_failed"})
+            return
+        logger.info("Submitted CLOSE %s: order %s (%s)", symbol, order.order_id, reason,
+                    extra={"symbol": symbol, "decision": "sell", "dry_run": False,
+                           "order_id": order.order_id, "reason": reason})
+        self.trade_logger.log("sell", symbol, order.qty, 0.0, 0.0, sentiment, 0.0, 0.0,
+                              reason, dry_run=False, order_id=order.order_id,
+                              status=order.status)
+
+        if self.closed_trade_logger is not None:
+            exit_price = order.filled_avg_price or self.broker.latest_price(symbol)
+            lot = self.state.pop_open(symbol)
+            if lot is not None and exit_price is not None:
+                pnl = self.closed_trade_logger.log(
+                    symbol, lot["qty"], lot["entry_price"], exit_price,
+                    exit_reason=reason, entry_time=lot.get("entry_time"),
+                )
+                logger.info("Closed trade %s: entry=%.2f exit=%.2f pnl=%.2f",
+                            symbol, lot["entry_price"], exit_price, pnl,
+                            extra={"symbol": symbol, "decision": "closed_trade",
+                                   "entry_price": lot["entry_price"], "exit_price": exit_price,
+                                   "pnl": pnl})

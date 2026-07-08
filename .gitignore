@@ -1,0 +1,24 @@
+# Secrets / local config
+config.ini
+.env
+
+# Logs & data (all ephemeral runtime output — see DEPLOYMENT.md re: Railway Volumes)
+logs/*.csv
+logs/*.log
+logs/*.json
+logs/reports/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

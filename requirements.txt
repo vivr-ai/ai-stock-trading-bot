@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------
+# Python 3.14 note:
+#   The code is 3.14-compatible. The only install risk on a brand-new Python
+#   is alpaca-py's dependency on pydantic-core (a compiled Rust package) — old
+#   pydantic releases have no 3.14 wheels and try to build from source.
+#   So on 3.14:  python -m pip install -U pip   FIRST, then install below.
+#   Use the LATEST alpaca-py (it pulls a pydantic with 3.14 wheels).
+#   If pydantic-core still fails to build, use Python 3.12 or 3.13 instead.
+#
+# All providers are installed unconditionally (not just the "simplified
+# mode" defaults). Provider selection is now controlled entirely by
+# environment variables at RUNTIME (NEWS_PROVIDER, SENTIMENT_PROVIDER, ...),
+# and on a platform like Railway you can't conditionally pip-install based on
+# a variable you might change later without triggering a new build — so
+# every optional dependency ships in the image, and the ones you don't use
+# just sit there unused (a few MB, not worth the deploy fragility of
+# "change an env var, forget you also need a new build").
+# ---------------------------------------------------------------------------
+
+# ---- Core ---------------------------------------------------------------
+alpaca-py>=0.42         # use the newest; older pins may block Python 3.14
+APScheduler>=3.11
+tzdata>=2024.1          # timezone data for the market-hours cron
+
+# ---- News providers (finnhub / newsapi) + universe 'mention' provider ---
+requests>=2.31
+
+# ---- Optional sentiment providers ----------------------------------------
+anthropic>=0.40         # sentiment.provider = claude
+openai>=1.40            # sentiment.provider = openai
