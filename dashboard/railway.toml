@@ -4,7 +4,7 @@
 # See ../DASHBOARD_DEPLOYMENT.md for the full walkthrough.
 
 [build]
-builder = "NIXPACKS"
+builder = "RAILPACK"
 
 [deploy]
 startCommand = "npm run start"
