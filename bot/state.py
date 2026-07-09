@@ -89,11 +89,16 @@ class BotState:
         return exited
 
     # ---- open-lot tracking (for realized P/L on exit) ----------------------
-    def record_open(self, symbol: str, entry_price: float, qty: int) -> None:
+    def record_open(self, symbol: str, entry_price: float, qty: int,
+                     reason: str = None, sentiment_score: float = None,
+                     sentiment_label: str = None) -> None:
         self._data["open_lots"][symbol] = {
             "entry_price": entry_price,
             "qty": qty,
             "entry_time": time.time(),
+            "reason": reason,
+            "sentiment_score": sentiment_score,
+            "sentiment_label": sentiment_label,
         }
         self._save()
 

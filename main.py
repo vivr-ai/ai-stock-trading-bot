@@ -22,6 +22,7 @@ import threading
 from bot.config import load_config
 from bot.logging_utils import ClosedTradeLogger, DailySummaryLogger, TradeLogger
 from bot.news import get_news_provider
+from bot.persistence import Recorder
 from bot.reporting import PerformanceReporter
 from bot.scheduler import start_scheduler
 from bot.sentiment import get_sentiment_analyzer
@@ -90,11 +91,14 @@ def build(cfg):
     reporter = PerformanceReporter(
         broker, cfg.logging.trade_log_path, cfg.logging.closed_trades_path, cfg.logging.report_dir
     )
+    # Dashboard persistence: purely additive observability, no bearing on
+    # trading decisions. No-ops automatically if DATABASE_URL isn't set.
+    recorder = Recorder()
     strategy = SentimentStrategy(
         cfg, broker, universe, news, analyzer, risk, trade_logger, summary_logger, state,
-        closed_trade_logger=closed_trade_logger,
+        closed_trade_logger=closed_trade_logger, recorder=recorder,
     )
-    return broker, summary_logger, reporter, strategy
+    return broker, summary_logger, reporter, strategy, recorder
 
 
 def do_check(cfg) -> int:
@@ -196,27 +200,48 @@ def main() -> int:
              cfg.universe.provider, cfg.news.provider, cfg.sentiment.provider, mode, config_source)
 
     try:
-        broker, summary_logger, reporter, strategy = build(cfg)
+        broker, summary_logger, reporter, strategy, recorder = build(cfg)
     except Exception as exc:  # noqa: BLE001
         log.error("Failed to initialize the bot: %s", exc)
+        # Best-effort: even init failures are worth a row if the DB happens
+        # to be reachable independently (e.g. a bad news/sentiment key, not
+        # a DB problem). No-ops if DATABASE_URL isn't set.
+        Recorder().record_notification(
+            type_="error", severity="critical", title="Bot failed to start",
+            message=str(exc),
+        )
         return 1
 
+    recorder.record_notification(
+        type_="bot_restart", severity="info", title="Bot started",
+        message=f"universe={cfg.universe.provider} news={cfg.news.provider} "
+                f"sentiment={cfg.sentiment.provider} mode={mode}",
+    )
+
     def run_eod():
-        summary_logger.write_eod(broker.account_snapshot()["portfolio_value"])
+        pv = broker.account_snapshot()["portfolio_value"]
+        summary_logger.write_eod(pv)
         text = reporter.write()
         log.info("\n%s", text)
+        recorder.record_notification(
+            type_="daily_summary", severity="info", title="Daily summary generated",
+            message=text,
+        )
 
     if args.eod:
         run_eod()
         return 0
     if args.force:
-        strategy.run_cycle(force=True)
+        strategy.run_cycle(force=True, scheduler_status="one_shot")
         return 0
     if args.once:
-        strategy.run_cycle()
+        strategy.run_cycle(scheduler_status="one_shot")
         return 0
 
-    start_scheduler(cfg, strategy.run_cycle, eod_fn=run_eod, shutdown_event=_shutdown)
+    start_scheduler(
+        cfg, lambda: strategy.run_cycle(scheduler_status="scheduled"),
+        eod_fn=run_eod, shutdown_event=_shutdown,
+    )
     return 0
 
 

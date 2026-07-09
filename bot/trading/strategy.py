@@ -49,9 +49,18 @@ class CycleStats:
     blocked: int = 0
 
 
+class _NullRecorder:
+    """Stand-in used when no dashboard Recorder is configured, so call
+    sites never need to check for None."""
+
+    def __getattr__(self, _name):
+        return lambda *a, **k: None
+
+
 class SentimentStrategy:
     def __init__(self, cfg, broker, universe, news, analyzer, risk,
-                 trade_logger, summary_logger, state, closed_trade_logger=None):
+                 trade_logger, summary_logger, state, closed_trade_logger=None,
+                 recorder=None):
         self.cfg = cfg
         self.broker = broker
         self.universe = universe
@@ -62,10 +71,18 @@ class SentimentStrategy:
         self.summary_logger = summary_logger
         self.state = state
         self.closed_trade_logger = closed_trade_logger
+        # Optional dashboard recorder. A no-op stand-in keeps every call site
+        # below simple (no "if self.recorder" checks needed) when no DB is
+        # configured - see bot/persistence/db.py.
+        self.recorder = recorder if recorder is not None else _NullRecorder()
 
-    def run_cycle(self, force: bool = False) -> None:
+    def run_cycle(self, force: bool = False, scheduler_status: str = "scheduled") -> None:
         if not force and not self.broker.is_market_open():
             logger.info("Market closed; skipping cycle.")
+            self.recorder.record_heartbeat(
+                status="running", scheduler_status=scheduler_status, market_open=False,
+                dry_run=self.cfg.risk.dry_run, message="market closed; cycle skipped",
+            )
             return
         if force:
             logger.info("FORCE: running one cycle ignoring market hours (test mode).")
@@ -77,7 +94,28 @@ class SentimentStrategy:
             exposure = self.broker.total_exposure()
         except Exception as exc:  # noqa: BLE001
             logger.error("Account snapshot failed; skipping this cycle: %s", exc)
+            self.recorder.record_heartbeat(
+                status="error", scheduler_status=scheduler_status,
+                dry_run=self.cfg.risk.dry_run, message=f"account snapshot failed: {exc}",
+            )
+            self.recorder.record_notification(
+                type_="broker_issue", severity="warning", title="Account snapshot failed",
+                message=str(exc),
+            )
             return
+
+        self.recorder.record_heartbeat(
+            status="running", scheduler_status=scheduler_status, market_open=True,
+            dry_run=self.cfg.risk.dry_run, portfolio_value=acct.get("portfolio_value"),
+            cash=acct.get("cash"), equity=acct.get("equity"),
+            buying_power=acct.get("buying_power"), open_positions=len(open_positions),
+        )
+        self.recorder.record_portfolio_snapshot(
+            portfolio_value=acct.get("portfolio_value"), cash=acct.get("cash"),
+            equity=acct.get("equity"), buying_power=acct.get("buying_power"),
+            unrealized_pl=None, open_positions=len(open_positions), exposure=exposure,
+        )
+        self._sync_open_positions_snapshot(acct.get("portfolio_value"))
 
         exited = self.state.detect_exits(list(open_positions.keys()))
         if exited:
@@ -92,6 +130,8 @@ class SentimentStrategy:
         if not new_entries_allowed:
             logger.warning("Daily loss limit breached; sentiment exits only this cycle.",
                            extra={"decision": "block_new_entries", "reason": "daily_loss_limit"})
+            self.recorder.record_decision(symbol="*", decision="block_new_entries",
+                                          reason="daily_loss_limit")
 
         # Market filter 1: if the broad market is down hard today, don't open longs.
         if new_entries_allowed and self.cfg.strategy.market_filter_max_drop_pct > 0:
@@ -102,6 +142,10 @@ class SentimentStrategy:
                     self.cfg.strategy.market_filter_symbol, mkt,
                     extra={"decision": "block_new_entries", "reason": "intraday_drop",
                            "symbol": self.cfg.strategy.market_filter_symbol, "change_pct": mkt},
+                )
+                self.recorder.record_decision(
+                    symbol=self.cfg.strategy.market_filter_symbol, decision="block_new_entries",
+                    reason="intraday_drop", change_pct=mkt,
                 )
                 new_entries_allowed = False
 
@@ -121,6 +165,10 @@ class SentimentStrategy:
                     self.cfg.strategy.market_filter_symbol, self.cfg.strategy.market_regime_ma_period,
                     extra={"decision": "block_new_entries", "reason": "regime_data_unavailable"},
                 )
+                self.recorder.record_decision(
+                    symbol=self.cfg.strategy.market_filter_symbol, decision="block_new_entries",
+                    reason="regime_data_unavailable",
+                )
                 new_entries_allowed = False
             elif spy_snap.last < spy_snap.sma:
                 logger.warning(
@@ -131,6 +179,10 @@ class SentimentStrategy:
                     extra={"decision": "block_new_entries", "reason": "below_market_regime_sma",
                            "symbol": self.cfg.strategy.market_filter_symbol,
                            "price": spy_snap.last, "sma": spy_snap.sma},
+                )
+                self.recorder.record_decision(
+                    symbol=self.cfg.strategy.market_filter_symbol, decision="block_new_entries",
+                    reason="below_market_regime_sma", price=spy_snap.last, sma=spy_snap.sma,
                 )
                 new_entries_allowed = False
 
@@ -156,6 +208,32 @@ class SentimentStrategy:
             exposure=exposure,
             stats=stats,
         )
+
+    def _sync_open_positions_snapshot(self, portfolio_value) -> None:
+        """Push the full current book (with unrealized P/L straight from
+        Alpaca, plus the entry reason/confidence we recorded at buy time) to
+        the dashboard's open_positions table. Best-effort: any failure here
+        never affects trading, only what the dashboard shows."""
+        try:
+            detailed = self.broker.open_positions_detailed()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not fetch detailed positions for dashboard sync: %s", exc)
+            return
+        rows = []
+        for symbol, pos in detailed.items():
+            lot = self.state.peek_open(symbol) or {}
+            allocation_pct = (
+                (pos.market_value / portfolio_value * 100.0)
+                if portfolio_value else None
+            )
+            rows.append({
+                "symbol": symbol, "qty": pos.qty, "avg_entry_price": pos.avg_entry_price,
+                "current_price": pos.current_price, "market_value": pos.market_value,
+                "unrealized_pl": pos.unrealized_pl, "unrealized_plpc": pos.unrealized_plpc,
+                "allocation_pct": allocation_pct, "ai_confidence": lot.get("sentiment_score"),
+                "entry_reason": lot.get("reason"), "entry_time": lot.get("entry_time"),
+            })
+        self.recorder.sync_open_positions(rows)
 
     def _log_auto_exit(self, symbol: str) -> None:
         """A position vanished since last cycle without us closing it here —
@@ -184,6 +262,18 @@ class SentimentStrategy:
                     extra={"symbol": symbol, "decision": "closed_trade",
                            "entry_price": lot["entry_price"], "exit_price": exit_price,
                            "pnl": pnl, "exit_reason": "auto_exit"})
+        pnl_pct = ((exit_price - lot["entry_price"]) / lot["entry_price"] * 100.0
+                   if lot["entry_price"] else 0.0)
+        self.recorder.record_closed_trade(
+            symbol=symbol, qty=lot["qty"], entry_price=lot["entry_price"], exit_price=exit_price,
+            pnl=pnl, pnl_pct=pnl_pct, exit_reason="auto_exit (stop_loss_or_take_profit)",
+            entry_time=lot.get("entry_time"),
+        )
+        self.recorder.record_notification(
+            type_="trade_executed", title=f"{symbol} position closed (auto-exit)",
+            message=f"entry={lot['entry_price']:.2f} exit={exit_price:.2f} pnl={pnl:.2f}",
+            severity="info" if pnl >= 0 else "warning",
+        )
 
     def _process_symbol(self, symbol, acct, exposure, open_positions, pending,
                         sector_counts, new_entries_allowed, stats) -> float:
@@ -201,6 +291,12 @@ class SentimentStrategy:
                    "positive_headlines": sentiment.positive_count,
                    "negative_headlines": sentiment.negative_count},
         )
+        self.recorder.record_decision(
+            symbol=symbol, decision="scan", sentiment_score=sentiment.score,
+            sentiment_label=sentiment.label, headline_count=sentiment.article_count,
+            positive_headlines=sentiment.positive_count, negative_headlines=sentiment.negative_count,
+            rationale=sentiment.rationale,
+        )
 
         holding = symbol in open_positions and open_positions[symbol] != 0
 
@@ -212,6 +308,11 @@ class SentimentStrategy:
                             self.cfg.strategy.sell_min_headlines,
                             extra={"symbol": symbol, "decision": "sell_skipped",
                                    "reason": "too_few_headlines"})
+                self.recorder.record_decision(
+                    symbol=symbol, decision="sell_skipped", reason="too_few_headlines",
+                    sentiment_score=sentiment.score, sentiment_label=sentiment.label,
+                    headline_count=sentiment.article_count,
+                )
                 return exposure
             self._do_sell(symbol, sentiment,
                           reason=f"sentiment {sentiment.score:.1f} < {self.cfg.strategy.sell_threshold}")
@@ -228,22 +329,32 @@ class SentimentStrategy:
         if symbol in pending:
             logger.info("BUY %s skipped: an order is already pending", symbol,
                        extra={"symbol": symbol, "decision": "buy_skipped", "reason": "order_pending"})
+            self.recorder.record_decision(symbol=symbol, decision="buy_skipped", reason="order_pending",
+                                          sentiment_score=sentiment.score, sentiment_label=sentiment.label)
             return exposure
         if self.state.in_cooldown(symbol, self.cfg.risk.reentry_cooldown_hours):
             logger.info("BUY %s skipped: in re-entry cooldown", symbol,
                        extra={"symbol": symbol, "decision": "buy_skipped", "reason": "cooldown"})
+            self.recorder.record_decision(symbol=symbol, decision="buy_skipped", reason="cooldown",
+                                          sentiment_score=sentiment.score, sentiment_label=sentiment.label)
             return exposure
         if sentiment.article_count < self.cfg.strategy.min_headlines:
             logger.info("BUY %s skipped: only %d headlines (< %d)",
                         symbol, sentiment.article_count, self.cfg.strategy.min_headlines,
                         extra={"symbol": symbol, "decision": "buy_skipped",
                                "reason": "too_few_headlines"})
+            self.recorder.record_decision(symbol=symbol, decision="buy_skipped",
+                                          reason="too_few_headlines", sentiment_score=sentiment.score,
+                                          sentiment_label=sentiment.label,
+                                          headline_count=sentiment.article_count)
             return exposure
         if stats.buys >= self.cfg.risk.max_new_positions_per_cycle:
             logger.info("BUY %s skipped: per-cycle new-position cap reached (%d)",
                         symbol, self.cfg.risk.max_new_positions_per_cycle,
                         extra={"symbol": symbol, "decision": "buy_skipped",
                                "reason": "per_cycle_cap"})
+            self.recorder.record_decision(symbol=symbol, decision="buy_skipped", reason="per_cycle_cap",
+                                          sentiment_score=sentiment.score, sentiment_label=sentiment.label)
             return exposure
         # Sector cap (skip the 'unknown' bucket so a custom universe isn't blocked).
         sector = sector_of(symbol)
@@ -253,6 +364,9 @@ class SentimentStrategy:
                         symbol, sector, self.cfg.risk.max_positions_per_sector,
                         extra={"symbol": symbol, "decision": "buy_skipped",
                                "reason": "sector_cap", "sector": sector})
+            self.recorder.record_decision(symbol=symbol, decision="buy_skipped", reason="sector_cap",
+                                          sentiment_score=sentiment.score, sentiment_label=sentiment.label,
+                                          extra={"sector": sector})
             return exposure
 
         # One data call gives price, gap-aware run-up, SMA, and volume ratio.
@@ -270,6 +384,9 @@ class SentimentStrategy:
                         self.cfg.strategy.max_intraday_runup_pct,
                         extra={"symbol": symbol, "decision": "buy_skipped",
                                "reason": "runup", "change_pct": runup})
+            self.recorder.record_decision(symbol=symbol, decision="buy_skipped", reason="runup",
+                                          sentiment_score=sentiment.score, sentiment_label=sentiment.label,
+                                          change_pct=runup)
             return exposure
 
         # --- Confirmation filter: price above its N-day SMA ---
@@ -279,12 +396,18 @@ class SentimentStrategy:
                             symbol, self.cfg.strategy.sma_period,
                             extra={"symbol": symbol, "decision": "buy_skipped",
                                    "reason": "sma_unavailable"})
+                self.recorder.record_decision(symbol=symbol, decision="buy_skipped",
+                                              reason="sma_unavailable", sentiment_score=sentiment.score,
+                                              sentiment_label=sentiment.label)
                 return exposure
             if snap.last <= snap.sma:
                 logger.info("BUY %s skipped: price %.2f not above %d-day SMA %.2f",
                             symbol, snap.last, self.cfg.strategy.sma_period, snap.sma,
                             extra={"symbol": symbol, "decision": "buy_skipped",
                                    "reason": "below_sma", "price": snap.last, "sma": snap.sma})
+                self.recorder.record_decision(symbol=symbol, decision="buy_skipped", reason="below_sma",
+                                              sentiment_score=sentiment.score, sentiment_label=sentiment.label,
+                                              price=snap.last, sma=snap.sma)
                 return exposure
 
         # --- Confirmation filter: today's volume >= min_volume_ratio x avg ---
@@ -295,12 +418,18 @@ class SentimentStrategy:
                             symbol, self.cfg.strategy.volume_lookback_days,
                             extra={"symbol": symbol, "decision": "buy_skipped",
                                    "reason": "volume_unavailable"})
+                self.recorder.record_decision(symbol=symbol, decision="buy_skipped",
+                                              reason="volume_unavailable", sentiment_score=sentiment.score,
+                                              sentiment_label=sentiment.label)
                 return exposure
             if snap.volume_ratio < self.cfg.strategy.min_volume_ratio:
                 logger.info("BUY %s skipped: volume ratio %.2fx < required %.2fx",
                             symbol, snap.volume_ratio, self.cfg.strategy.min_volume_ratio,
                             extra={"symbol": symbol, "decision": "buy_skipped",
                                    "reason": "low_volume", "volume_ratio": snap.volume_ratio})
+                self.recorder.record_decision(symbol=symbol, decision="buy_skipped", reason="low_volume",
+                                              sentiment_score=sentiment.score, sentiment_label=sentiment.label,
+                                              volume_ratio=snap.volume_ratio)
                 return exposure
 
         return self._do_buy(symbol, sentiment, snap.last, acct, exposure,
@@ -318,6 +447,9 @@ class SentimentStrategy:
         if not decision.approved:
             logger.info("BUY %s blocked by risk: %s", symbol, decision.reason,
                        extra={"symbol": symbol, "decision": "buy_blocked", "reason": decision.reason})
+            self.recorder.record_decision(symbol=symbol, decision="buy_blocked",
+                                          reason=decision.reason, sentiment_score=sentiment.score,
+                                          sentiment_label=sentiment.label)
             stats.blocked += 1
             return exposure
 
@@ -333,6 +465,11 @@ class SentimentStrategy:
             self.trade_logger.log("buy", symbol, plan.qty, plan.price, plan.notional,
                                   sentiment, plan.stop_price, plan.take_profit_price,
                                   reason, dry_run=True, order_id="", status="dry_run")
+            self.recorder.record_trade(
+                action="buy", symbol=symbol, qty=plan.qty, price=plan.price, notional=plan.notional,
+                sentiment=sentiment, stop_price=plan.stop_price, take_profit=plan.take_profit_price,
+                reason=reason, rationale=sentiment.rationale, dry_run=True, order_id="", status="dry_run",
+            )
         else:
             # Idempotency key stable within a 30-min slot, so a crash/restart or a
             # second instance can't open a duplicate of the same intended entry.
@@ -346,6 +483,13 @@ class SentimentStrategy:
             except Exception as exc:  # noqa: BLE001 - order failed even after retries
                 logger.error("BUY %s failed after retries: %s", symbol, exc,
                             extra={"symbol": symbol, "decision": "buy_failed", "error": str(exc)})
+                self.recorder.record_decision(symbol=symbol, decision="buy_failed",
+                                              reason=str(exc), sentiment_score=sentiment.score,
+                                              sentiment_label=sentiment.label)
+                self.recorder.record_notification(
+                    type_="error", severity="warning", title=f"BUY {symbol} failed",
+                    message=str(exc),
+                )
                 return exposure
             logger.info("Submitted BUY %s: order %s status %s",
                         symbol, order.order_id, order.status,
@@ -356,10 +500,22 @@ class SentimentStrategy:
                                   sentiment, plan.stop_price, plan.take_profit_price,
                                   reason, dry_run=False, order_id=order.order_id,
                                   status=order.status)
+            self.recorder.record_trade(
+                action="buy", symbol=symbol, qty=plan.qty, price=plan.price, notional=plan.notional,
+                sentiment=sentiment, stop_price=plan.stop_price, take_profit=plan.take_profit_price,
+                reason=reason, rationale=sentiment.rationale, dry_run=False,
+                order_id=order.order_id, status=order.status,
+            )
+            self.recorder.record_notification(
+                type_="trade_executed", title=f"BUY {symbol}",
+                message=f"{plan.qty} shares @ ~{plan.price:.2f} ({reason})",
+            )
 
         # Remember what we paid (real or simulated) so the performance report
-        # can compute P/L whenever this position eventually closes.
-        self.state.record_open(symbol, plan.price, plan.qty)
+        # can compute P/L whenever this position eventually closes. Also keep
+        # the reason/confidence so the dashboard can show why we bought it.
+        self.state.record_open(symbol, plan.price, plan.qty, reason=reason,
+                               sentiment_score=sentiment.score, sentiment_label=sentiment.label)
 
         open_positions[symbol] = plan.qty
         sector_counts[sector_of(symbol)] += 1
@@ -374,6 +530,11 @@ class SentimentStrategy:
                               "reason": reason})
             self.trade_logger.log("sell", symbol, 0, 0.0, 0.0, sentiment, 0.0, 0.0,
                                   reason, dry_run=True, order_id="", status="dry_run")
+            self.recorder.record_trade(
+                action="sell", symbol=symbol, qty=0, price=0.0, notional=0.0, sentiment=sentiment,
+                stop_price=0.0, take_profit=0.0, reason=reason, rationale=sentiment.rationale,
+                dry_run=True, order_id="", status="dry_run",
+            )
             if self.closed_trade_logger is not None and exit_price is not None:
                 lot = self.state.pop_open(symbol)
                 if lot is not None:
@@ -384,12 +545,24 @@ class SentimentStrategy:
                     logger.info("Closed trade (dry-run) %s: pnl=%.2f", symbol, pnl,
                                extra={"symbol": symbol, "decision": "closed_trade",
                                       "pnl": pnl, "dry_run": True})
+                    pnl_pct = ((exit_price - lot["entry_price"]) / lot["entry_price"] * 100.0
+                               if lot["entry_price"] else 0.0)
+                    self.recorder.record_closed_trade(
+                        symbol=symbol, qty=lot["qty"], entry_price=lot["entry_price"],
+                        exit_price=exit_price, pnl=pnl, pnl_pct=pnl_pct,
+                        exit_reason=f"dry_run: {reason}", entry_time=lot.get("entry_time"),
+                        news_summary=sentiment.rationale,
+                    )
             return
 
         order = self.broker.close_position(symbol)
         if order is None:
             logger.error("SELL %s failed (close_position returned no order)", symbol,
                         extra={"symbol": symbol, "decision": "sell_failed"})
+            self.recorder.record_notification(
+                type_="error", severity="warning", title=f"SELL {symbol} failed",
+                message="close_position returned no order",
+            )
             return
         logger.info("Submitted CLOSE %s: order %s (%s)", symbol, order.order_id, reason,
                     extra={"symbol": symbol, "decision": "sell", "dry_run": False,
@@ -397,6 +570,14 @@ class SentimentStrategy:
         self.trade_logger.log("sell", symbol, order.qty, 0.0, 0.0, sentiment, 0.0, 0.0,
                               reason, dry_run=False, order_id=order.order_id,
                               status=order.status)
+        self.recorder.record_trade(
+            action="sell", symbol=symbol, qty=order.qty, price=0.0, notional=0.0, sentiment=sentiment,
+            stop_price=0.0, take_profit=0.0, reason=reason, rationale=sentiment.rationale,
+            dry_run=False, order_id=order.order_id, status=order.status,
+        )
+        self.recorder.record_notification(
+            type_="trade_executed", title=f"SELL {symbol}", message=reason,
+        )
 
         if self.closed_trade_logger is not None:
             exit_price = order.filled_avg_price or self.broker.latest_price(symbol)
@@ -405,6 +586,13 @@ class SentimentStrategy:
                 pnl = self.closed_trade_logger.log(
                     symbol, lot["qty"], lot["entry_price"], exit_price,
                     exit_reason=reason, entry_time=lot.get("entry_time"),
+                )
+                pnl_pct = ((exit_price - lot["entry_price"]) / lot["entry_price"] * 100.0
+                           if lot["entry_price"] else 0.0)
+                self.recorder.record_closed_trade(
+                    symbol=symbol, qty=lot["qty"], entry_price=lot["entry_price"],
+                    exit_price=exit_price, pnl=pnl, pnl_pct=pnl_pct, exit_reason=reason,
+                    entry_time=lot.get("entry_time"), news_summary=sentiment.rationale,
                 )
                 logger.info("Closed trade %s: entry=%.2f exit=%.2f pnl=%.2f",
                             symbol, lot["entry_price"], exit_price, pnl,

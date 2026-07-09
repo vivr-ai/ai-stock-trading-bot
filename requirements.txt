@@ -28,3 +28,6 @@ requests>=2.31
 # ---- Optional sentiment providers ----------------------------------------
 anthropic>=0.40         # sentiment.provider = claude
 openai>=1.40            # sentiment.provider = openai
+
+# ---- Dashboard persistence (optional; no-op if DATABASE_URL is unset) ----
+psycopg2-binary>=2.9

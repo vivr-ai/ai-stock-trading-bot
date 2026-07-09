@@ -1,0 +1,12 @@
+# Railway deployment config for the dashboard service.
+# In Railway, create this as a SECOND service in the SAME project as the bot
+# (so it can share the Postgres plugin), with Root Directory = "dashboard".
+# See ../DASHBOARD_DEPLOYMENT.md for the full walkthrough.
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "npm run start"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
