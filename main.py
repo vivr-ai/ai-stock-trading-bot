@@ -18,6 +18,7 @@ import argparse
 import logging
 import sys
 import threading
+from datetime import datetime, timezone
 
 from bot.config import load_config
 from bot.logging_utils import ClosedTradeLogger, DailySummaryLogger, TradeLogger
@@ -227,6 +228,16 @@ def main() -> int:
             type_="daily_summary", severity="info", title="Daily summary generated",
             message=text,
         )
+        # Weekly rollup: piggybacks on the existing daily EOD job, only does
+        # anything extra on Fridays. Purely additive observability - no
+        # bearing on trading decisions.
+        if datetime.now(timezone.utc).weekday() == 4:
+            weekly_text = reporter.write_weekly()
+            log.info("\n%s", weekly_text)
+            recorder.record_notification(
+                type_="weekly_summary", severity="info", title="Weekly summary generated",
+                message=weekly_text,
+            )
 
     if args.eod:
         run_eod()

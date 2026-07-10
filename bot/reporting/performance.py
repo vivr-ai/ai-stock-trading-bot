@@ -27,7 +27,7 @@ import csv
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 logger = logging.getLogger("bot.reporting.performance")
@@ -158,6 +158,67 @@ class PerformanceReporter:
             "Max drawdown:          unavailable this run",
         ]
         return "\n".join(lines)
+
+    def build_weekly(self) -> Dict:
+        """A lightweight 7-day rollup, reusing the same closed_trades.csv this
+        report already reads - no new data source, just a wider date filter.
+        Meant to be called once a week (see main.py's Friday EOD check), not
+        every day."""
+        now = datetime.now(timezone.utc)
+        week_start = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+
+        try:
+            acct = self.broker.account_snapshot()
+            portfolio_value = acct.get("portfolio_value")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Could not fetch account snapshot for weekly report: %s", exc)
+            portfolio_value = None
+
+        closed_rows = _read_csv(self.closed_trades_path)
+        week_pnls = [
+            float(r["pnl"]) for r in closed_rows
+            if r.get("timestamp_utc", "") >= week_start and _is_float(r.get("pnl"))
+        ]
+        wins = [p for p in week_pnls if p > 0]
+        losses = [p for p in week_pnls if p < 0]
+        win_rate = (len(wins) / len(week_pnls) * 100.0) if week_pnls else None
+
+        trade_rows = _read_csv(self.trade_log_path)
+        trades_week = [r for r in trade_rows if r.get("timestamp_utc", "") >= week_start]
+
+        return {
+            "week_ending": now.strftime("%Y-%m-%d"),
+            "portfolio_value": portfolio_value,
+            "realized_pl_week": round(sum(week_pnls), 2) if week_pnls else 0.0,
+            "trades_week": len(trades_week),
+            "closed_trades_week": len(week_pnls),
+            "win_rate_pct": round(win_rate, 1) if win_rate is not None else None,
+            "wins": len(wins),
+            "losses": len(losses),
+        }
+
+    def render_weekly_text(self, report: Dict) -> str:
+        pv = report["portfolio_value"]
+        win_rate_line = (
+            f"Win rate (7 days):      {report['win_rate_pct']}%"
+            if report["win_rate_pct"] is not None
+            else "Win rate (7 days):      n/a (no closed trades this week)"
+        )
+        return "\n".join([
+            f"=== WEEKLY SUMMARY — week ending {report['week_ending']} ===",
+            f"Portfolio value:        {'$%.2f' % pv if pv is not None else 'unavailable'}",
+            f"Realized P/L (7 days):  ${report['realized_pl_week']:.2f}",
+            f"Trades placed (7 days): {report['trades_week']}",
+            f"Closed trades (7 days): {report['closed_trades_week']} "
+            f"(wins={report['wins']}, losses={report['losses']})",
+            win_rate_line,
+        ])
+
+    def write_weekly(self) -> str:
+        report = self.build_weekly()
+        text = self.render_weekly_text(report)
+        logger.info("Weekly summary generated", extra={"decision": "weekly_report", **report})
+        return text
 
     def write(self) -> str:
         report = self.build()
