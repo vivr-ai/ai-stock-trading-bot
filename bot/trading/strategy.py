@@ -267,7 +267,8 @@ class SentimentStrategy:
         self.recorder.record_closed_trade(
             symbol=symbol, qty=lot["qty"], entry_price=lot["entry_price"], exit_price=exit_price,
             pnl=pnl, pnl_pct=pnl_pct, exit_reason="auto_exit (stop_loss_or_take_profit)",
-            entry_time=lot.get("entry_time"),
+            entry_time=lot.get("entry_time"), buy_reason=lot.get("reason"),
+            news_summary=lot.get("rationale"),
         )
         self.recorder.record_notification(
             type_="trade_executed", title=f"{symbol} position closed (auto-exit)",
@@ -515,7 +516,8 @@ class SentimentStrategy:
         # can compute P/L whenever this position eventually closes. Also keep
         # the reason/confidence so the dashboard can show why we bought it.
         self.state.record_open(symbol, plan.price, plan.qty, reason=reason,
-                               sentiment_score=sentiment.score, sentiment_label=sentiment.label)
+                               sentiment_score=sentiment.score, sentiment_label=sentiment.label,
+                               rationale=sentiment.rationale)
 
         open_positions[symbol] = plan.qty
         sector_counts[sector_of(symbol)] += 1
@@ -551,7 +553,7 @@ class SentimentStrategy:
                         symbol=symbol, qty=lot["qty"], entry_price=lot["entry_price"],
                         exit_price=exit_price, pnl=pnl, pnl_pct=pnl_pct,
                         exit_reason=f"dry_run: {reason}", entry_time=lot.get("entry_time"),
-                        news_summary=sentiment.rationale,
+                        buy_reason=lot.get("reason"), news_summary=lot.get("rationale"),
                     )
             return
 
@@ -592,7 +594,8 @@ class SentimentStrategy:
                 self.recorder.record_closed_trade(
                     symbol=symbol, qty=lot["qty"], entry_price=lot["entry_price"],
                     exit_price=exit_price, pnl=pnl, pnl_pct=pnl_pct, exit_reason=reason,
-                    entry_time=lot.get("entry_time"), news_summary=sentiment.rationale,
+                    entry_time=lot.get("entry_time"), buy_reason=lot.get("reason"),
+                    news_summary=lot.get("rationale"),
                 )
                 logger.info("Closed trade %s: entry=%.2f exit=%.2f pnl=%.2f",
                             symbol, lot["entry_price"], exit_price, pnl,
