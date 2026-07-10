@@ -6,6 +6,7 @@ import StatusBadge from "@/components/StatusBadge";
 import LoadingSkeleton from "@/components/LoadingSkeleton";
 import ErrorState from "@/components/ErrorState";
 import { Activity, Wallet, Banknote, TrendingUp, Layers, Repeat, Radio, Clock } from "lucide-react";
+import { fmtMoney, fmtPct, timeAgo, toneFor } from "@/lib/format";
 
 type StatusResponse = {
   botStatus: "running" | "stopped" | "error";
@@ -33,27 +34,6 @@ type StatusResponse = {
   } | null;
   hasAnyData: boolean;
 };
-
-function fmtMoney(v: number | null | undefined) {
-  if (v == null) return "—";
-  return v.toLocaleString("en-US", { style: "currency", currency: "USD" });
-}
-
-function fmtPct(v: number | null | undefined) {
-  if (v == null) return "—";
-  return `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`;
-}
-
-function timeAgo(iso: string | null) {
-  if (!iso) return "never";
-  const diffMs = Date.now() - new Date(iso).getTime();
-  const mins = Math.round(diffMs / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.round(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
-  return `${Math.round(hours / 24)}d ago`;
-}
 
 export default function HomePage() {
   const [data, setData] = useState<StatusResponse | null>(null);
@@ -126,7 +106,7 @@ export default function HomePage() {
           <StatCard
             label="Today's P/L"
             value={fmtMoney(data.todaysPl)}
-            tone={data.todaysPl > 0 ? "gain" : data.todaysPl < 0 ? "loss" : "neutral"}
+            tone={toneFor(data.todaysPl)}
             sublabel={`Realized ${fmtMoney(data.realizedToday)} + unrealized ${fmtMoney(
               data.unrealizedNow
             )}`}
@@ -135,15 +115,7 @@ export default function HomePage() {
           <StatCard
             label="Total Return"
             value={fmtPct(data.totalReturnPct)}
-            tone={
-              data.totalReturnPct == null
-                ? "neutral"
-                : data.totalReturnPct > 0
-                ? "gain"
-                : data.totalReturnPct < 0
-                ? "loss"
-                : "neutral"
-            }
+            tone={toneFor(data.totalReturnPct)}
             sublabel="Since dashboard tracking began"
             icon={<TrendingUp size={15} />}
           />
