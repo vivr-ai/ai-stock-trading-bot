@@ -471,6 +471,11 @@ class SentimentStrategy:
                 sentiment=sentiment, stop_price=plan.stop_price, take_profit=plan.take_profit_price,
                 reason=reason, rationale=sentiment.rationale, dry_run=True, order_id="", status="dry_run",
             )
+            self.recorder.record_decision(
+                symbol=symbol, decision="buy", reason=reason, sentiment_score=sentiment.score,
+                sentiment_label=sentiment.label, headline_count=sentiment.article_count,
+                rationale=sentiment.rationale, price=plan.price, extra={"dry_run": True},
+            )
         else:
             # Idempotency key stable within a 30-min slot, so a crash/restart or a
             # second instance can't open a duplicate of the same intended entry.
@@ -507,6 +512,12 @@ class SentimentStrategy:
                 reason=reason, rationale=sentiment.rationale, dry_run=False,
                 order_id=order.order_id, status=order.status,
             )
+            self.recorder.record_decision(
+                symbol=symbol, decision="buy", reason=reason, sentiment_score=sentiment.score,
+                sentiment_label=sentiment.label, headline_count=sentiment.article_count,
+                rationale=sentiment.rationale, price=plan.price,
+                extra={"dry_run": False, "order_id": order.order_id, "status": order.status},
+            )
             self.recorder.record_notification(
                 type_="trade_executed", title=f"BUY {symbol}",
                 message=f"{plan.qty} shares @ ~{plan.price:.2f} ({reason})",
@@ -536,6 +547,11 @@ class SentimentStrategy:
                 action="sell", symbol=symbol, qty=0, price=0.0, notional=0.0, sentiment=sentiment,
                 stop_price=0.0, take_profit=0.0, reason=reason, rationale=sentiment.rationale,
                 dry_run=True, order_id="", status="dry_run",
+            )
+            self.recorder.record_decision(
+                symbol=symbol, decision="sell", reason=reason, sentiment_score=sentiment.score,
+                sentiment_label=sentiment.label, headline_count=sentiment.article_count,
+                rationale=sentiment.rationale, price=exit_price, extra={"dry_run": True},
             )
             if self.closed_trade_logger is not None and exit_price is not None:
                 lot = self.state.pop_open(symbol)
@@ -576,6 +592,12 @@ class SentimentStrategy:
             action="sell", symbol=symbol, qty=order.qty, price=0.0, notional=0.0, sentiment=sentiment,
             stop_price=0.0, take_profit=0.0, reason=reason, rationale=sentiment.rationale,
             dry_run=False, order_id=order.order_id, status=order.status,
+        )
+        self.recorder.record_decision(
+            symbol=symbol, decision="sell", reason=reason, sentiment_score=sentiment.score,
+            sentiment_label=sentiment.label, headline_count=sentiment.article_count,
+            rationale=sentiment.rationale,
+            extra={"dry_run": False, "order_id": order.order_id, "status": order.status},
         )
         self.recorder.record_notification(
             type_="trade_executed", title=f"SELL {symbol}", message=reason,
