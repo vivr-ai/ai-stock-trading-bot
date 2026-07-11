@@ -1,4 +1,14 @@
-import { Pool, type QueryResultRow } from "pg";
+import { Pool, types, type QueryResultRow } from "pg";
+
+// node-postgres returns NUMERIC/DECIMAL columns as strings by default (to
+// avoid silent precision loss on values too large for a JS number). Every
+// price/qty/P&L column in db/schema.sql is NUMERIC, and most pages/components
+// treat them as numbers (.toFixed(), arithmetic, chart data) - without this,
+// real rows throw a client-side render error the moment they exist (this was
+// invisible before because the affected pages only ever hit their "no data
+// yet" branch). OID 1700 = numeric. Parsing to float here, once, is simpler
+// and safer than adding Number(...) at every one of the many call sites.
+types.setTypeParser(1700, (val: string) => (val === null ? null : parseFloat(val)));
 
 // Single pooled connection reused across requests (Next.js keeps this module
 // warm between invocations on the same server instance). Reads only - the

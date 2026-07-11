@@ -5,7 +5,7 @@ import { query, queryOne } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
-type Snapshot = { ts: string; portfolio_value: number | null };
+type Snapshot = { ts: string | Date; portfolio_value: number | null };
 type ClosedTradeAgg = {
   total: string;
   wins: string;
@@ -13,11 +13,18 @@ type ClosedTradeAgg = {
   avg_loss: string | null;
 };
 
-function dayKey(iso: string) {
-  return iso.slice(0, 10); // YYYY-MM-DD (UTC)
+// node-postgres returns TIMESTAMPTZ columns as native Date objects (not
+// strings) when read directly from a query result - it only becomes a
+// string after JSON.stringify serializes the API response. These helpers
+// run server-side on the raw query rows, so they need to handle a Date.
+function toIso(value: string | Date): string {
+  return value instanceof Date ? value.toISOString() : value;
 }
-function monthKey(iso: string) {
-  return iso.slice(0, 7); // YYYY-MM
+function dayKey(iso: string | Date) {
+  return toIso(iso).slice(0, 10); // YYYY-MM-DD (UTC)
+}
+function monthKey(iso: string | Date) {
+  return toIso(iso).slice(0, 7); // YYYY-MM
 }
 
 /** Collapse a time series to one point per key (the LAST point for that key),
