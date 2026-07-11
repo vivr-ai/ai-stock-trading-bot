@@ -29,7 +29,7 @@ function monthKey(iso: string | Date) {
 
 /** Collapse a time series to one point per key (the LAST point for that key),
  * then return [{ key, value }] in chronological order. */
-function collapseToLast(points: Snapshot[], keyFn: (iso: string) => string) {
+function collapseToLast(points: Snapshot[], keyFn: (iso: string | Date) => string) {
   const map = new Map<string, number>();
   for (const p of points) {
     if (p.portfolio_value == null) continue;
