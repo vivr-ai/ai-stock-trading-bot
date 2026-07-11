@@ -12,6 +12,11 @@ import {
   FileText,
   CalendarDays,
   Bell,
+  PowerOff,
+  Rocket,
+  ShieldAlert,
+  DatabaseZap,
+  TimerReset,
 } from "lucide-react";
 
 type NotificationRow = {
@@ -34,8 +39,13 @@ const TYPE_META: Record<string, { icon: typeof Bell; label: string }> = {
   error: { icon: XCircle, label: "Error" },
   broker_issue: { icon: AlertTriangle, label: "Broker issue" },
   bot_restart: { icon: RotateCw, label: "Bot restart" },
+  bot_stopped_unexpectedly: { icon: PowerOff, label: "Bot stopped unexpectedly" },
+  deployment_completed: { icon: Rocket, label: "Deployment completed" },
   daily_summary: { icon: FileText, label: "Daily summary" },
   weekly_summary: { icon: CalendarDays, label: "Weekly summary" },
+  daily_loss_limit: { icon: ShieldAlert, label: "Daily loss limit" },
+  database_failure: { icon: DatabaseZap, label: "Database failure" },
+  scheduler_failure: { icon: TimerReset, label: "Scheduler failure" },
 };
 
 const SEVERITY_CLASS: Record<string, string> = {
@@ -163,8 +173,13 @@ export default function NotificationsPage() {
           <option value="error">Errors</option>
           <option value="broker_issue">Broker issues</option>
           <option value="bot_restart">Bot restarts</option>
+          <option value="bot_stopped_unexpectedly">Bot stopped unexpectedly</option>
+          <option value="deployment_completed">Deployments</option>
           <option value="daily_summary">Daily summaries</option>
           <option value="weekly_summary">Weekly summaries</option>
+          <option value="daily_loss_limit">Daily loss limit</option>
+          <option value="database_failure">Database failures</option>
+          <option value="scheduler_failure">Scheduler failures</option>
         </select>
         <select
           value={severity}

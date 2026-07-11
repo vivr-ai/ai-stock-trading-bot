@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import threading
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ from datetime import datetime, timezone
 from bot.config import load_config
 from bot.logging_utils import ClosedTradeLogger, DailySummaryLogger, TradeLogger
 from bot.news import get_news_provider
+from bot.notifications import NotificationService, TelegramNotifier
 from bot.persistence import Recorder
 from bot.reporting import PerformanceReporter
 from bot.scheduler import start_scheduler
@@ -94,7 +96,8 @@ def build(cfg):
     )
     # Dashboard persistence: purely additive observability, no bearing on
     # trading decisions. No-ops automatically if DATABASE_URL isn't set.
-    recorder = Recorder()
+    telegram = TelegramNotifier(cfg.telegram.bot_token, cfg.telegram.chat_id) if cfg.telegram.enabled else TelegramNotifier("", "")
+    recorder = NotificationService(Recorder(), telegram=telegram)
     strategy = SentimentStrategy(
         cfg, broker, universe, news, analyzer, risk, trade_logger, summary_logger, state,
         closed_trade_logger=closed_trade_logger, recorder=recorder,
@@ -153,6 +156,18 @@ def do_check(cfg) -> int:
         ok = False
         log.error("[FAIL] Sentiment provider '%s': %s", cfg.sentiment.provider, exc)
 
+    # 4) Telegram (optional - only checked if credentials are configured)
+    if cfg.telegram.enabled:
+        telegram = TelegramNotifier(cfg.telegram.bot_token, cfg.telegram.chat_id)
+        if telegram.test():
+            log.info("[OK] Telegram | test message sent")
+        else:
+            ok = False
+            log.error("[FAIL] Telegram | could not send test message — check "
+                      "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
+    else:
+        log.info("[SKIP] Telegram not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID unset)")
+
     if ok:
         log.info("CHECK PASSED — keys connect and the read pipeline works. "
                  "No orders were placed.")
@@ -206,17 +221,29 @@ def main() -> int:
         log.error("Failed to initialize the bot: %s", exc)
         # Best-effort: even init failures are worth a row if the DB happens
         # to be reachable independently (e.g. a bad news/sentiment key, not
-        # a DB problem). No-ops if DATABASE_URL isn't set.
-        Recorder().record_notification(
+        # a DB problem). No-ops if DATABASE_URL isn't set. Telegram is sent
+        # directly here since the full NotificationService/Recorder pairing
+        # failed to build.
+        NotificationService(
+            Recorder(),
+            telegram=TelegramNotifier(cfg.telegram.bot_token, cfg.telegram.chat_id)
+            if cfg.telegram.enabled else TelegramNotifier("", ""),
+        ).record_notification(
             type_="error", severity="critical", title="Bot failed to start",
             message=str(exc),
         )
         return 1
 
+    _commit = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "")
+    _env = os.environ.get("RAILWAY_ENVIRONMENT_NAME", "")
+    _deploy_bits = " | ".join(
+        b for b in [f"commit={_commit[:7]}" if _commit else "", f"env={_env}" if _env else ""] if b
+    )
     recorder.record_notification(
         type_="bot_restart", severity="info", title="Bot started",
         message=f"universe={cfg.universe.provider} news={cfg.news.provider} "
-                f"sentiment={cfg.sentiment.provider} mode={mode}",
+                f"sentiment={cfg.sentiment.provider} mode={mode}"
+                + (f" | {_deploy_bits}" if _deploy_bits else ""),
     )
 
     def run_eod():
@@ -249,10 +276,29 @@ def main() -> int:
         strategy.run_cycle(scheduler_status="one_shot")
         return 0
 
-    start_scheduler(
-        cfg, lambda: strategy.run_cycle(scheduler_status="scheduled"),
-        eod_fn=run_eod, shutdown_event=_shutdown,
-    )
+    def run_cycle_safely():
+        # Guards against a bug in a single cycle taking the scheduler job
+        # down silently (APScheduler swallows exceptions from jobs on its
+        # own). Per-symbol errors are already isolated inside run_cycle();
+        # this is the outer net for anything else (e.g. summary logging).
+        try:
+            strategy.run_cycle(scheduler_status="scheduled")
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Critical error in scheduled cycle: %s", exc)
+            recorder.notify_critical_error("scheduled cycle", str(exc))
+
+    def on_scheduler_crash(reason: str) -> None:
+        recorder.notify_scheduler_failure(reason)
+
+    try:
+        start_scheduler(
+            cfg, run_cycle_safely,
+            eod_fn=run_eod, shutdown_event=_shutdown, on_crash=on_scheduler_crash,
+        )
+    except Exception as exc:  # noqa: BLE001 - truly unhandled; last-resort alert before exit
+        log.exception("Bot process is exiting due to an unhandled error: %s", exc)
+        recorder.notify_bot_stopped_unexpectedly(str(exc))
+        raise
     return 0
 
 

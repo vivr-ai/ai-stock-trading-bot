@@ -35,6 +35,7 @@ import logging
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Optional
 
 from ..universe.static_universe import sector_of
 
@@ -75,6 +76,9 @@ class SentimentStrategy:
         # below simple (no "if self.recorder" checks needed) when no DB is
         # configured - see bot/persistence/db.py.
         self.recorder = recorder if recorder is not None else _NullRecorder()
+        # Guards the daily-loss-limit notification so it fires once per
+        # breach-day, not every 30-min cycle for the rest of the day.
+        self._daily_loss_notified_date: Optional[str] = None
 
     def run_cycle(self, force: bool = False, scheduler_status: str = "scheduled") -> None:
         if not force and not self.broker.is_market_open():
@@ -132,6 +136,21 @@ class SentimentStrategy:
                            extra={"decision": "block_new_entries", "reason": "daily_loss_limit"})
             self.recorder.record_decision(symbol="*", decision="block_new_entries",
                                           reason="daily_loss_limit")
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if self._daily_loss_notified_date != today:
+                self._daily_loss_notified_date = today
+                loss_pct = None
+                if acct.get("last_equity"):
+                    loss_pct = (acct["equity"] - acct["last_equity"]) / acct["last_equity"] * 100.0
+                self.recorder.record_notification(
+                    type_="daily_loss_limit", severity="warning",
+                    title="Daily loss limit reached",
+                    message=(
+                        f"Kill switch engaged (limit {self.cfg.risk.daily_loss_limit_pct}%). "
+                        f"Sentiment-driven exits still run; no new entries today."
+                        + (f" Today's change: {loss_pct:.2f}%." if loss_pct is not None else "")
+                    ),
+                )
 
         # Market filter 1: if the broad market is down hard today, don't open longs.
         if new_entries_allowed and self.cfg.strategy.market_filter_max_drop_pct > 0:

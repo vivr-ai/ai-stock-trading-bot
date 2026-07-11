@@ -160,3 +160,35 @@ CREATE TABLE IF NOT EXISTS notifications (
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_ts ON notifications (ts DESC);
 CREATE INDEX IF NOT EXISTS idx_notifications_type ON notifications (type);
+
+-- ---------------------------------------------------------------------
+-- notification_settings: one row per notification type, editable from the
+-- dashboard's Notification Settings page. `channel` controls the Telegram
+-- delivery path; `enabled=false` mutes Telegram entirely for that type
+-- (the notifications table audit trail is always written regardless).
+-- The bot reads this table (bot/notifications/settings.py) with a ~60s
+-- cache, so a change here takes effect on the bot's next cycle without a
+-- redeploy.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS notification_settings (
+    type        TEXT PRIMARY KEY,
+    channel     TEXT NOT NULL DEFAULT 'immediate',  -- 'immediate' | 'daily_summary' | 'weekly_summary' | 'off'
+    enabled     BOOLEAN NOT NULL DEFAULT true,
+    label       TEXT,          -- human-readable name for the settings UI
+    description TEXT,          -- short explanation for the settings UI
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO notification_settings (type, channel, enabled, label, description) VALUES
+    ('bot_restart', 'immediate', true, 'Bot started / restarted', 'Fires whenever the process starts, including redeploys and crash-restarts.'),
+    ('bot_stopped_unexpectedly', 'immediate', true, 'Bot stopped unexpectedly', 'Fires when the process exits due to an unhandled error, not a deliberate stop.'),
+    ('deployment_completed', 'immediate', true, 'Railway deployment completed', 'Fires once a new Railway deploy finishes (release command).'),
+    ('trade_executed', 'immediate', true, 'Trade executed', 'Every buy/sell/auto-exit the bot places.'),
+    ('daily_summary', 'immediate', true, 'Daily trading summary', 'The end-of-day performance report.'),
+    ('weekly_summary', 'immediate', true, 'Weekly performance summary', 'The Friday end-of-week rollup.'),
+    ('daily_loss_limit', 'immediate', true, 'Daily loss limit reached', 'Fires once per day when the kill switch engages.'),
+    ('broker_issue', 'immediate', true, 'Broker/API connection failure', 'Alpaca account snapshot or data calls failing after retries.'),
+    ('database_failure', 'immediate', true, 'Database failure', 'Dashboard Postgres writes failing (trading itself is unaffected).'),
+    ('scheduler_failure', 'immediate', true, 'Scheduler failure', 'The internal job scheduler crashed and is restarting itself.'),
+    ('error', 'immediate', true, 'Critical application errors', 'Order failures, startup failures, and other unexpected errors.')
+ON CONFLICT (type) DO NOTHING;

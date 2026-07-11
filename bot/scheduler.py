@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 def start_scheduler(cfg, run_cycle_fn: Callable, eod_fn: Optional[Callable] = None,
-                     shutdown_event=None) -> None:
+                     shutdown_event=None, on_crash: Optional[Callable[[str], None]] = None) -> None:
     from apscheduler.schedulers.blocking import BlockingScheduler
     from apscheduler.triggers.cron import CronTrigger
 
@@ -78,6 +78,11 @@ def start_scheduler(cfg, run_cycle_fn: Callable, eod_fn: Optional[Callable] = No
             return
         except Exception as exc:  # noqa: BLE001 - must never take the whole process down
             logger.exception("Scheduler crashed unexpectedly: %s", exc)
+            if on_crash is not None:
+                try:
+                    on_crash(str(exc))
+                except Exception:  # noqa: BLE001 - notifying must never mask the real crash
+                    logger.exception("on_crash notification callback itself failed")
             if stop_requested["flag"] or (shutdown_event is not None and shutdown_event.is_set()):
                 return
             logger.warning("Restarting scheduler in %ds.", backoff)

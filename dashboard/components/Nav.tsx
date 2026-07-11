@@ -12,6 +12,7 @@ import {
   BookOpen,
   ShieldAlert,
   Bell,
+  Settings,
   LogOut,
   Menu,
   X,
@@ -27,6 +28,7 @@ const LINKS = [
   { href: "/strategy", label: "Trading Strategy", icon: BookOpen },
   { href: "/risk", label: "Risk Dashboard", icon: ShieldAlert },
   { href: "/notifications", label: "Notifications", icon: Bell },
+  { href: "/notification-settings", label: "Notification Settings", icon: Settings },
 ];
 
 function NavLinks({ onNavigate }: { onNavigate?: () => void }) {

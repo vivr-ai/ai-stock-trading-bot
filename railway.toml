@@ -6,6 +6,17 @@ builder = "NIXPACKS"
 
 [deploy]
 startCommand = "python main.py"
+# Runs once per deploy, after a successful build, before the new instance
+# takes over — from inside Railway's network, so DATABASE_URL's internal
+# hostname (postgres.railway.internal) resolves here even though it won't
+# from a laptop. Two steps:
+#   1. apply_schema.py - (re-)applies db/schema.sql. Idempotent, so this is
+#      the ONLY place the schema needs to be applied; no manual psql step.
+#   2. notify_deploy.py - sends the "Railway deployment completed" Telegram
+#      notification, separate from bot_restart/scheduler notifications so a
+#      genuine deploy is distinguishable from a crash-restart.
+# Both no-op safely (exit 0) if DATABASE_URL / TELEGRAM_* aren't set.
+releaseCommand = "python scripts/apply_schema.py && python scripts/notify_deploy.py"
 # If the process does exit unexpectedly, Railway restarts it. The bot itself
 # also self-heals from most transient failures (see bot/utils/retry.py and
 # bot/scheduler.py's supervisor loop) — this is a last-resort safety net, not

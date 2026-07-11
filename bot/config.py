@@ -115,6 +115,13 @@ class ServerConfig:
 
 
 @dataclass
+class TelegramConfig:
+    bot_token: str
+    chat_id: str
+    enabled: bool
+
+
+@dataclass
 class Config:
     alpaca: AlpacaConfig
     universe: UniverseConfig
@@ -126,6 +133,7 @@ class Config:
     logging: LoggingConfig
     retry: RetryConfig
     server: ServerConfig
+    telegram: TelegramConfig
     project_root: str = field(default="")
     config_file_used: Optional[str] = field(default=None)
 
@@ -302,11 +310,23 @@ def load_config(path: str = "config.ini") -> Config:
             ),
         ),
         server=ServerConfig(port=int(port_raw) if port_raw.strip().isdigit() else None),
+        telegram=_build_telegram_config(parser),
         project_root=project_root,
         config_file_used=path if parser is not None else None,
     )
     _validate(cfg)
     return cfg
+
+
+def _build_telegram_config(parser: Optional[configparser.ConfigParser]) -> "TelegramConfig":
+    bot_token = _get(parser, "telegram", "bot_token", "TELEGRAM_BOT_TOKEN", "")
+    chat_id = _get(parser, "telegram", "chat_id", "TELEGRAM_CHAT_ID", "")
+    # Auto-enabled once both credentials are present; TELEGRAM_ENABLED=false
+    # is an explicit opt-out (e.g. to silence notifications temporarily
+    # without deleting the credentials).
+    default_enabled = bool(bot_token and chat_id)
+    enabled = _get(parser, "telegram", "enabled", "TELEGRAM_ENABLED", default_enabled, bool)
+    return TelegramConfig(bot_token=bot_token, chat_id=chat_id, enabled=enabled and default_enabled)
 
 
 def _validate(cfg: Config) -> None:

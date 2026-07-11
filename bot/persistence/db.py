@@ -31,6 +31,13 @@ class Recorder:
         self.database_url = database_url or os.environ.get("DATABASE_URL", "")
         self.enabled = bool(self.database_url)
         self._psycopg2 = None
+        # Tracks whether the most recent write succeeded, so callers (see
+        # bot/notifications/service.py) can detect a DB outage and raise a
+        # Telegram-only alert without this module needing to know Telegram
+        # exists. Starts True (optimistic) so a never-written Recorder isn't
+        # reported as failing.
+        self.healthy = True
+        self.last_error: Optional[str] = None
         if self.enabled:
             try:
                 import psycopg2  # noqa: F401
@@ -55,13 +62,19 @@ class Recorder:
             conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Dashboard DB connect failed (row dropped): %s", exc)
+            self.healthy = False
+            self.last_error = str(exc)
             return
         try:
             with conn:
                 with conn.cursor() as cur:
                     cur.execute(sql, params)
+            self.healthy = True
+            self.last_error = None
         except Exception as exc:  # noqa: BLE001
             logger.warning("Dashboard DB write failed (row dropped): %s", exc)
+            self.healthy = False
+            self.last_error = str(exc)
         finally:
             try:
                 conn.close()
@@ -192,6 +205,8 @@ class Recorder:
             conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Dashboard DB connect failed (positions sync dropped): %s", exc)
+            self.healthy = False
+            self.last_error = str(exc)
             return
         try:
             with conn:
@@ -245,8 +260,12 @@ class Recorder:
                                 entry_time=entry_dt,
                             ),
                         )
+            self.healthy = True
+            self.last_error = None
         except Exception as exc:  # noqa: BLE001
             logger.warning("Dashboard DB positions sync failed: %s", exc)
+            self.healthy = False
+            self.last_error = str(exc)
         finally:
             try:
                 conn.close()
