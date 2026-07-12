@@ -185,6 +185,26 @@ CREATE TABLE IF NOT EXISTS notification_settings (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- ---------------------------------------------------------------------
+-- fx_rates: cached RBA daily AUD/USD exchange rates, used by the
+-- Accountant Export to convert each transaction leg (buy and sell
+-- separately) to AUD at the rate applicable on its own date - the
+-- ATO-correct method, not a single blended rate for the whole trade.
+--
+-- Convention: aud_usd_rate follows the RBA's own quoting convention
+-- (Series ID FXRUSD in their F11 table), i.e. "1 AUD = aud_usd_rate USD".
+-- To convert a USD amount to AUD: aud_amount = usd_amount / aud_usd_rate.
+-- Populated lazily by the dashboard (dashboard/lib/fx.ts) the first time an
+-- export needs a date range, then reused - reproducible even if RBA's site
+-- is ever unreachable later.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS fx_rates (
+    rate_date     DATE PRIMARY KEY,
+    aud_usd_rate  NUMERIC NOT NULL,
+    source        TEXT NOT NULL DEFAULT 'RBA',
+    fetched_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 INSERT INTO notification_settings (type, channel, enabled, label, description) VALUES
     ('bot_restart', 'immediate', true, 'Bot started / restarted', 'Fires whenever the process starts, including redeploys and crash-restarts.'),
     ('bot_stopped_unexpectedly', 'immediate', true, 'Bot stopped unexpectedly', 'Fires when the process exits due to an unhandled error, not a deliberate stop.'),

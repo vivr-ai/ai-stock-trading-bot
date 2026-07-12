@@ -14,6 +14,7 @@ import {
   Bell,
   Settings,
   HeartPulse,
+  FileSpreadsheet,
   LogOut,
   Menu,
   X,
@@ -31,6 +32,7 @@ const LINKS = [
   { href: "/system-health", label: "System Health", icon: HeartPulse },
   { href: "/notifications", label: "Notifications", icon: Bell },
   { href: "/notification-settings", label: "Notification Settings", icon: Settings },
+  { href: "/accountant-export", label: "Accountant Export", icon: FileSpreadsheet },
 ];
 
 function NavLinks({ onNavigate }: { onNavigate?: () => void }) {

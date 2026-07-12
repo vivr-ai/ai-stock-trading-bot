@@ -11,8 +11,10 @@ import { Pool, types, type QueryResultRow } from "pg";
 types.setTypeParser(1700, (val: string) => (val === null ? null : parseFloat(val)));
 
 // Single pooled connection reused across requests (Next.js keeps this module
-// warm between invocations on the same server instance). Reads only - the
-// dashboard never writes to the bot's tables.
+// warm between invocations on the same server instance). Read-only for every
+// bot-owned table (heartbeats, trades, decisions, etc.) - the one exception
+// is `fx_rates` (see lib/fx.ts), which the dashboard populates itself as a
+// cache when the Accountant Export needs exchange rates for a date range.
 declare global {
   // eslint-disable-next-line no-var
   var _pgPool: Pool | undefined;
