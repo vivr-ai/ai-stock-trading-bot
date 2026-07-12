@@ -32,6 +32,7 @@ Sell rule:
 from __future__ import annotations
 
 import logging
+import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -91,16 +92,20 @@ class SentimentStrategy:
         if force:
             logger.info("FORCE: running one cycle ignoring market hours (test mode).")
 
+        api_call_started = time.monotonic()
         try:
             acct = self.broker.account_snapshot()
+            api_latency_ms = (time.monotonic() - api_call_started) * 1000.0
             open_positions = self.broker.open_positions()
             pending = self.broker.pending_order_symbols()
             exposure = self.broker.total_exposure()
         except Exception as exc:  # noqa: BLE001
+            api_latency_ms = (time.monotonic() - api_call_started) * 1000.0
             logger.error("Account snapshot failed; skipping this cycle: %s", exc)
             self.recorder.record_heartbeat(
                 status="error", scheduler_status=scheduler_status,
                 dry_run=self.cfg.risk.dry_run, message=f"account snapshot failed: {exc}",
+                api_latency_ms=api_latency_ms,
             )
             self.recorder.record_notification(
                 type_="broker_issue", severity="warning", title="Account snapshot failed",
@@ -113,6 +118,7 @@ class SentimentStrategy:
             dry_run=self.cfg.risk.dry_run, portfolio_value=acct.get("portfolio_value"),
             cash=acct.get("cash"), equity=acct.get("equity"),
             buying_power=acct.get("buying_power"), open_positions=len(open_positions),
+            api_latency_ms=api_latency_ms,
         )
         self.recorder.record_portfolio_snapshot(
             portfolio_value=acct.get("portfolio_value"), cash=acct.get("cash"),

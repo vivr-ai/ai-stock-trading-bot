@@ -90,19 +90,22 @@ class Recorder:
                           market_open: Optional[bool] = None, dry_run: Optional[bool] = None,
                           portfolio_value: Optional[float] = None, cash: Optional[float] = None,
                           equity: Optional[float] = None, buying_power: Optional[float] = None,
-                          open_positions: Optional[int] = None, message: Optional[str] = None) -> None:
+                          open_positions: Optional[int] = None, message: Optional[str] = None,
+                          api_latency_ms: Optional[float] = None) -> None:
         self._execute(
             """
             INSERT INTO heartbeats
                 (status, scheduler_status, market_open, dry_run, portfolio_value,
-                 cash, equity, buying_power, open_positions, message)
+                 cash, equity, buying_power, open_positions, message, api_latency_ms)
             VALUES
                 (%(status)s, %(scheduler_status)s, %(market_open)s, %(dry_run)s, %(portfolio_value)s,
-                 %(cash)s, %(equity)s, %(buying_power)s, %(open_positions)s, %(message)s)
+                 %(cash)s, %(equity)s, %(buying_power)s, %(open_positions)s, %(message)s,
+                 %(api_latency_ms)s)
             """,
             dict(status=status, scheduler_status=scheduler_status, market_open=market_open,
                  dry_run=dry_run, portfolio_value=portfolio_value, cash=cash, equity=equity,
-                 buying_power=buying_power, open_positions=open_positions, message=message),
+                 buying_power=buying_power, open_positions=open_positions, message=message,
+                 api_latency_ms=api_latency_ms),
         )
 
     def record_decision(self, *, symbol: str, decision: str, reason: Optional[str] = None,

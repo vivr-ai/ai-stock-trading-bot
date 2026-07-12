@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timezone
 
 # Allow running as `python scripts/notify_deploy.py` from the repo root.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,11 +32,13 @@ def main() -> int:
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     telegram = TelegramNotifier(bot_token, chat_id)
 
-    commit = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "unknown")[:7]
+    commit_full = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "")
+    commit = commit_full[:7] if commit_full else "unknown"
     env = os.environ.get("RAILWAY_ENVIRONMENT_NAME", "unknown")
     service = os.environ.get("RAILWAY_SERVICE_NAME", "unknown")
     author = os.environ.get("RAILWAY_GIT_AUTHOR", "")
     message = os.environ.get("RAILWAY_GIT_COMMIT_MESSAGE", "")
+    deployed_at = datetime.now(timezone.utc).isoformat()
 
     text = (
         f"service={service} env={env} commit={commit}"
@@ -43,10 +46,21 @@ def main() -> int:
         + (f"\n{message.strip()}" if message else "")
     )
 
+    # Structured metadata (not just the free-text message above) so the
+    # System Health page can reliably read the commit/version without
+    # string-parsing a human-readable message.
+    metadata = {
+        "commit": commit_full or None,
+        "commit_short": commit,
+        "service": service,
+        "environment": env,
+        "deployed_at": deployed_at,
+    }
+
     notifier = NotificationService(Recorder(), telegram=telegram)
     notifier.record_notification(
         type_="deployment_completed", severity="info",
-        title="Railway deployment completed", message=text,
+        title="Railway deployment completed", message=text, metadata=metadata,
     )
     print(f"notify_deploy: recorded deployment_completed ({text})")
     return 0

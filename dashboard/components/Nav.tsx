@@ -13,6 +13,7 @@ import {
   ShieldAlert,
   Bell,
   Settings,
+  HeartPulse,
   LogOut,
   Menu,
   X,
@@ -27,6 +28,7 @@ const LINKS = [
   { href: "/decisions", label: "AI Decision Log", icon: Bot },
   { href: "/strategy", label: "Trading Strategy", icon: BookOpen },
   { href: "/risk", label: "Risk Dashboard", icon: ShieldAlert },
+  { href: "/system-health", label: "System Health", icon: HeartPulse },
   { href: "/notifications", label: "Notifications", icon: Bell },
   { href: "/notification-settings", label: "Notification Settings", icon: Settings },
 ];

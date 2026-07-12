@@ -27,9 +27,15 @@ CREATE TABLE IF NOT EXISTS heartbeats (
     equity            NUMERIC,
     buying_power      NUMERIC,
     open_positions    INTEGER,
-    message           TEXT
+    message           TEXT,
+    api_latency_ms    NUMERIC          -- Alpaca account_snapshot() round-trip time, for System Health
 );
 CREATE INDEX IF NOT EXISTS idx_heartbeats_ts ON heartbeats (ts DESC);
+
+-- Added by the System Health phase; ALTER here (rather than only in the
+-- CREATE TABLE above) so this column also lands on databases where
+-- heartbeats already existed before this column was introduced.
+ALTER TABLE heartbeats ADD COLUMN IF NOT EXISTS api_latency_ms NUMERIC;
 
 -- ---------------------------------------------------------------------
 -- decisions: EVERY decision the strategy makes each cycle, whether or not
