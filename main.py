@@ -25,6 +25,7 @@ from bot.config import load_config
 from bot.logging_utils import ClosedTradeLogger, DailySummaryLogger, TradeLogger
 from bot.news import get_news_provider
 from bot.notifications import NotificationService, TelegramNotifier
+from bot.notifications.summary import build_queued_summary
 from bot.persistence import Recorder
 from bot.reporting import PerformanceReporter
 from bot.scheduler import start_scheduler
@@ -250,6 +251,13 @@ def main() -> int:
         pv = broker.account_snapshot()["portfolio_value"]
         summary_logger.write_eod(pv)
         text = reporter.write()
+        # Roll up anything the user configured as "daily summary only" in
+        # the dashboard's Notification Settings (see bot/notifications/summary.py)
+        # into this same message, so muting immediate sends doesn't mean
+        # those events vanish from Telegram entirely.
+        queued = build_queued_summary(recorder.database_url, "daily_summary", period_label="today")
+        if queued:
+            text = f"{text}\n\n{queued}"
         log.info("\n%s", text)
         recorder.record_notification(
             type_="daily_summary", severity="info", title="Daily summary generated",
@@ -260,6 +268,11 @@ def main() -> int:
         # bearing on trading decisions.
         if datetime.now(timezone.utc).weekday() == 4:
             weekly_text = reporter.write_weekly()
+            queued_weekly = build_queued_summary(
+                recorder.database_url, "weekly_summary", period_label="this week"
+            )
+            if queued_weekly:
+                weekly_text = f"{weekly_text}\n\n{queued_weekly}"
             log.info("\n%s", weekly_text)
             recorder.record_notification(
                 type_="weekly_summary", severity="info", title="Weekly summary generated",
