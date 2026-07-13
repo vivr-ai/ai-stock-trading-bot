@@ -91,22 +91,100 @@ class Recorder:
                           portfolio_value: Optional[float] = None, cash: Optional[float] = None,
                           equity: Optional[float] = None, buying_power: Optional[float] = None,
                           open_positions: Optional[int] = None, message: Optional[str] = None,
-                          api_latency_ms: Optional[float] = None) -> None:
+                          api_latency_ms: Optional[float] = None,
+                          trading_mode: Optional[str] = None,
+                          daytrade_count: Optional[int] = None,
+                          pattern_day_trader: Optional[bool] = None) -> None:
         self._execute(
             """
             INSERT INTO heartbeats
                 (status, scheduler_status, market_open, dry_run, portfolio_value,
-                 cash, equity, buying_power, open_positions, message, api_latency_ms)
+                 cash, equity, buying_power, open_positions, message, api_latency_ms,
+                 trading_mode, daytrade_count, pattern_day_trader)
             VALUES
                 (%(status)s, %(scheduler_status)s, %(market_open)s, %(dry_run)s, %(portfolio_value)s,
                  %(cash)s, %(equity)s, %(buying_power)s, %(open_positions)s, %(message)s,
-                 %(api_latency_ms)s)
+                 %(api_latency_ms)s, %(trading_mode)s, %(daytrade_count)s, %(pattern_day_trader)s)
             """,
             dict(status=status, scheduler_status=scheduler_status, market_open=market_open,
                  dry_run=dry_run, portfolio_value=portfolio_value, cash=cash, equity=equity,
                  buying_power=buying_power, open_positions=open_positions, message=message,
-                 api_latency_ms=api_latency_ms),
+                 api_latency_ms=api_latency_ms, trading_mode=trading_mode,
+                 daytrade_count=daytrade_count, pattern_day_trader=pattern_day_trader),
         )
+
+    def record_config_status(self, *, trading_mode: str, live_confirmed: bool,
+                              risk_dry_run: bool, allow_submit: bool,
+                              has_paper_keys: bool, has_live_keys: bool,
+                              has_telegram: bool, commit_short: Optional[str] = None,
+                              environment: Optional[str] = None) -> None:
+        """One row per startup - the dashboard's Live Readiness page reads the
+        latest row, since presence/absence of env vars can only be observed
+        from inside the bot's own process (never the raw secret values)."""
+        self._execute(
+            """
+            INSERT INTO config_status
+                (trading_mode, live_confirmed, risk_dry_run, allow_submit,
+                 has_paper_keys, has_live_keys, has_telegram, has_database,
+                 commit_short, environment)
+            VALUES
+                (%(trading_mode)s, %(live_confirmed)s, %(risk_dry_run)s, %(allow_submit)s,
+                 %(has_paper_keys)s, %(has_live_keys)s, %(has_telegram)s, true,
+                 %(commit_short)s, %(environment)s)
+            """,
+            dict(trading_mode=trading_mode, live_confirmed=live_confirmed,
+                 risk_dry_run=risk_dry_run, allow_submit=allow_submit,
+                 has_paper_keys=has_paper_keys, has_live_keys=has_live_keys,
+                 has_telegram=has_telegram, commit_short=commit_short, environment=environment),
+        )
+
+    def record_account_activities(self, rows) -> None:
+        """Upsert a batch of Alpaca account activities (dividends, regulatory
+        fees, non-resident withholding). Safe to call with an overlapping
+        date window every day - ON CONFLICT keeps this idempotent on Alpaca's
+        own activity id. `rows` is a list of dicts with the keys used below."""
+        if not self.enabled or not rows:
+            return
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB connect failed (activities sync dropped): %s", exc)
+            self.healthy = False
+            self.last_error = str(exc)
+            return
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    for r in rows:
+                        cur.execute(
+                            """
+                            INSERT INTO account_activities
+                                (activity_id, activity_type, activity_date, symbol, net_amount,
+                                 qty, per_share_amount, description, raw)
+                            VALUES
+                                (%(activity_id)s, %(activity_type)s, %(activity_date)s, %(symbol)s,
+                                 %(net_amount)s, %(qty)s, %(per_share_amount)s, %(description)s, %(raw)s)
+                            ON CONFLICT (activity_id) DO NOTHING
+                            """,
+                            dict(
+                                activity_id=r["activity_id"], activity_type=r["activity_type"],
+                                activity_date=r["activity_date"], symbol=r.get("symbol"),
+                                net_amount=r.get("net_amount"), qty=r.get("qty"),
+                                per_share_amount=r.get("per_share_amount"),
+                                description=r.get("description"), raw=self._json(r.get("raw")),
+                            ),
+                        )
+            self.healthy = True
+            self.last_error = None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB activities sync failed: %s", exc)
+            self.healthy = False
+            self.last_error = str(exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def record_decision(self, *, symbol: str, decision: str, reason: Optional[str] = None,
                          sentiment_score: Optional[float] = None, sentiment_label: Optional[str] = None,

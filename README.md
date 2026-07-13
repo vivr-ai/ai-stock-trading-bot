@@ -1,15 +1,50 @@
-# News Sentiment Trading Bot (Alpaca Paper Trading)
+# News Sentiment Trading Bot (Alpaca)
 
-An automated **paper-trading** bot: every 30 minutes during US market hours it
-builds a list of stocks, reads recent headlines, scores sentiment, confirms
-the move with price/volume/market-regime filters, and places risk-managed
-paper orders through Alpaca — logging every scan and every decision, and
-producing a daily performance report.
+An automated trading bot: every 30 minutes during US market hours it builds a
+list of stocks, reads recent headlines, scores sentiment, confirms the move
+with price/volume/market-regime filters, and places risk-managed orders
+through Alpaca — logging every scan and every decision, and producing a daily
+performance report.
 
-> Paper trading only, and **not investment advice**. It refuses to start against
-> a live account. Run it with your own keys, keep `RISK_DRY_RUN=true` until
-> you've watched it for a while, and remember a simple sentiment rule has no
-> proven edge.
+> **Not investment advice.** The bot ships defaulting to paper trading and
+> stays there until you deliberately opt into something else — see
+> "Operating modes" below. Run it with your own keys, keep `RISK_DRY_RUN=true`
+> until you've watched it for a while, and remember a simple sentiment rule
+> has no proven edge.
+
+---
+
+## Operating modes: PAPER / DRY_RUN / LIVE
+
+The bot has three operating modes, selected by `TRADING_MODE`. Switching
+between them is **environment-variables only** — no code changes, ever.
+
+| Mode | `TRADING_MODE` | Account | Places real orders? | Credentials used |
+|------|-----------------|---------|----------------------|-------------------|
+| Paper (default) | `paper` | Alpaca paper | No — paper fills only | `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` |
+| Dry run | `dry_run` | Alpaca **live** | Never — logs + Telegram-notifies what it would have done | `ALPACA_LIVE_API_KEY` / `ALPACA_LIVE_SECRET_KEY` |
+| Live | `live` | Alpaca **live** | Yes, if fully confirmed (see below) | `ALPACA_LIVE_API_KEY` / `ALPACA_LIVE_SECRET_KEY` |
+
+`DRY_RUN` is the recommended way to rehearse against your real account —
+it sees real balances/positions and evaluates every decision exactly like
+`LIVE` would, but the broker layer physically refuses to submit an order in
+this mode (not just a risk-layer check — the guard lives in
+`AlpacaBroker.__init__`).
+
+**Going live requires three independent switches to all agree** — this is
+deliberate defense-in-depth for a system that trades real money:
+
+1. `TRADING_MODE=live`
+2. `LIVE_TRADING_CONFIRMED=true` — an explicit, separate "I mean it" flag.
+   Setting `TRADING_MODE=live` alone raises a configuration error at startup.
+3. `RISK_DRY_RUN=false` — the pre-existing risk-layer dry-run gate, unrelated
+   to `TRADING_MODE`, and still checked on top of it.
+
+Missing any one of the three keeps the bot in a safe, order-free state (an
+explicit config error for #1/#2 at startup; a runtime no-op for #3). See the
+dashboard's **Live Readiness** page for a live checklist of everything this
+implies before you flip the switch, and `.env.example` for the full variable
+reference.
 
 ---
 
@@ -30,7 +65,8 @@ The full variable list with defaults is in **[.env.example](.env.example)**.
 
 | Key | Env var | Needed? | When |
 |-----|---------|---------|------|
-| Alpaca API key + secret (paper) | `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` | **MANDATORY** | Always |
+| Alpaca API key + secret (paper) | `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` | **MANDATORY** | `TRADING_MODE=paper` (default) |
+| Alpaca API key + secret (live) | `ALPACA_LIVE_API_KEY` / `ALPACA_LIVE_SECRET_KEY` | Required for dry-run/live | `TRADING_MODE=dry_run` or `live` |
 | Finnhub | `FINNHUB_API_KEY` | Optional | `UNIVERSE_PROVIDER=mention` or `NEWS_PROVIDER=finnhub` |
 | NewsAPI | `NEWSAPI_API_KEY` | Optional | `NEWS_PROVIDER=newsapi` |
 | Anthropic (Claude) | `ANTHROPIC_API_KEY` | Optional | `SENTIMENT_PROVIDER=claude` |

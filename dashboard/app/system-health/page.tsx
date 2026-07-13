@@ -17,6 +17,7 @@ import {
   Gauge,
   Tag,
   GitCommit,
+  ShieldAlert,
 } from "lucide-react";
 
 type SystemHealthResponse = {
@@ -26,6 +27,9 @@ type SystemHealthResponse = {
     ageMinutes: number | null;
     marketOpen: boolean | null;
     dryRun: boolean | null;
+    tradingMode: string | null;
+    daytradeCount: number | null;
+    patternDayTrader: boolean | null;
   };
   botStatus: "running" | "stopped" | "error";
   scheduler: {
@@ -205,6 +209,29 @@ export default function SystemHealthPage() {
                   : "No deployment notifications recorded yet"
               }
               icon={<GitCommit size={15} />}
+            />
+            <StatCard
+              label="Pattern Day Trader"
+              value={
+                data.heartbeat.daytradeCount == null
+                  ? "—"
+                  : data.heartbeat.patternDayTrader
+                  ? "FLAGGED"
+                  : `${data.heartbeat.daytradeCount}/4`
+              }
+              tone={
+                data.heartbeat.patternDayTrader
+                  ? "loss"
+                  : (data.heartbeat.daytradeCount ?? 0) >= 3
+                  ? "loss"
+                  : "neutral"
+              }
+              sublabel={
+                data.heartbeat.tradingMode
+                  ? `mode: ${data.heartbeat.tradingMode} · see Live Readiness for detail`
+                  : "Day trades in the current rolling 5-day window"
+              }
+              icon={<ShieldAlert size={15} />}
             />
           </div>
 

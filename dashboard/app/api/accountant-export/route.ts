@@ -32,6 +32,14 @@ type OpenPosition = {
   entry_reason: string | null;
 };
 
+type AccountActivity = {
+  activity_type: string; // 'DIV' | 'DIVNRA' | 'FEE' | ...
+  activity_date: string;
+  symbol: string | null;
+  net_amount: number | null;
+  description: string | null;
+};
+
 function csvEscape(value: unknown): string {
   if (value === null || value === undefined) return "";
   const s = String(value);
@@ -158,9 +166,6 @@ export async function GET(req: Request) {
         daysHeld != null && daysHeld > 365 ? "yes" : "no",
         t.exit_reason ?? "",
         t.buy_reason ?? "",
-        "", // commission_usd - placeholder, see NOTES
-        "", // commission_aud - placeholder
-        "", // withholding_tax_usd - placeholder
       ]);
     }
 
@@ -172,10 +177,13 @@ export async function GET(req: Request) {
         "capital_gain_aud", "capital_gain_usd",
         "days_held", "cgt_discount_eligible_over_12mo",
         "exit_reason", "entry_reason",
-        "commission_usd_placeholder", "commission_aud_placeholder", "withholding_tax_usd_placeholder",
       ],
       tradeRows
     );
+    // Note: Alpaca does not charge per-trade commissions on US equities, so
+    // there is no per-trade commission column here. Regulatory fees (e.g.
+    // SEC/FINRA transaction fees on sells) are account-level activities, not
+    // tied to an individual trade record - see regulatory_fees.csv.
 
     // ---- annual_summary.csv ----------------------------------------------
     const totalTrades = closedTrades.length;
@@ -228,15 +236,73 @@ export async function GET(req: Request) {
                "current_price_usd", "market_value_usd", "unrealized_pl_usd"], []);
     }
 
-    // ---- dividends.csv (placeholder - see NOTES) --------------------------
+    // ---- dividends.csv / regulatory_fees.csv ------------------------------
+    // Sourced from account_activities, populated by the bot's daily EOD job
+    // via Alpaca's account activities endpoint (DIV / DIVNRA / FEE) once
+    // it's connected to a real (dry_run/live) account - see bot/trading/
+    // alpaca_client.py's get_account_activities(). Paper-only accounts will
+    // have no rows here, since paper trading doesn't generate real activity
+    // records; the export still produces a valid (empty) file with headers
+    // in that case, same shape either way.
+    const activities = await query<AccountActivity>(
+      `SELECT activity_type, activity_date, symbol, net_amount, description
+       FROM account_activities
+       WHERE activity_date >= $1::date AND activity_date <= $2::date
+       ORDER BY activity_date ASC`,
+      [start, end]
+    );
+    const dividendActivities = activities.filter(
+      (a) => a.activity_type === "DIV" || a.activity_type === "DIVNRA"
+    );
+    const feeActivities = activities.filter((a) => a.activity_type === "FEE");
+    const hasRealActivityData = activities.length > 0;
+
+    const dividendRows: (string | number | null)[][] = [];
+    for (const d of dividendActivities) {
+      const activityDate = dateOnly(d.activity_date);
+      const rate = await rateFor(activityDate);
+      const amountUsd = Number(d.net_amount ?? 0);
+      const amountAud = Number.isFinite(rate.rate) ? usdToAud(amountUsd, rate.rate) : null;
+      dividendRows.push([
+        d.symbol ?? "",
+        activityDate,
+        d.activity_type,
+        amountUsd.toFixed(2),
+        rate.rate.toFixed(4),
+        amountAud != null ? amountAud.toFixed(2) : "",
+        d.description ?? "",
+      ]);
+    }
     const dividendsCsv =
-      "NOTE: Dividend data is not yet tracked by the bot. This file is a placeholder with the " +
-      "intended structure, ready to populate automatically once dividend recording is added " +
-      "(e.g. from Alpaca's account activities API).\r\n" +
+      (hasRealActivityData
+        ? ""
+        : "NOTE: No dividend/withholding activity recorded for this period yet - this is expected " +
+          "for a paper-trading-only account (Alpaca's paper accounts don't generate real dividend " +
+          "activity). Once connected to a live account (TRADING_MODE=dry_run or live), this " +
+          "populates automatically from Alpaca's account activities API - no export changes needed.\r\n") +
       toCsv(
-        ["symbol", "pay_date", "amount_usd", "fx_rate_aud_usd", "amount_aud", "withholding_tax_usd_placeholder", "franking_credits_placeholder"],
-        []
+        ["symbol", "activity_date", "activity_type", "amount_usd", "fx_rate_aud_usd", "amount_aud", "description"],
+        dividendRows
       );
+
+    // ---- regulatory_fees.csv ------------------------------------------------
+    const feeRows: (string | number | null)[][] = [];
+    for (const f of feeActivities) {
+      const activityDate = dateOnly(f.activity_date);
+      const rate = await rateFor(activityDate);
+      const amountUsd = Number(f.net_amount ?? 0);
+      const amountAud = Number.isFinite(rate.rate) ? usdToAud(amountUsd, rate.rate) : null;
+      feeRows.push([
+        activityDate, amountUsd.toFixed(2), rate.rate.toFixed(4),
+        amountAud != null ? amountAud.toFixed(2) : "", f.description ?? "",
+      ]);
+    }
+    const feesCsv =
+      (hasRealActivityData
+        ? ""
+        : "NOTE: No regulatory fee activity recorded for this period yet - same reason as " +
+          "dividends.csv (paper-trading-only account).\r\n") +
+      toCsv(["activity_date", "amount_usd", "fx_rate_aud_usd", "amount_aud", "description"], feeRows);
 
     // ---- fx_conversion_log.csv --------------------------------------------
     const fxRows = Array.from(fxLookupsUsed.values())
@@ -266,11 +332,15 @@ export async function GET(req: Request) {
       fx_conversion_method:
         "Each trade leg (entry and exit) converted independently using the AUD/USD rate on its own " +
         "transaction date, then subtracted - not a single blended rate applied to the net USD profit.",
+      has_real_dividend_fee_data: hasRealActivityData,
       disclaimer:
         "Generated automatically for record-keeping convenience. Verify figures, especially FX rates " +
-        "and CGT discount eligibility, with a registered tax agent before lodging a return. Commission, " +
-        "dividend, and withholding tax columns are placeholders pending live trading and are not yet " +
-        "populated with real data.",
+        "and CGT discount eligibility, with a registered tax agent before lodging a return. " +
+        (hasRealActivityData
+          ? "Dividend/withholding/fee figures are sourced from Alpaca's account activities API."
+          : "Dividend, withholding tax, and regulatory fee files are empty for this period - this " +
+            "account has been paper-trading only, which doesn't generate real activity records. " +
+            "These populate automatically once connected to a live account, no export changes needed."),
     };
 
     const zip = new JSZip();
@@ -278,6 +348,7 @@ export async function GET(req: Request) {
     zip.file("annual_summary.csv", summaryCsv);
     zip.file("open_positions_30_june.csv", positionsCsv);
     zip.file("dividends.csv", dividendsCsv);
+    zip.file("regulatory_fees.csv", feesCsv);
     zip.file("fx_conversion_log.csv", fxCsv);
     zip.file("metadata.json", JSON.stringify(metadata, null, 2));
 

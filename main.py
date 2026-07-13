@@ -78,8 +78,25 @@ def _maybe_start_health_server(port) -> None:
 
 
 def build(cfg):
+    # Pick credentials for the account this mode actually connects to. PAPER
+    # uses the existing ALPACA_API_KEY/SECRET_KEY; DRY_RUN and LIVE both
+    # connect to the real account and need the separate ALPACA_LIVE_* keys
+    # (bot/config.py's _validate already guarantees these are present for
+    # those modes before we get here).
+    live_mode = cfg.trading.mode in ("dry_run", "live")
+    api_key = cfg.trading.live_api_key if live_mode else cfg.alpaca.api_key
+    secret_key = cfg.trading.live_secret_key if live_mode else cfg.alpaca.secret_key
+
+    # Effective dry-run: DRY_RUN mode never submits, full stop. RISK_DRY_RUN
+    # remains an independent extra layer on top of that - it defaults to
+    # True, so even TRADING_MODE=live with LIVE_TRADING_CONFIRMED=true won't
+    # place a single real order until RISK_DRY_RUN is ALSO explicitly set to
+    # false. Three separate switches have to agree before real money moves.
+    cfg.risk.dry_run = cfg.risk.dry_run or (cfg.trading.mode == "dry_run")
+    allow_submit = not cfg.risk.dry_run
+
     broker = AlpacaBroker(
-        cfg.alpaca.api_key, cfg.alpaca.secret_key, cfg.alpaca.paper,
+        api_key, secret_key, mode=cfg.trading.mode, allow_submit=allow_submit,
         retry_attempts=cfg.retry.max_attempts, retry_base_delay=cfg.retry.base_delay_seconds,
     )
     universe = get_universe_provider(cfg)
@@ -116,10 +133,16 @@ def do_check(cfg) -> int:
     log = logging.getLogger("check")
     ok = True
 
-    # 1) Alpaca account / trading connectivity
+    # 1) Alpaca account / trading connectivity. --check never submits orders
+    # regardless of TRADING_MODE, so allow_submit is always False here; it
+    # still connects to whichever account (paper vs live) TRADING_MODE points
+    # at, so --check against dry_run/live verifies the LIVE account's keys.
+    live_mode = cfg.trading.mode in ("dry_run", "live")
+    check_api_key = cfg.trading.live_api_key if live_mode else cfg.alpaca.api_key
+    check_secret_key = cfg.trading.live_secret_key if live_mode else cfg.alpaca.secret_key
     try:
         broker = AlpacaBroker(
-            cfg.alpaca.api_key, cfg.alpaca.secret_key, cfg.alpaca.paper,
+            check_api_key, check_secret_key, mode=cfg.trading.mode, allow_submit=False,
             retry_attempts=cfg.retry.max_attempts, retry_base_delay=cfg.retry.base_delay_seconds,
         )
         acct = broker.account_snapshot()
@@ -131,7 +154,11 @@ def do_check(cfg) -> int:
                  is_open, len(positions))
     except Exception as exc:  # noqa: BLE001
         log.error("[FAIL] Alpaca connection/account: %s", exc)
-        log.error("       -> check ALPACA_API_KEY / ALPACA_SECRET_KEY (paper keys).")
+        if live_mode:
+            log.error("       -> check ALPACA_LIVE_API_KEY / ALPACA_LIVE_SECRET_KEY "
+                      f"(TRADING_MODE={cfg.trading.mode} connects to the LIVE account).")
+        else:
+            log.error("       -> check ALPACA_API_KEY / ALPACA_SECRET_KEY (paper keys).")
         return 1  # nothing else will work without this
 
     # 2) News read (a sample ticker)
@@ -211,10 +238,16 @@ def main() -> int:
     if args.force:
         cfg.risk.dry_run = True
 
-    mode = "DRY RUN (no orders submitted)" if cfg.risk.dry_run else "LIVE PAPER ORDERS"
     config_source = f"config.ini ({cfg.config_file_used}) + env vars" if cfg.config_file_used else "environment variables only"
-    log.info("Starting | universe=%s news=%s sentiment=%s | %s | config source: %s",
-             cfg.universe.provider, cfg.news.provider, cfg.sentiment.provider, mode, config_source)
+    log.info("Starting | universe=%s news=%s sentiment=%s | operating mode=%s | config source: %s",
+             cfg.universe.provider, cfg.news.provider, cfg.sentiment.provider,
+             cfg.trading.mode.upper(), config_source)
+    if cfg.trading.mode == "live":
+        log.warning(
+            "TRADING_MODE=live: this run connects to your LIVE Alpaca account. "
+            "RISK_DRY_RUN=%s (orders %s submit).",
+            cfg.risk.dry_run, "will NOT" if cfg.risk.dry_run else "WILL",
+        )
 
     try:
         broker, summary_logger, reporter, strategy, recorder = build(cfg)
@@ -235,21 +268,66 @@ def main() -> int:
         )
         return 1
 
+    # Human-readable status line, computed AFTER build() since that's what
+    # actually resolves the final dry-run state (mode + RISK_DRY_RUN combined).
+    if cfg.trading.mode == "live" and not cfg.risk.dry_run:
+        mode_label = "LIVE — REAL ORDERS WILL BE SUBMITTED"
+    elif cfg.trading.mode == "live":
+        mode_label = "LIVE account, DRY RUN (RISK_DRY_RUN=true — no orders submitted)"
+    elif cfg.trading.mode == "dry_run":
+        mode_label = "DRY RUN against LIVE account (no orders submitted)"
+    else:
+        mode_label = "PAPER" if not cfg.risk.dry_run else "PAPER, DRY RUN (no orders submitted)"
+    log.info("Resolved mode: %s", mode_label)
+
     _commit = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "")
     _env = os.environ.get("RAILWAY_ENVIRONMENT_NAME", "")
     _deploy_bits = " | ".join(
         b for b in [f"commit={_commit[:7]}" if _commit else "", f"env={_env}" if _env else ""] if b
     )
     recorder.record_notification(
-        type_="bot_restart", severity="info", title="Bot started",
+        type_="bot_restart", severity="info" if cfg.trading.mode != "live" else "warning",
+        title="Bot started",
         message=f"universe={cfg.universe.provider} news={cfg.news.provider} "
-                f"sentiment={cfg.sentiment.provider} mode={mode}"
+                f"sentiment={cfg.sentiment.provider} mode={mode_label}"
                 + (f" | {_deploy_bits}" if _deploy_bits else ""),
     )
+    # One row per startup for the dashboard's Live Readiness page - it can
+    # only see what's written to Postgres, never Railway's env vars
+    # directly. Only presence booleans are recorded, never the actual key
+    # values.
+    recorder.record_config_status(
+        trading_mode=cfg.trading.mode, live_confirmed=cfg.trading.live_confirmed,
+        risk_dry_run=cfg.risk.dry_run, allow_submit=broker.allow_submit,
+        has_paper_keys=bool(cfg.alpaca.api_key and cfg.alpaca.secret_key),
+        has_live_keys=bool(cfg.trading.live_api_key and cfg.trading.live_secret_key),
+        has_telegram=cfg.telegram.enabled,
+        commit_short=_commit[:7] if _commit else None, environment=_env or None,
+    )
+
+    def _sync_account_activities():
+        # Dividends / regulatory fees / non-resident withholding only exist
+        # against a real Alpaca account - paper accounts don't generate
+        # these, so skip the call entirely rather than log a confusing
+        # empty-result line every day. A 10-day lookback window with
+        # upsert-by-activity-id (see Recorder.record_account_activities)
+        # means a missed day is self-healing on the next run.
+        if cfg.trading.mode == "paper":
+            return
+        try:
+            from datetime import timedelta
+            after = (datetime.now(timezone.utc).date() - timedelta(days=10)).isoformat()
+            rows = broker.get_account_activities(after=after)
+            if rows:
+                recorder.record_account_activities(rows)
+                log.info("Synced %d account activities (dividends/fees/withholding).", len(rows))
+        except Exception as exc:  # noqa: BLE001 - best-effort, never block the EOD report
+            log.warning("Account activities sync failed: %s", exc)
 
     def run_eod():
         pv = broker.account_snapshot()["portfolio_value"]
         summary_logger.write_eod(pv)
+        _sync_account_activities()
         text = reporter.write()
         # Roll up anything the user configured as "daily summary only" in
         # the dashboard's Notification Settings (see bot/notifications/summary.py)

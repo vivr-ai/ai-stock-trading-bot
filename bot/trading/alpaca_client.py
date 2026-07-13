@@ -68,23 +68,46 @@ class FillInfo:
 
 
 class AlpacaBroker:
-    def __init__(self, api_key: str, secret_key: str, paper: bool = True,
+    """`mode` picks which Alpaca account this connects to ("paper" -> Alpaca's
+    paper endpoint; "dry_run"/"live" -> the real live endpoint, since dry-run
+    rehearses against real account data). `allow_submit` is a SEPARATE gate
+    controlling whether submit_bracket_buy/close_position are allowed to
+    actually place an order - this is the second layer of defense behind
+    bot/config.py's validation: even if a caller somehow reached this class
+    with mode="live" incorrectly, order methods still refuse unless
+    allow_submit is explicitly True. Belt and suspenders, on purpose - this
+    class trades real money in "live" mode and that deserves more than one
+    guard."""
+
+    def __init__(self, api_key: str, secret_key: str, mode: str = "paper",
+                 allow_submit: bool = False,
                  retry_attempts: int = 4, retry_base_delay: float = 1.0):
         from alpaca.trading.client import TradingClient
         from alpaca.data.historical import StockHistoricalDataClient
 
-        if not paper:
-            raise ValueError("AlpacaBroker refuses to run with paper=False")
+        if mode not in ("paper", "dry_run", "live"):
+            raise ValueError(f"AlpacaBroker: unknown mode '{mode}' (expected paper/dry_run/live)")
         if not api_key or not secret_key:
             raise ValueError(
-                "Alpaca API key/secret missing. Set ALPACA_API_KEY and "
-                "ALPACA_SECRET_KEY (env vars on Railway, or config.ini locally)."
+                "Alpaca API key/secret missing. Set ALPACA_API_KEY/ALPACA_SECRET_KEY (paper) "
+                "or ALPACA_LIVE_API_KEY/ALPACA_LIVE_SECRET_KEY (dry_run/live) as appropriate."
             )
 
-        self._trading = TradingClient(api_key, secret_key, paper=True)
+        self.mode = mode
+        self.connects_to_paper = (mode == "paper")
+        # In dry_run mode, submission is never allowed regardless of what's
+        # passed in - this is not configurable, on purpose.
+        self.allow_submit = bool(allow_submit) and mode != "dry_run"
+
+        self._trading = TradingClient(api_key, secret_key, paper=self.connects_to_paper)
         self._data = StockHistoricalDataClient(api_key, secret_key)
         self._retry_attempts = retry_attempts
         self._retry_base_delay = retry_base_delay
+        logger.info(
+            "AlpacaBroker initialized: mode=%s (%s account), order submission %s",
+            mode, "paper" if self.connects_to_paper else "LIVE",
+            "ENABLED" if self.allow_submit else "disabled",
+        )
 
     def _retry(self, fn, op_name: str):
         return call_with_retry(
@@ -101,7 +124,12 @@ class AlpacaBroker:
             return False  # fail-safe: treat as closed, do nothing
 
     def account_snapshot(self) -> Dict[str, float]:
-        """One call returns everything the cycle needs, with retries."""
+        """One call returns everything the cycle needs, with retries.
+
+        daytrade_count / pattern_day_trader come straight from Alpaca, which
+        is the authoritative source for PDT status (it enforces the rule,
+        we're just surfacing it) - see bot/trading/strategy.py's PDT warning
+        and the dashboard's Live Readiness page."""
         acct = self._retry(self._trading.get_account, "get_account")
         return {
             "portfolio_value": float(getattr(acct, "portfolio_value", acct.equity)),
@@ -109,6 +137,8 @@ class AlpacaBroker:
             "last_equity": float(acct.last_equity),
             "buying_power": float(acct.buying_power),
             "cash": float(getattr(acct, "cash", 0.0) or 0.0),
+            "daytrade_count": int(getattr(acct, "daytrade_count", 0) or 0),
+            "pattern_day_trader": bool(getattr(acct, "pattern_day_trader", False)),
         }
 
     def open_positions(self) -> Dict[str, float]:
@@ -317,6 +347,58 @@ class AlpacaBroker:
             )
         return None
 
+    def get_account_activities(self, after: Optional[str] = None,
+                                activity_types: Optional[List[str]] = None) -> List[Dict]:
+        """Dividends / regulatory fees / non-resident withholding, straight
+        from Alpaca's account activities endpoint. Only meaningful against a
+        real account (dry_run/live) - paper accounts don't generate these.
+
+        `after` is an ISO date string ('YYYY-MM-DD'); defaults to activity
+        types DIV (dividends), DIVNRA (non-resident-alien dividend
+        withholding - the one directly relevant to AU tax residents), and
+        FEE (regulatory fees). Degrades to an empty list on any failure
+        (unsupported SDK version, network hiccup, etc.) rather than raising,
+        matching every other read-path method in this class - the caller
+        (main.py's EOD job) treats this as best-effort, not required for a
+        trading cycle to succeed.
+        """
+        from alpaca.trading.requests import GetAccountActivitiesRequest
+
+        types = activity_types or ["DIV", "DIVNRA", "FEE"]
+        out: List[Dict] = []
+        try:
+            req = GetAccountActivitiesRequest(
+                activity_types=types, after=after, page_size=100,
+            )
+            activities = self._retry(
+                lambda: self._trading.get_account_activities(req), "get_account_activities"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("get_account_activities failed (skipping this sync): %s", exc)
+            return out
+
+        for a in activities or []:
+            try:
+                activity_date = getattr(a, "date", None) or getattr(a, "activity_date", None)
+                activity_date_str = str(activity_date)[:10] if activity_date else None
+                out.append({
+                    "activity_id": str(getattr(a, "id", "")),
+                    "activity_type": str(getattr(a, "activity_type", "")),
+                    "activity_date": activity_date_str,
+                    "symbol": getattr(a, "symbol", None),
+                    "net_amount": float(getattr(a, "net_amount", 0.0) or 0.0)
+                        if getattr(a, "net_amount", None) is not None else None,
+                    "qty": float(getattr(a, "qty", 0.0) or 0.0)
+                        if getattr(a, "qty", None) is not None else None,
+                    "per_share_amount": float(getattr(a, "per_share_amount", 0.0) or 0.0)
+                        if getattr(a, "per_share_amount", None) is not None else None,
+                    "description": getattr(a, "description", None),
+                    "raw": {k: str(v) for k, v in getattr(a, "__dict__", {}).items()},
+                })
+            except (TypeError, ValueError) as exc:
+                logger.warning("Skipping malformed account activity: %s", exc)
+        return out
+
     # ---- order placement -----------------------------------------------
     def submit_bracket_buy(self, symbol: str, qty: int, stop_price: float,
                            take_profit_price: float, client_order_id: str = None) -> PlacedOrder:
@@ -334,6 +416,12 @@ class AlpacaBroker:
         propagates so the caller logs it as a failed buy rather than assuming
         success.
         """
+        if not self.allow_submit:
+            raise RuntimeError(
+                f"submit_bracket_buy({symbol}) blocked: order submission is disabled in "
+                f"mode={self.mode}. This should never be reached in normal operation - the "
+                "strategy layer checks this first; this is the second line of defense."
+            )
         from alpaca.trading.requests import (
             MarketOrderRequest,
             StopLossRequest,
@@ -375,6 +463,12 @@ class AlpacaBroker:
             logger.warning("cancel_orders_for %s failed: %s", symbol, exc)
 
     def close_position(self, symbol: str) -> Optional[PlacedOrder]:
+        if not self.allow_submit:
+            raise RuntimeError(
+                f"close_position({symbol}) blocked: order submission is disabled in "
+                f"mode={self.mode}. This should never be reached in normal operation - the "
+                "strategy layer checks this first; this is the second line of defense."
+            )
         # Cancel the open bracket legs FIRST. Otherwise, after we flatten, a
         # leftover stop or limit leg can still execute and open an unintended
         # short position.

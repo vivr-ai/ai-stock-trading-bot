@@ -21,9 +21,33 @@ T = TypeVar("T")
 
 @dataclass
 class AlpacaConfig:
-    api_key: str
+    api_key: str      # PAPER account credentials
     secret_key: str
-    paper: bool = True
+
+
+@dataclass
+class TradingConfig:
+    """Which of the three operating modes the bot runs in, and the
+    credentials/confirmation that go with it. See README.md 'Operating
+    modes' section for the full explanation.
+
+      PAPER    - connects to Alpaca's paper account, executes paper trades.
+      DRY_RUN  - connects to the LIVE account, but never submits an order;
+                 only logs + notifies what it would have done. The safe way
+                 to rehearse against real account data/positions.
+      LIVE     - connects to the LIVE account and executes real trades.
+                 Requires live_confirmed=True as a second, independent gate
+                 (LIVE_TRADING_CONFIRMED env var) - TRADING_MODE=live alone
+                 is never sufficient.
+    """
+    mode: str                 # "paper" | "dry_run" | "live"
+    live_confirmed: bool
+    live_api_key: str          # LIVE account credentials (separate from paper's)
+    live_secret_key: str
+
+    @property
+    def connects_to_paper(self) -> bool:
+        return self.mode == "paper"
 
 
 @dataclass
@@ -134,6 +158,7 @@ class Config:
     retry: RetryConfig
     server: ServerConfig
     telegram: TelegramConfig
+    trading: TradingConfig
     project_root: str = field(default="")
     config_file_used: Optional[str] = field(default=None)
 
@@ -188,7 +213,6 @@ def load_config(path: str = "config.ini") -> Config:
         alpaca=AlpacaConfig(
             api_key=_get(parser, "alpaca", "api_key", "ALPACA_API_KEY", ""),
             secret_key=_get(parser, "alpaca", "secret_key", "ALPACA_SECRET_KEY", ""),
-            paper=_get(parser, "alpaca", "paper", "ALPACA_PAPER", True, bool),
         ),
         universe=UniverseConfig(
             provider=_get(parser, "universe", "provider", "UNIVERSE_PROVIDER", "static").lower(),
@@ -311,6 +335,12 @@ def load_config(path: str = "config.ini") -> Config:
         ),
         server=ServerConfig(port=int(port_raw) if port_raw.strip().isdigit() else None),
         telegram=_build_telegram_config(parser),
+        trading=TradingConfig(
+            mode=_get(parser, "trading", "mode", "TRADING_MODE", "paper").lower(),
+            live_confirmed=_get(parser, "trading", "live_confirmed", "LIVE_TRADING_CONFIRMED", False, bool),
+            live_api_key=_get(parser, "trading", "live_api_key", "ALPACA_LIVE_API_KEY", ""),
+            live_secret_key=_get(parser, "trading", "live_secret_key", "ALPACA_LIVE_SECRET_KEY", ""),
+        ),
         project_root=project_root,
         config_file_used=path if parser is not None else None,
     )
@@ -349,11 +379,37 @@ def _validate(cfg: Config) -> None:
         raise ValueError("news.provider / NEWS_PROVIDER must be 'alpaca', 'newsapi', or 'finnhub'")
     if cfg.sentiment.provider not in ("lexicon", "claude", "openai"):
         raise ValueError("sentiment.provider / SENTIMENT_PROVIDER must be 'lexicon', 'claude', or 'openai'")
-    if not cfg.alpaca.paper:
+
+    # ---- Operating mode: PAPER / DRY_RUN / LIVE --------------------------
+    # This replaces the old hard-coded "refuses to run against a live
+    # account" check with a deliberate three-mode architecture. PAPER is
+    # the only mode that doesn't need live credentials or confirmation, so
+    # a fresh deploy with no TRADING_MODE set behaves exactly as before.
+    if cfg.trading.mode not in ("paper", "dry_run", "live"):
         raise ValueError(
-            "alpaca.paper / ALPACA_PAPER is false. This project is built for paper "
-            "trading; refusing to start against a live account."
+            "TRADING_MODE must be 'paper', 'dry_run', or 'live' (got "
+            f"'{cfg.trading.mode}')."
         )
+    if cfg.trading.mode in ("dry_run", "live"):
+        live_missing = []
+        if not cfg.trading.live_api_key:
+            live_missing.append("ALPACA_LIVE_API_KEY")
+        if not cfg.trading.live_secret_key:
+            live_missing.append("ALPACA_LIVE_SECRET_KEY")
+        if live_missing:
+            raise ValueError(
+                f"TRADING_MODE={cfg.trading.mode} connects to your LIVE Alpaca account, which "
+                "needs its own credentials (separate from your paper keys). Missing: "
+                + ", ".join(live_missing) + ". Get these from Alpaca's live account dashboard."
+            )
+    if cfg.trading.mode == "live" and not cfg.trading.live_confirmed:
+        raise ValueError(
+            "TRADING_MODE=live requires LIVE_TRADING_CONFIRMED=true as a second, independent "
+            "confirmation that you intend to place real orders with real money. Setting "
+            "TRADING_MODE=live alone is never sufficient. If you want to rehearse against the "
+            "live account first without risk, use TRADING_MODE=dry_run instead."
+        )
+
     if not (-10 <= cfg.strategy.sell_threshold < cfg.strategy.buy_threshold <= 10):
         raise ValueError("thresholds must satisfy -10 <= sell < buy <= 10")
     if cfg.logging.log_format not in ("text", "json"):

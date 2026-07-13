@@ -80,6 +80,8 @@ class SentimentStrategy:
         # Guards the daily-loss-limit notification so it fires once per
         # breach-day, not every 30-min cycle for the rest of the day.
         self._daily_loss_notified_date: Optional[str] = None
+        # Same one-per-day guard for the PDT warning (see _maybe_notify_pdt).
+        self._pdt_notified_date: Optional[str] = None
 
     def run_cycle(self, force: bool = False, scheduler_status: str = "scheduled") -> None:
         if not force and not self.broker.is_market_open():
@@ -118,8 +120,11 @@ class SentimentStrategy:
             dry_run=self.cfg.risk.dry_run, portfolio_value=acct.get("portfolio_value"),
             cash=acct.get("cash"), equity=acct.get("equity"),
             buying_power=acct.get("buying_power"), open_positions=len(open_positions),
-            api_latency_ms=api_latency_ms,
+            api_latency_ms=api_latency_ms, trading_mode=self.cfg.trading.mode,
+            daytrade_count=acct.get("daytrade_count"),
+            pattern_day_trader=acct.get("pattern_day_trader"),
         )
+        self._maybe_notify_pdt(acct)
         self.recorder.record_portfolio_snapshot(
             portfolio_value=acct.get("portfolio_value"), cash=acct.get("cash"),
             equity=acct.get("equity"), buying_power=acct.get("buying_power"),
@@ -232,6 +237,50 @@ class SentimentStrategy:
             open_positions=len(open_positions),
             exposure=exposure,
             stats=stats,
+        )
+
+    def _maybe_notify_pdt(self, acct) -> None:
+        """Pattern Day Trader warning: FINRA restricts accounts under $25,000
+        equity to 3 day trades per rolling 5-business-day window before
+        they're flagged and blocked from opening new positions. Alpaca's
+        `daytrade_count` / `pattern_day_trader` fields (surfaced by
+        account_snapshot()) are the authoritative source - it enforces the
+        rule, this just warns before it bites. Paper accounts don't
+        meaningfully enforce PDT, but the count is still shown for
+        awareness; the warning fires regardless of mode since it's useful
+        practice for anyone planning to go live. Fires at most once per
+        calendar day, same guard pattern as the daily-loss-limit notice."""
+        daytrade_count = acct.get("daytrade_count")
+        pattern_day_trader = acct.get("pattern_day_trader")
+        equity = acct.get("equity")
+        if daytrade_count is None:
+            return
+        approaching = daytrade_count >= 3  # the 4th day trade triggers the flag
+        under_25k = equity is not None and equity < 25000
+        if not (approaching or pattern_day_trader):
+            return
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self._pdt_notified_date == today:
+            return
+        self._pdt_notified_date = today
+        if pattern_day_trader:
+            title = "Pattern Day Trader flag is ACTIVE on this account"
+            severity = "critical"
+            detail = ("Alpaca has flagged this account as a Pattern Day Trader. "
+                      "New positions may be restricted until equity is at or above "
+                      "$25,000." if under_25k else
+                      "Alpaca has flagged this account as a Pattern Day Trader.")
+        else:
+            title = f"Approaching Pattern Day Trader limit ({daytrade_count}/4 day trades)"
+            severity = "warning"
+            detail = (
+                f"{daytrade_count} day trades in the current rolling 5-business-day window. "
+                "One more day trade will flag this account as a Pattern Day Trader"
+                + (", which restricts trading below $25,000 equity." if under_25k else ".")
+            )
+        self.recorder.record_notification(
+            type_="pdt_warning", severity=severity, title=title,
+            message=f"{detail} mode={self.cfg.trading.mode} equity={equity}",
         )
 
     def _sync_open_positions_snapshot(self, portfolio_value) -> None:

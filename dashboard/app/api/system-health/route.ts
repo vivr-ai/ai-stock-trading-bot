@@ -21,6 +21,9 @@ type Heartbeat = {
   market_open: boolean | null;
   dry_run: boolean | null;
   api_latency_ms: number | null;
+  trading_mode: string | null;
+  daytrade_count: number | null;
+  pattern_day_trader: boolean | null;
 };
 
 type DeployMeta = {
@@ -52,7 +55,7 @@ export async function GET() {
     const [heartbeat, lastScan, lastDeploy, lastBrokerIssue, lastSchedulerFailure, lastDbFailure] =
       await Promise.all([
         queryOne<Heartbeat>(
-          "SELECT ts, status, scheduler_status, market_open, dry_run, api_latency_ms FROM heartbeats ORDER BY ts DESC LIMIT 1"
+          "SELECT ts, status, scheduler_status, market_open, dry_run, api_latency_ms, trading_mode, daytrade_count, pattern_day_trader FROM heartbeats ORDER BY ts DESC LIMIT 1"
         ),
         queryOne<{ ts: string }>(
           "SELECT ts FROM decisions WHERE decision = 'scan' ORDER BY ts DESC LIMIT 1"
@@ -123,6 +126,9 @@ export async function GET() {
         ageMinutes: heartbeatAgeMinutes,
         marketOpen: heartbeat?.market_open ?? null,
         dryRun: heartbeat?.dry_run ?? null,
+        tradingMode: heartbeat?.trading_mode ?? null,
+        daytradeCount: heartbeat?.daytrade_count ?? null,
+        patternDayTrader: heartbeat?.pattern_day_trader ?? null,
       },
       botStatus,
       scheduler: {

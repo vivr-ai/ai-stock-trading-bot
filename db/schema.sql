@@ -28,7 +28,10 @@ CREATE TABLE IF NOT EXISTS heartbeats (
     buying_power      NUMERIC,
     open_positions    INTEGER,
     message           TEXT,
-    api_latency_ms    NUMERIC          -- Alpaca account_snapshot() round-trip time, for System Health
+    api_latency_ms    NUMERIC,        -- Alpaca account_snapshot() round-trip time, for System Health
+    trading_mode      TEXT,           -- 'paper' | 'dry_run' | 'live', from cfg.trading.mode
+    daytrade_count    INTEGER,        -- Alpaca's own day-trade counter (PDT rule uses a 5-business-day window)
+    pattern_day_trader BOOLEAN        -- Alpaca's own PDT-flagged status for this account
 );
 CREATE INDEX IF NOT EXISTS idx_heartbeats_ts ON heartbeats (ts DESC);
 
@@ -36,6 +39,12 @@ CREATE INDEX IF NOT EXISTS idx_heartbeats_ts ON heartbeats (ts DESC);
 -- CREATE TABLE above) so this column also lands on databases where
 -- heartbeats already existed before this column was introduced.
 ALTER TABLE heartbeats ADD COLUMN IF NOT EXISTS api_latency_ms NUMERIC;
+
+-- Added by the 3-mode / Live Readiness phase; same ALTER-for-existing-DBs
+-- reasoning as api_latency_ms above.
+ALTER TABLE heartbeats ADD COLUMN IF NOT EXISTS trading_mode TEXT;
+ALTER TABLE heartbeats ADD COLUMN IF NOT EXISTS daytrade_count INTEGER;
+ALTER TABLE heartbeats ADD COLUMN IF NOT EXISTS pattern_day_trader BOOLEAN;
 
 -- ---------------------------------------------------------------------
 -- decisions: EVERY decision the strategy makes each cycle, whether or not
@@ -216,5 +225,54 @@ INSERT INTO notification_settings (type, channel, enabled, label, description) V
     ('broker_issue', 'immediate', true, 'Broker/API connection failure', 'Alpaca account snapshot or data calls failing after retries.'),
     ('database_failure', 'immediate', true, 'Database failure', 'Dashboard Postgres writes failing (trading itself is unaffected).'),
     ('scheduler_failure', 'immediate', true, 'Scheduler failure', 'The internal job scheduler crashed and is restarting itself.'),
-    ('error', 'immediate', true, 'Critical application errors', 'Order failures, startup failures, and other unexpected errors.')
+    ('error', 'immediate', true, 'Critical application errors', 'Order failures, startup failures, and other unexpected errors.'),
+    ('pdt_warning', 'immediate', true, 'Pattern Day Trader warning', 'Fires once per day when day-trade count is approaching the 4-in-5-business-days PDT threshold on an account under $25,000.')
 ON CONFLICT (type) DO NOTHING;
+
+-- ---------------------------------------------------------------------
+-- config_status: one row per bot startup, recording which operating mode
+-- and safety switches were resolved (never secret VALUES - only booleans
+-- for "is this credential present") plus deploy metadata. The dashboard's
+-- Live Readiness page reads the latest row, since it can only see what's in
+-- Postgres - it has no way to read Railway's environment variables directly.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS config_status (
+    id                    BIGSERIAL PRIMARY KEY,
+    ts                    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    trading_mode          TEXT NOT NULL,      -- 'paper' | 'dry_run' | 'live'
+    live_confirmed        BOOLEAN NOT NULL DEFAULT false,
+    risk_dry_run          BOOLEAN NOT NULL DEFAULT true,
+    allow_submit          BOOLEAN NOT NULL DEFAULT false,  -- resolved AlpacaBroker.allow_submit
+    has_paper_keys        BOOLEAN NOT NULL DEFAULT false,
+    has_live_keys         BOOLEAN NOT NULL DEFAULT false,
+    has_telegram          BOOLEAN NOT NULL DEFAULT false,
+    has_database          BOOLEAN NOT NULL DEFAULT true,   -- always true if this row exists at all
+    commit_short          TEXT,
+    environment           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_config_status_ts ON config_status (ts DESC);
+
+-- ---------------------------------------------------------------------
+-- account_activities: dividends, regulatory fees, and non-resident
+-- withholding tax, sourced from Alpaca's account activities endpoint
+-- (activity types DIV / DIVNRA / FEE, among others). Populated by the
+-- bot's daily EOD job once it's connected to a real (dry_run/live) Alpaca
+-- account - paper accounts don't generate these. Upserted on Alpaca's own
+-- activity id, so re-fetching an overlapping window is always safe.
+-- Consumed directly by the dashboard's Accountant Export, replacing the
+-- placeholder dividend/fee/withholding columns from the Phase 4 export.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS account_activities (
+    activity_id     TEXT PRIMARY KEY,   -- Alpaca's own activity id
+    activity_type   TEXT NOT NULL,      -- 'DIV' | 'DIVNRA' | 'FEE' | ...
+    activity_date   DATE NOT NULL,
+    symbol          TEXT,
+    net_amount      NUMERIC,
+    qty             NUMERIC,
+    per_share_amount NUMERIC,
+    description     TEXT,
+    raw             JSONB,              -- full activity payload, for audit / future fields
+    synced_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_account_activities_date ON account_activities (activity_date);
+CREATE INDEX IF NOT EXISTS idx_account_activities_type ON account_activities (activity_type);
