@@ -326,6 +326,25 @@ CREATE TABLE IF NOT EXISTS pattern_discovery_findings (
 CREATE INDEX IF NOT EXISTS idx_pattern_findings_run ON pattern_discovery_findings (run_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pattern_findings_category ON pattern_discovery_findings (category);
 
+-- ---------------------------------------------------------------------
+-- strategy_health_scores: one row per computation of the Phase 5 Strategy
+-- Health Score (see dashboard/lib/strategyHealth.ts). Recomputed fresh from
+-- current data every time the Strategy Health page loads, then a snapshot is
+-- persisted here purely so the page can chart the score's trend over time -
+-- the live "current" score shown on the page always comes from the fresh
+-- computation, never a stale row.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS strategy_health_scores (
+    id                BIGSERIAL PRIMARY KEY,
+    computed_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    overall_score     NUMERIC,          -- NULL if there wasn't enough data to compute anything
+    confidence_level  TEXT NOT NULL DEFAULT 'insufficient', -- 'insufficient' | 'low' | 'medium' | 'high'
+    total_trades      INTEGER NOT NULL DEFAULT 0,
+    strategy_version  TEXT,
+    components        JSONB             -- full per-component breakdown, see HealthComponent type
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_health_computed ON strategy_health_scores (computed_at DESC);
+
 INSERT INTO notification_settings (type, channel, enabled, label, description) VALUES
     ('bot_restart', 'immediate', true, 'Bot started / restarted', 'Fires whenever the process starts, including redeploys and crash-restarts.'),
     ('bot_stopped_unexpectedly', 'immediate', true, 'Bot stopped unexpectedly', 'Fires when the process exits due to an unhandled error, not a deliberate stop.'),
