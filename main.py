@@ -5,6 +5,8 @@ Usage:
     python main.py                 # start scheduler: every 30 min, market hours
     python main.py --once          # run one cycle now and exit (good for testing)
     python main.py --eod           # write an end-of-day performance report now and exit
+    python main.py --monthly-report  # generate the monthly research report now and exit
+                                    #   (calls the dashboard - see DASHBOARD_INTERNAL_URL)
     python main.py --config PATH   # use an alternate config.ini (optional; env vars
                                     #   always take precedence — see .env.example)
 
@@ -216,6 +218,8 @@ def main() -> int:
                         help="verify keys connect + print paper balance, then exit")
     parser.add_argument("--eod", action="store_true",
                         help="write the daily performance report now and exit")
+    parser.add_argument("--monthly-report", action="store_true",
+                        help="generate the monthly research report now (calls the dashboard) and exit")
     args = parser.parse_args()
 
     try:
@@ -357,6 +361,50 @@ def main() -> int:
                 message=weekly_text,
             )
 
+    def run_monthly_report():
+        # Optional integration: the actual analysis (Performance Analytics,
+        # Pattern Discovery, Strategy Health, AI narrative) lives in the
+        # dashboard's TypeScript codebase - see dashboard/lib/monthlyReport.ts
+        # and dashboard/app/api/monthly-report/route.ts - so this doesn't
+        # duplicate that logic in Python, it just triggers it and relays the
+        # result to Telegram via the existing notification pipeline. If
+        # DASHBOARD_INTERNAL_URL / DASHBOARD_INTERNAL_API_KEY aren't set,
+        # this quietly no-ops - the dashboard's own "Generate Report Now"
+        # button still works standalone without the bot ever calling it.
+        if not cfg.dashboard.internal_url or not cfg.dashboard.internal_api_key:
+            log.info(
+                "Monthly research report skipped: DASHBOARD_INTERNAL_URL / "
+                "DASHBOARD_INTERNAL_API_KEY not configured."
+            )
+            return
+        try:
+            import requests
+
+            resp = requests.post(
+                f"{cfg.dashboard.internal_url.rstrip('/')}/api/monthly-report",
+                json={"model": "haiku"},  # Haiku for scheduled runs, per the cost/latency default
+                headers={"x-internal-api-key": cfg.dashboard.internal_api_key},
+                timeout=120,  # report generation calls the Anthropic API server-side; give it room
+            )
+            if resp.status_code != 200:
+                log.warning(
+                    "Monthly research report request failed: HTTP %d %s",
+                    resp.status_code, resp.text[:300],
+                )
+                return
+            payload = resp.json()
+            summary = payload.get("telegramSummary") or "Monthly research report generated - see the dashboard for details."
+            recorder.record_notification(
+                type_="monthly_research_report", severity="info",
+                title="Monthly Research Report", message=summary,
+            )
+            log.info("Monthly research report generated and recorded.")
+        except Exception as exc:  # noqa: BLE001 - best-effort, must never crash the scheduler
+            log.warning("Monthly research report failed: %s", exc)
+
+    if args.monthly_report:
+        run_monthly_report()
+        return 0
     if args.eod:
         run_eod()
         return 0
@@ -385,6 +433,7 @@ def main() -> int:
         start_scheduler(
             cfg, run_cycle_safely,
             eod_fn=run_eod, shutdown_event=_shutdown, on_crash=on_scheduler_crash,
+            monthly_report_fn=run_monthly_report,
         )
     except Exception as exc:  # noqa: BLE001 - truly unhandled; last-resort alert before exit
         log.exception("Bot process is exiting due to an unhandled error: %s", exc)

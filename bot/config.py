@@ -146,6 +146,18 @@ class TelegramConfig:
 
 
 @dataclass
+class DashboardConfig:
+    # Used only for the monthly research report (see main.py's
+    # run_monthly_report / bot/scheduler.py): the bot calls the dashboard's
+    # own /api/monthly-report route (which has all the Strategy Intelligence
+    # analysis logic) over HTTP, rather than duplicating that TypeScript
+    # logic in Python. Both blank means the monthly job silently no-ops -
+    # this is optional, not required for the bot's core trading loop.
+    internal_url: str
+    internal_api_key: str
+
+
+@dataclass
 class Config:
     alpaca: AlpacaConfig
     universe: UniverseConfig
@@ -159,6 +171,7 @@ class Config:
     server: ServerConfig
     telegram: TelegramConfig
     trading: TradingConfig
+    dashboard: DashboardConfig
     project_root: str = field(default="")
     config_file_used: Optional[str] = field(default=None)
 
@@ -340,6 +353,12 @@ def load_config(path: str = "config.ini") -> Config:
             live_confirmed=_get(parser, "trading", "live_confirmed", "LIVE_TRADING_CONFIRMED", False, bool),
             live_api_key=_get(parser, "trading", "live_api_key", "ALPACA_LIVE_API_KEY", ""),
             live_secret_key=_get(parser, "trading", "live_secret_key", "ALPACA_LIVE_SECRET_KEY", ""),
+        ),
+        dashboard=DashboardConfig(
+            internal_url=_get(parser, "dashboard", "internal_url", "DASHBOARD_INTERNAL_URL", ""),
+            internal_api_key=_get(
+                parser, "dashboard", "internal_api_key", "DASHBOARD_INTERNAL_API_KEY", ""
+            ),
         ),
         project_root=project_root,
         config_file_used=path if parser is not None else None,

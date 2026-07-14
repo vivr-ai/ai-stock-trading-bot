@@ -14,6 +14,15 @@ performance report.
 
 ---
 
+> **Strategy Intelligence layer:** the dashboard's Strategy Intelligence /
+> Pattern Discovery / Recommendations / Strategy Health / Backtesting pages
+> analyse historical performance and produce advisory-only recommendations -
+> they never modify trading behaviour automatically. Every heuristic, proxy,
+> and scope boundary used to build that layer is logged in
+> [`docs/strategy-intelligence-limitations.md`](docs/strategy-intelligence-limitations.md),
+> and summarised in a "Known limitations" panel on the Strategy Intelligence
+> page itself.
+
 ## Operating modes: PAPER / DRY_RUN / LIVE
 
 The bot has three operating modes, selected by `TRADING_MODE`. Switching
@@ -89,6 +98,15 @@ let you repoint the model IDs without a code change if Anthropic renames a
 model: `RESEARCH_MODEL_HAIKU` (default `claude-haiku-4-5-20251001`, used for
 scheduled/cheap runs) and `RESEARCH_MODEL_SONNET` (default `claude-sonnet-5`,
 used when you pick "Sonnet" on demand in the dashboard).
+
+**Monthly Research Report automation** (Phase 7): for the bot to trigger this
+automatically once a month, set `DASHBOARD_INTERNAL_API_KEY` on the
+**dashboard** service (any random secret string - it's a shared secret between
+the two services, not a real login) and the matching `DASHBOARD_INTERNAL_URL`
+/ `DASHBOARD_INTERNAL_API_KEY` pair on the **bot** service (see
+`.env.example`). Without these, the monthly job silently no-ops - the
+dashboard's own "Generate Report Now" button on `/monthly-report` still works
+without the bot ever calling it.
 
 ---
 

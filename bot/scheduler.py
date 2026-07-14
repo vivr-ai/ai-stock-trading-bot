@@ -23,7 +23,8 @@ logger = logging.getLogger(__name__)
 
 
 def start_scheduler(cfg, run_cycle_fn: Callable, eod_fn: Optional[Callable] = None,
-                     shutdown_event=None, on_crash: Optional[Callable[[str], None]] = None) -> None:
+                     shutdown_event=None, on_crash: Optional[Callable[[str], None]] = None,
+                     monthly_report_fn: Optional[Callable] = None) -> None:
     from apscheduler.schedulers.blocking import BlockingScheduler
     from apscheduler.triggers.cron import CronTrigger
 
@@ -50,6 +51,17 @@ def start_scheduler(cfg, run_cycle_fn: Callable, eod_fn: Optional[Callable] = No
                 eod_fn,
                 CronTrigger(day_of_week="mon-fri", hour="16", minute="5", timezone=tz),
                 id="eod_summary", max_instances=1, misfire_grace_time=300,
+            )
+        if monthly_report_fn is not None:
+            # 1st of the month, 06:00 in the configured market timezone - well
+            # before market open, and not tied to a trading day (unlike the
+            # cycle/eod jobs) since this is a research artifact, not a trade.
+            # misfire_grace_time is generous (a day) since missing the exact
+            # hour on a Railway restart is harmless for a monthly job.
+            scheduler.add_job(
+                monthly_report_fn,
+                CronTrigger(day="1", hour="6", minute="0", timezone=tz),
+                id="monthly_research_report", max_instances=1, misfire_grace_time=86_400,
             )
 
         def _handle_stop(signum, _frame):

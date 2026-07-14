@@ -8,8 +8,84 @@ import WinRateBreakdownChart from "@/components/WinRateBreakdownChart";
 import { fmtMoney, timeAgo } from "@/lib/format";
 import {
   Percent, TrendingUp, TrendingDown, Gauge, ListChecks, Target,
-  CalendarClock, Repeat, BrainCircuit, GitBranch, LineChart as LineChartIcon,
+  CalendarClock, Repeat, BrainCircuit, GitBranch, LineChart as LineChartIcon, Info,
 } from "lucide-react";
+
+// Running log of every heuristic/scope boundary across the whole Strategy
+// Intelligence layer (Phases 1-6+), so it's one click away instead of buried
+// in code comments. Full detail (with the reasoning behind each) lives in
+// docs/strategy-intelligence-limitations.md in the repo - this is the short
+// version for the dashboard.
+const KNOWN_LIMITATIONS: { phase: string; items: string[] }[] = [
+  {
+    phase: "Performance Analytics",
+    items: [
+      "Market regime is a heuristic from SPY's own change % and price-vs-SMA, not a dedicated volatility/VIX model.",
+      "\"Confidence score\" is the bot's raw -10..+10 sentiment score, not a 0-100% probability.",
+    ],
+  },
+  {
+    phase: "Pattern Discovery",
+    items: [
+      "News source predictive value isn't measurable - NEWS_PROVIDER is one global setting, not recorded per trade.",
+      "Stop-loss vs. take-profit exit classification is inferred from P&L sign, not a literal field - never marked statistically significant.",
+    ],
+  },
+  {
+    phase: "AI Research Assistant",
+    items: [
+      "Only produces a recommendation when a finding supports it - won't invent one to fill space.",
+      "A backtestable \"proposedConfigChange\" is only attached for 4 simple rule types; most recommendations need manual review.",
+    ],
+  },
+  {
+    phase: "Strategy Health Score",
+    items: [
+      "Sample size is shown as a confidence label, never used to numerically deflate the score.",
+      "Several scaling factors (Sharpe-to-score, drawdown penalty, stability) are hand-tuned heuristics, not industry standards.",
+    ],
+  },
+  {
+    phase: "Backtesting",
+    items: [
+      "Can only simulate trade-filtering rules (confidence threshold, sector/symbol exclusion, regime restriction).",
+      "Cannot simulate a different stop-loss/take-profit level or position size - would need intraday price data not stored.",
+      "Its \"max drawdown\"/\"risk-adjusted ratio\" are synthetic, built from the trade subset's own P&L sequence - not the same numbers shown on Performance/Strategy Health.",
+    ],
+  },
+  {
+    phase: "Monthly Research Report",
+    items: [
+      "The automatic monthly trigger lives in the Python bot's scheduler, not the dashboard - the dashboard's \"Generate Report Now\" button always works standalone either way.",
+      "If the AI call fails, the report falls back to a short data-only summary rather than skipping the month entirely.",
+    ],
+  },
+];
+
+function KnownLimitationsPanel() {
+  return (
+    <details className="rounded-xl border border-dashed border-bg-border bg-bg-panel/50 p-4">
+      <summary className="flex cursor-pointer items-center gap-2 text-sm font-medium text-white">
+        <Info size={15} /> Known limitations across this feature
+      </summary>
+      <div className="mt-3 space-y-3">
+        {KNOWN_LIMITATIONS.map((group) => (
+          <div key={group.phase}>
+            <div className="text-xs font-semibold text-muted">{group.phase}</div>
+            <ul className="mt-1 list-disc space-y-1 pl-4">
+              {group.items.map((item, i) => (
+                <li key={i} className="text-xs text-muted">{item}</li>
+              ))}
+            </ul>
+          </div>
+        ))}
+        <p className="text-xs text-muted">
+          Full detail and reasoning: <code className="text-white">docs/strategy-intelligence-limitations.md</code> in the repo.
+        </p>
+      </div>
+    </details>
+  );
+}
 
 type Bucket = {
   key: string; trades: number; winRatePct: number | null; avgPnl: number | null;
@@ -179,9 +255,13 @@ export default function StrategyIntelligencePage() {
       <div className="mb-6">
         <h1 className="text-xl font-semibold text-white">Strategy Intelligence</h1>
         <p className="text-sm text-muted">
-          Analytics only - this page never changes trading behaviour. Recommendations and approvals
-          arrive in a later phase.
+          Analytics only - this page never changes trading behaviour. Recommendations and approval
+          workflow live on the Recommendations page.
         </p>
+      </div>
+
+      <div className="mb-6">
+        <KnownLimitationsPanel />
       </div>
 
       {loading && <LoadingSkeleton rows={6} />}

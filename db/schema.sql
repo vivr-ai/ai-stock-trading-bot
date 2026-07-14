@@ -345,6 +345,34 @@ CREATE TABLE IF NOT EXISTS strategy_health_scores (
 );
 CREATE INDEX IF NOT EXISTS idx_strategy_health_computed ON strategy_health_scores (computed_at DESC);
 
+-- ---------------------------------------------------------------------
+-- monthly_research_reports: one row per Phase 7 monthly rollup (see
+-- dashboard/lib/monthlyReport.ts). Generated either on-demand from the
+-- dashboard's Monthly Report page, or automatically once a month by the
+-- Python bot's scheduler calling POST /api/monthly-report (see main.py's
+-- run_monthly_report and bot/scheduler.py) - both paths write here.
+-- telegram_summary is a short plain-text digest suitable for a Telegram
+-- message; the rest are full plain-English sections shown on the dashboard.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS monthly_research_reports (
+    id                        BIGSERIAL PRIMARY KEY,
+    generated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    period_start              TIMESTAMPTZ NOT NULL,
+    period_end                TIMESTAMPTZ NOT NULL,
+    model_used                TEXT NOT NULL,
+    total_trades              INTEGER NOT NULL DEFAULT 0,
+    strategy_health_score     NUMERIC,
+    overall_performance       JSONB,
+    lessons_learned           TEXT,
+    emerging_patterns         TEXT,
+    potential_optimizations   TEXT,
+    market_observations       TEXT,
+    recommended_improvements  TEXT,
+    telegram_summary          TEXT,
+    sent_via_telegram         BOOLEAN NOT NULL DEFAULT false
+);
+CREATE INDEX IF NOT EXISTS idx_monthly_reports_generated ON monthly_research_reports (generated_at DESC);
+
 INSERT INTO notification_settings (type, channel, enabled, label, description) VALUES
     ('bot_restart', 'immediate', true, 'Bot started / restarted', 'Fires whenever the process starts, including redeploys and crash-restarts.'),
     ('bot_stopped_unexpectedly', 'immediate', true, 'Bot stopped unexpectedly', 'Fires when the process exits due to an unhandled error, not a deliberate stop.'),
@@ -358,7 +386,8 @@ INSERT INTO notification_settings (type, channel, enabled, label, description) V
     ('scheduler_failure', 'immediate', true, 'Scheduler failure', 'The internal job scheduler crashed and is restarting itself.'),
     ('error', 'immediate', true, 'Critical application errors', 'Order failures, startup failures, and other unexpected errors.'),
     ('pdt_warning', 'immediate', true, 'Pattern Day Trader warning', 'Fires once per day when day-trade count is approaching the 4-in-5-business-days PDT threshold on an account under $25,000.'),
-    ('strategy_recommendation', 'daily_summary', true, 'New strategy recommendation', 'Fires when Pattern Discovery or the AI Research Assistant produces a new recommendation for your review - advisory only, never applied automatically.')
+    ('strategy_recommendation', 'daily_summary', true, 'New strategy recommendation', 'Fires when Pattern Discovery or the AI Research Assistant produces a new recommendation for your review - advisory only, never applied automatically.'),
+    ('monthly_research_report', 'immediate', true, 'Monthly research report', 'Fires once a month (or whenever you generate one on-demand) with a short performance/pattern-health summary - full detail lives on the Monthly Report dashboard page.')
 ON CONFLICT (type) DO NOTHING;
 
 -- ---------------------------------------------------------------------
