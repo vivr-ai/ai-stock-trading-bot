@@ -292,6 +292,40 @@ CREATE TABLE IF NOT EXISTS strategy_recommendations (
 CREATE INDEX IF NOT EXISTS idx_strategy_recommendations_status ON strategy_recommendations (status);
 CREATE INDEX IF NOT EXISTS idx_strategy_recommendations_created ON strategy_recommendations (created_at DESC);
 
+-- ---------------------------------------------------------------------
+-- pattern_discovery_findings: one row per statistical finding, per analysis
+-- run (see dashboard/lib/patternDiscovery.ts). Recomputed fresh from
+-- ALL-TIME closed_trades every time the Pattern Discovery page loads (or its
+-- API route is hit) - deliberately not recency-weighted, so a handful of
+-- lucky/unlucky recent trades can't dominate a "pattern." Every finding
+-- records its own sample size and whether it cleared that category's
+-- minimum-sample bar, so the dashboard can grey out anything under-evidenced
+-- instead of presenting it as a real conclusion. This table is a history/
+-- audit log read by the AI Research Assistant (Phase 4) and the Monthly
+-- Report (Phase 7) - Pattern Discovery itself never writes to
+-- strategy_recommendations directly.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS pattern_discovery_findings (
+    id                    BIGSERIAL PRIMARY KEY,
+    run_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+    category              TEXT NOT NULL,   -- 'confidence_threshold' | 'sector' | 'holding_period' |
+                                            -- 'symbol_underperformance' | 'stop_loss' | 'take_profit' |
+                                            -- 'volatility' | 'position_sizing' | 'sentiment_reasoning' | 'news_source'
+    title                 TEXT NOT NULL,
+    description           TEXT NOT NULL,
+    sample_size           INTEGER NOT NULL,
+    baseline_sample_size  INTEGER,
+    statistical_method     TEXT,
+    p_value               NUMERIC,
+    effect_size           NUMERIC,
+    meets_min_sample      BOOLEAN NOT NULL DEFAULT false,
+    is_significant        BOOLEAN NOT NULL DEFAULT false,
+    confidence_level      TEXT NOT NULL DEFAULT 'insufficient', -- 'insufficient' | 'low' | 'medium' | 'high'
+    raw                   JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_pattern_findings_run ON pattern_discovery_findings (run_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pattern_findings_category ON pattern_discovery_findings (category);
+
 INSERT INTO notification_settings (type, channel, enabled, label, description) VALUES
     ('bot_restart', 'immediate', true, 'Bot started / restarted', 'Fires whenever the process starts, including redeploys and crash-restarts.'),
     ('bot_stopped_unexpectedly', 'immediate', true, 'Bot stopped unexpectedly', 'Fires when the process exits due to an unhandled error, not a deliberate stop.'),
