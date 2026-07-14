@@ -80,6 +80,16 @@ offline word-list for sentiment.
 > key has ever been pasted into a chat, email, or screenshot, rotate it in the
 > provider's dashboard.
 
+**Dashboard's AI Research Assistant** (Strategy Intelligence → Recommendations
+→ "Run AI Research") is a separate Next.js service and needs its own
+`ANTHROPIC_API_KEY` set in that service's Railway variables (the same key
+value the bot uses for `SENTIMENT_PROVIDER=claude` works fine - it's just a
+second copy of the env var on a different service). Two optional overrides
+let you repoint the model IDs without a code change if Anthropic renames a
+model: `RESEARCH_MODEL_HAIKU` (default `claude-haiku-4-5-20251001`, used for
+scheduled/cheap runs) and `RESEARCH_MODEL_SONNET` (default `claude-sonnet-5`,
+used when you pick "Sonnet" on demand in the dashboard).
+
 ---
 
 ## Quick start — local (Mac / any machine)

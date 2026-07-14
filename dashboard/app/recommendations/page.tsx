@@ -4,7 +4,13 @@ import { useEffect, useState } from "react";
 import LoadingSkeleton from "@/components/LoadingSkeleton";
 import ErrorState from "@/components/ErrorState";
 import { timeAgo } from "@/lib/format";
-import { CheckCircle2, XCircle, Sparkles } from "lucide-react";
+import { CheckCircle2, XCircle, Sparkles, BrainCircuit, Loader2 } from "lucide-react";
+
+const SOURCE_LABEL: Record<string, string> = {
+  manual: "Manual",
+  pattern_discovery: "Pattern Discovery",
+  ai_research_assistant: "AI Research Assistant",
+};
 
 type Recommendation = {
   id: number;
@@ -56,7 +62,7 @@ function RecCard({
         <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${STATUS_STYLE[rec.status]}`}>
           {rec.status}
         </span>
-        <span className="text-xs text-muted">{rec.source.replace("_", " ")}</span>
+        <span className="text-xs text-muted">{SOURCE_LABEL[rec.source] ?? rec.source.replace(/_/g, " ")}</span>
         <span className="text-xs text-muted">· {timeAgo(rec.created_at)}</span>
         {rec.deployed_as_version && (
           <span className="rounded-full bg-accent/15 px-2 py-0.5 text-xs text-accent">
@@ -135,6 +141,9 @@ export default function RecommendationsPage() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<"pending" | "approved" | "rejected" | "all">("pending");
+  const [model, setModel] = useState<"haiku" | "sonnet">("haiku");
+  const [running, setRunning] = useState(false);
+  const [runResult, setRunResult] = useState<string | null>(null);
 
   async function load() {
     try {
@@ -163,6 +172,31 @@ export default function RecommendationsPage() {
     await load();
   }
 
+  async function runResearch() {
+    setRunning(true);
+    setRunResult(null);
+    try {
+      const res = await fetch("/api/ai-research", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "Request failed");
+      if (json.created > 0) {
+        setRunResult(`Generated ${json.created} new recommendation${json.created === 1 ? "" : "s"}.`);
+        setFilter("pending");
+        await load();
+      } else {
+        setRunResult(json.note || "No new recommendations generated.");
+      }
+    } catch (err) {
+      setRunResult(err instanceof Error ? err.message : "Failed to run AI Research Assistant.");
+    } finally {
+      setRunning(false);
+    }
+  }
+
   const filtered = recs?.filter((r) => filter === "all" || r.status === filter) ?? [];
 
   return (
@@ -171,9 +205,46 @@ export default function RecommendationsPage() {
         <h1 className="text-xl font-semibold text-white">Recommendations</h1>
         <p className="text-sm text-muted">
           Advisory only - approving a recommendation here never changes trading behaviour by itself.
-          Pattern Discovery and the AI Research Assistant (later phases) will populate this list
-          automatically; for now it's empty until those phases exist or you add one manually via the API.
+          To actually change trading behaviour, an approved recommendation must be explicitly deployed
+          as a new strategy version on the Strategy Versions page.
         </p>
+      </div>
+
+      <div className="mb-6 rounded-xl border border-bg-border bg-bg-panel p-4">
+        <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-white">
+          <BrainCircuit size={16} /> AI Research Assistant
+        </div>
+        <p className="mb-3 text-xs text-muted">
+          Reads Pattern Discovery&apos;s findings that meet their minimum sample size and drafts
+          plain-English recommendations. Grounded only in those findings - if none qualify yet, no
+          report is generated. Haiku is cheaper and is what a scheduled run would use; Sonnet gives
+          deeper analysis on demand.
+        </p>
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex overflow-hidden rounded-lg border border-bg-border text-xs">
+            <button
+              onClick={() => setModel("haiku")}
+              className={`px-3 py-1.5 font-medium ${model === "haiku" ? "bg-accent/15 text-accent" : "text-muted hover:text-white"}`}
+            >
+              Haiku (default)
+            </button>
+            <button
+              onClick={() => setModel("sonnet")}
+              className={`px-3 py-1.5 font-medium ${model === "sonnet" ? "bg-accent/15 text-accent" : "text-muted hover:text-white"}`}
+            >
+              Sonnet (deeper, on demand)
+            </button>
+          </div>
+          <button
+            onClick={runResearch}
+            disabled={running}
+            className="flex items-center gap-1.5 rounded-lg bg-accent/15 px-3 py-1.5 text-xs font-medium text-accent hover:bg-accent/25 disabled:opacity-50"
+          >
+            {running ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
+            {running ? "Analysing..." : "Run AI Research"}
+          </button>
+        </div>
+        {runResult && <p className="mt-2 text-xs text-muted">{runResult}</p>}
       </div>
 
       <div className="mb-4 flex gap-2 border-b border-bg-border">
