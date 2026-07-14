@@ -94,23 +94,26 @@ class Recorder:
                           api_latency_ms: Optional[float] = None,
                           trading_mode: Optional[str] = None,
                           daytrade_count: Optional[int] = None,
-                          pattern_day_trader: Optional[bool] = None) -> None:
+                          pattern_day_trader: Optional[bool] = None,
+                          market_regime: Optional[str] = None) -> None:
         self._execute(
             """
             INSERT INTO heartbeats
                 (status, scheduler_status, market_open, dry_run, portfolio_value,
                  cash, equity, buying_power, open_positions, message, api_latency_ms,
-                 trading_mode, daytrade_count, pattern_day_trader)
+                 trading_mode, daytrade_count, pattern_day_trader, market_regime)
             VALUES
                 (%(status)s, %(scheduler_status)s, %(market_open)s, %(dry_run)s, %(portfolio_value)s,
                  %(cash)s, %(equity)s, %(buying_power)s, %(open_positions)s, %(message)s,
-                 %(api_latency_ms)s, %(trading_mode)s, %(daytrade_count)s, %(pattern_day_trader)s)
+                 %(api_latency_ms)s, %(trading_mode)s, %(daytrade_count)s, %(pattern_day_trader)s,
+                 %(market_regime)s)
             """,
             dict(status=status, scheduler_status=scheduler_status, market_open=market_open,
                  dry_run=dry_run, portfolio_value=portfolio_value, cash=cash, equity=equity,
                  buying_power=buying_power, open_positions=open_positions, message=message,
                  api_latency_ms=api_latency_ms, trading_mode=trading_mode,
-                 daytrade_count=daytrade_count, pattern_day_trader=pattern_day_trader),
+                 daytrade_count=daytrade_count, pattern_day_trader=pattern_day_trader,
+                 market_regime=market_regime),
         )
 
     def record_config_status(self, *, trading_mode: str, live_confirmed: bool,
@@ -213,18 +216,20 @@ class Recorder:
 
     def record_trade(self, *, action: str, symbol: str, qty: float, price: float, notional: float,
                       sentiment, stop_price: float, take_profit: float, reason: str, rationale: str,
-                      dry_run: bool, order_id: str, status: str) -> None:
+                      dry_run: bool, order_id: str, status: str,
+                      sector: Optional[str] = None, market_regime: Optional[str] = None) -> None:
         self._execute(
             """
             INSERT INTO trades
                 (action, symbol, qty, price, notional, stop_price, take_profit,
                  sentiment_score, sentiment_label, headline_count, positive_headlines,
-                 negative_headlines, reason, rationale, dry_run, order_id, status)
+                 negative_headlines, reason, rationale, dry_run, order_id, status,
+                 sector, market_regime)
             VALUES
                 (%(action)s, %(symbol)s, %(qty)s, %(price)s, %(notional)s, %(stop_price)s,
                  %(take_profit)s, %(sentiment_score)s, %(sentiment_label)s, %(headline_count)s,
                  %(positive_headlines)s, %(negative_headlines)s, %(reason)s, %(rationale)s,
-                 %(dry_run)s, %(order_id)s, %(status)s)
+                 %(dry_run)s, %(order_id)s, %(status)s, %(sector)s, %(market_regime)s)
             """,
             dict(action=action, symbol=symbol, qty=qty, price=price, notional=notional,
                  stop_price=stop_price, take_profit=take_profit,
@@ -234,13 +239,16 @@ class Recorder:
                  positive_headlines=getattr(sentiment, "positive_count", None),
                  negative_headlines=getattr(sentiment, "negative_count", None),
                  reason=reason, rationale=rationale, dry_run=dry_run, order_id=order_id,
-                 status=status),
+                 status=status, sector=sector, market_regime=market_regime),
         )
 
     def record_closed_trade(self, *, symbol: str, qty: float, entry_price: float, exit_price: float,
                              pnl: float, pnl_pct: float, exit_reason: str,
                              entry_time: Optional[float] = None, buy_reason: Optional[str] = None,
-                             news_summary: Optional[str] = None) -> None:
+                             news_summary: Optional[str] = None,
+                             sector: Optional[str] = None, confidence_score: Optional[float] = None,
+                             confidence_label: Optional[str] = None, market_regime: Optional[str] = None,
+                             strategy_version: Optional[str] = None) -> None:
         entry_dt = (
             datetime.fromtimestamp(entry_time, tz=timezone.utc) if entry_time else None
         )
@@ -248,14 +256,19 @@ class Recorder:
             """
             INSERT INTO closed_trades
                 (symbol, qty, entry_price, exit_price, pnl, pnl_pct, exit_reason,
-                 entry_time, buy_reason, news_summary)
+                 entry_time, buy_reason, news_summary,
+                 sector, confidence_score, confidence_label, market_regime, strategy_version)
             VALUES
                 (%(symbol)s, %(qty)s, %(entry_price)s, %(exit_price)s, %(pnl)s, %(pnl_pct)s,
-                 %(exit_reason)s, %(entry_time)s, %(buy_reason)s, %(news_summary)s)
+                 %(exit_reason)s, %(entry_time)s, %(buy_reason)s, %(news_summary)s,
+                 %(sector)s, %(confidence_score)s, %(confidence_label)s, %(market_regime)s,
+                 %(strategy_version)s)
             """,
             dict(symbol=symbol, qty=qty, entry_price=entry_price, exit_price=exit_price,
                  pnl=pnl, pnl_pct=pnl_pct, exit_reason=exit_reason, entry_time=entry_dt,
-                 buy_reason=buy_reason, news_summary=news_summary),
+                 buy_reason=buy_reason, news_summary=news_summary,
+                 sector=sector, confidence_score=confidence_score, confidence_label=confidence_label,
+                 market_regime=market_regime, strategy_version=strategy_version),
         )
 
     def record_portfolio_snapshot(self, *, portfolio_value: Optional[float], cash: Optional[float],

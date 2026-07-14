@@ -46,6 +46,11 @@ ALTER TABLE heartbeats ADD COLUMN IF NOT EXISTS trading_mode TEXT;
 ALTER TABLE heartbeats ADD COLUMN IF NOT EXISTS daytrade_count INTEGER;
 ALTER TABLE heartbeats ADD COLUMN IF NOT EXISTS pattern_day_trader BOOLEAN;
 
+-- Added by the Strategy Intelligence phase - "current market regime" on the
+-- dashboard reads the latest heartbeat's regime, independent of whether a
+-- trade happened to be entered this cycle.
+ALTER TABLE heartbeats ADD COLUMN IF NOT EXISTS market_regime TEXT;
+
 -- ---------------------------------------------------------------------
 -- decisions: EVERY decision the strategy makes each cycle, whether or not
 -- it resulted in an order - buy, sell, hold/skip, or blocked. This is the
@@ -96,10 +101,17 @@ CREATE TABLE IF NOT EXISTS trades (
     rationale           TEXT,
     dry_run             BOOLEAN NOT NULL DEFAULT false,
     order_id            TEXT,
-    status              TEXT
+    status              TEXT,
+    sector              TEXT,        -- from bot/universe/static_universe.sector_of(), for Strategy Intelligence breakdowns
+    market_regime       TEXT         -- 'bull' | 'bear' | 'sideways' | 'high_volatility' | 'low_volatility', see strategy.py
 );
 CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades (ts DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades (symbol);
+
+-- Added by the Strategy Intelligence phase; ALTER-for-existing-DBs, same
+-- reasoning as api_latency_ms above.
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS sector TEXT;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS market_regime TEXT;
 
 -- ---------------------------------------------------------------------
 -- closed_trades: one row per completed round-trip (mirrors closed_trades.csv)
@@ -117,10 +129,22 @@ CREATE TABLE IF NOT EXISTS closed_trades (
     exit_reason       TEXT,
     entry_time        TIMESTAMPTZ,
     buy_reason        TEXT,        -- original reason/rationale captured at entry, joined from trades if available
-    news_summary      TEXT
+    news_summary      TEXT,
+    sector              TEXT,        -- captured at entry time, from bot/universe/static_universe.sector_of()
+    confidence_score    NUMERIC,     -- sentiment score at ENTRY time (not exit) - the "confidence" Strategy Intelligence analyses
+    confidence_label    TEXT,
+    market_regime       TEXT,        -- market regime at ENTRY time - see trades.market_regime
+    strategy_version    TEXT         -- which strategy version was active when this trade was entered (see strategy_versions table, Phase 2)
 );
 CREATE INDEX IF NOT EXISTS idx_closed_trades_ts ON closed_trades (ts DESC);
 CREATE INDEX IF NOT EXISTS idx_closed_trades_symbol ON closed_trades (symbol);
+
+-- Added by the Strategy Intelligence phase; ALTER-for-existing-DBs.
+ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS sector TEXT;
+ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS confidence_score NUMERIC;
+ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS confidence_label TEXT;
+ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS market_regime TEXT;
+ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS strategy_version TEXT;
 
 -- ---------------------------------------------------------------------
 -- portfolio_snapshots: periodic account snapshots for the equity curve /
@@ -213,6 +237,26 @@ CREATE TABLE IF NOT EXISTS fx_rates (
     source        TEXT NOT NULL DEFAULT 'RBA',
     fetched_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ---------------------------------------------------------------------
+-- strategy_versions: Strategy Intelligence's versioning record. 'v1' is
+-- seeded below as the baseline (whatever config the bot has been running
+-- with since before this feature existed) so the dashboard has something
+-- to show as "current version" from day one. Phase 2 (Strategy Version
+-- Management) is what actually lets new versions be created through the
+-- approval workflow - until then, every trade is tagged strategy_version='v1'.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS strategy_versions (
+    version           TEXT PRIMARY KEY,       -- e.g. 'v1', 'v2'
+    deployed_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    description       TEXT,
+    config_snapshot   JSONB,                  -- key thresholds/risk params captured at deployment
+    is_active         BOOLEAN NOT NULL DEFAULT false,
+    created_from_recommendation_id BIGINT     -- FK to strategy_recommendations, once that table exists (Phase 2/3)
+);
+INSERT INTO strategy_versions (version, description, is_active) VALUES
+    ('v1', 'Baseline strategy - the configuration in place before Strategy Intelligence was introduced.', true)
+ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO notification_settings (type, channel, enabled, label, description) VALUES
     ('bot_restart', 'immediate', true, 'Bot started / restarted', 'Fires whenever the process starts, including redeploys and crash-restarts.'),

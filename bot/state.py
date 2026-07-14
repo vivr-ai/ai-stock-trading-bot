@@ -91,7 +91,9 @@ class BotState:
     # ---- open-lot tracking (for realized P/L on exit) ----------------------
     def record_open(self, symbol: str, entry_price: float, qty: int,
                      reason: str = None, sentiment_score: float = None,
-                     sentiment_label: str = None, rationale: str = None) -> None:
+                     sentiment_label: str = None, rationale: str = None,
+                     sector: str = None, market_regime: str = None,
+                     strategy_version: str = None) -> None:
         self._data["open_lots"][symbol] = {
             "entry_price": entry_price,
             "qty": qty,
@@ -100,6 +102,13 @@ class BotState:
             "sentiment_score": sentiment_score,
             "sentiment_label": sentiment_label,
             "rationale": rationale,
+            # Entry-time context for Strategy Intelligence's win-rate
+            # breakdowns - captured once here since it can differ wildly by
+            # the time the position closes (sector doesn't change, but
+            # market_regime and strategy_version certainly can).
+            "sector": sector,
+            "market_regime": market_regime,
+            "strategy_version": strategy_version,
         }
         self._save()
 

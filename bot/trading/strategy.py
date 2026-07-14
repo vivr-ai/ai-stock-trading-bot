@@ -60,6 +60,12 @@ class _NullRecorder:
 
 
 class SentimentStrategy:
+    # Placeholder until Phase 2 (Strategy Version Management) exists - every
+    # trade entered so far is tagged with this version so Strategy
+    # Intelligence has something to attribute performance to from day one.
+    # Phase 2 replaces this with a real strategy_versions-table lookup.
+    CURRENT_STRATEGY_VERSION = "v1"
+
     def __init__(self, cfg, broker, universe, news, analyzer, risk,
                  trade_logger, summary_logger, state, closed_trade_logger=None,
                  recorder=None):
@@ -115,6 +121,8 @@ class SentimentStrategy:
             )
             return
 
+        market_regime, cached_spy_snap = self._compute_market_regime()
+
         self.recorder.record_heartbeat(
             status="running", scheduler_status=scheduler_status, market_open=True,
             dry_run=self.cfg.risk.dry_run, portfolio_value=acct.get("portfolio_value"),
@@ -123,6 +131,7 @@ class SentimentStrategy:
             api_latency_ms=api_latency_ms, trading_mode=self.cfg.trading.mode,
             daytrade_count=acct.get("daytrade_count"),
             pattern_day_trader=acct.get("pattern_day_trader"),
+            market_regime=market_regime,
         )
         self._maybe_notify_pdt(acct)
         self.recorder.record_portfolio_snapshot(
@@ -183,11 +192,10 @@ class SentimentStrategy:
         # (SPY by default) is below its own long-term (50-day) SMA — i.e. the
         # broad market is in a downtrend, not just a single bad day.
         if new_entries_allowed and self.cfg.strategy.market_regime_filter_enabled:
-            spy_snap = self.broker.market_snapshot(
-                self.cfg.strategy.market_filter_symbol,
-                sma_period=self.cfg.strategy.market_regime_ma_period,
-                volume_lookback_days=self.cfg.strategy.market_regime_ma_period,
-            )
+            # Reuse the snapshot _compute_market_regime() already fetched
+            # this cycle (same symbol/sma_period/volume_lookback_days) rather
+            # than hitting the API again for the same data.
+            spy_snap = cached_spy_snap
             if spy_snap is None or spy_snap.sma is None:
                 logger.warning(
                     "Market regime filter: could not read %s's %d-day SMA; "
@@ -226,7 +234,7 @@ class SentimentStrategy:
             try:
                 exposure = self._process_symbol(
                     symbol, acct, exposure, open_positions, pending,
-                    sector_counts, new_entries_allowed, stats,
+                    sector_counts, new_entries_allowed, stats, market_regime,
                 )
             except Exception as exc:  # noqa: BLE001 - isolate per-symbol failures
                 logger.exception("Error processing %s: %s", symbol, exc,
@@ -238,6 +246,45 @@ class SentimentStrategy:
             exposure=exposure,
             stats=stats,
         )
+
+    def _compute_market_regime(self):
+        """Classify the current market backdrop for Strategy Intelligence's
+        win-rate-by-regime breakdown (and tags every trade entered this
+        cycle). Volatility extremes take priority over trend - a 2%+ day
+        matters more for risk context than which side of the SMA the market
+        happens to be on. This is a lightweight heuristic (SPY's own daily
+        change_pct as a volatility proxy, price vs its N-day SMA for trend),
+        not a dedicated realized-volatility or VIX-based classifier - good
+        enough for pattern discovery, not a claim of precision.
+
+        Returns (regime_label_or_None, market_snapshot_or_None) - the
+        snapshot is returned too so the market-regime FILTER below can reuse
+        it instead of making a second identical API call this cycle.
+        """
+        try:
+            snap = self.broker.market_snapshot(
+                self.cfg.strategy.market_filter_symbol,
+                sma_period=self.cfg.strategy.market_regime_ma_period,
+                volume_lookback_days=self.cfg.strategy.market_regime_ma_period,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not compute market regime: %s", exc)
+            return None, None
+        if snap is None or snap.change_pct is None:
+            return None, snap
+        change_pct = snap.change_pct
+        if abs(change_pct) >= 2.0:
+            return "high_volatility", snap
+        if snap.sma is None:
+            return None, snap
+        near_sma = snap.sma > 0 and abs(snap.last - snap.sma) / snap.sma <= 0.005
+        if abs(change_pct) <= 0.3 and near_sma:
+            return "low_volatility", snap
+        if snap.last > snap.sma * 1.005:
+            return "bull", snap
+        if snap.last < snap.sma * 0.995:
+            return "bear", snap
+        return "sideways", snap
 
     def _maybe_notify_pdt(self, acct) -> None:
         """Pattern Day Trader warning: FINRA restricts accounts under $25,000
@@ -342,7 +389,9 @@ class SentimentStrategy:
             symbol=symbol, qty=lot["qty"], entry_price=lot["entry_price"], exit_price=exit_price,
             pnl=pnl, pnl_pct=pnl_pct, exit_reason="auto_exit (stop_loss_or_take_profit)",
             entry_time=lot.get("entry_time"), buy_reason=lot.get("reason"),
-            news_summary=lot.get("rationale"),
+            news_summary=lot.get("rationale"), sector=lot.get("sector"),
+            confidence_score=lot.get("sentiment_score"), confidence_label=lot.get("sentiment_label"),
+            market_regime=lot.get("market_regime"), strategy_version=lot.get("strategy_version"),
         )
         self.recorder.record_notification(
             type_="trade_executed", title=f"{symbol} position closed (auto-exit)",
@@ -351,7 +400,7 @@ class SentimentStrategy:
         )
 
     def _process_symbol(self, symbol, acct, exposure, open_positions, pending,
-                        sector_counts, new_entries_allowed, stats) -> float:
+                        sector_counts, new_entries_allowed, stats, market_regime=None) -> float:
         articles = self.news.fetch(
             symbol, self.cfg.news.lookback_hours, self.cfg.news.max_articles_per_symbol
         )
@@ -508,10 +557,10 @@ class SentimentStrategy:
                 return exposure
 
         return self._do_buy(symbol, sentiment, snap.last, acct, exposure,
-                            open_positions, sector_counts, stats)
+                            open_positions, sector_counts, stats, market_regime)
 
     def _do_buy(self, symbol, sentiment, price, acct, exposure, open_positions,
-                sector_counts, stats) -> float:
+                sector_counts, stats, market_regime=None) -> float:
         if price is None or price <= 0:
             return exposure
 
@@ -544,6 +593,7 @@ class SentimentStrategy:
                 action="buy", symbol=symbol, qty=plan.qty, price=plan.price, notional=plan.notional,
                 sentiment=sentiment, stop_price=plan.stop_price, take_profit=plan.take_profit_price,
                 reason=reason, rationale=sentiment.rationale, dry_run=True, order_id="", status="dry_run",
+                sector=sector_of(symbol), market_regime=market_regime,
             )
             self.recorder.record_decision(
                 symbol=symbol, decision="buy", reason=reason, sentiment_score=sentiment.score,
@@ -585,6 +635,7 @@ class SentimentStrategy:
                 sentiment=sentiment, stop_price=plan.stop_price, take_profit=plan.take_profit_price,
                 reason=reason, rationale=sentiment.rationale, dry_run=False,
                 order_id=order.order_id, status=order.status,
+                sector=sector_of(symbol), market_regime=market_regime,
             )
             self.recorder.record_decision(
                 symbol=symbol, decision="buy", reason=reason, sentiment_score=sentiment.score,
@@ -602,7 +653,9 @@ class SentimentStrategy:
         # the reason/confidence so the dashboard can show why we bought it.
         self.state.record_open(symbol, plan.price, plan.qty, reason=reason,
                                sentiment_score=sentiment.score, sentiment_label=sentiment.label,
-                               rationale=sentiment.rationale)
+                               rationale=sentiment.rationale, sector=sector_of(symbol),
+                               market_regime=market_regime,
+                               strategy_version=self.CURRENT_STRATEGY_VERSION)
 
         open_positions[symbol] = plan.qty
         sector_counts[sector_of(symbol)] += 1
@@ -620,7 +673,7 @@ class SentimentStrategy:
             self.recorder.record_trade(
                 action="sell", symbol=symbol, qty=0, price=0.0, notional=0.0, sentiment=sentiment,
                 stop_price=0.0, take_profit=0.0, reason=reason, rationale=sentiment.rationale,
-                dry_run=True, order_id="", status="dry_run",
+                dry_run=True, order_id="", status="dry_run", sector=sector_of(symbol),
             )
             self.recorder.record_decision(
                 symbol=symbol, decision="sell", reason=reason, sentiment_score=sentiment.score,
@@ -644,6 +697,10 @@ class SentimentStrategy:
                         exit_price=exit_price, pnl=pnl, pnl_pct=pnl_pct,
                         exit_reason=f"dry_run: {reason}", entry_time=lot.get("entry_time"),
                         buy_reason=lot.get("reason"), news_summary=lot.get("rationale"),
+                        sector=lot.get("sector"), confidence_score=lot.get("sentiment_score"),
+                        confidence_label=lot.get("sentiment_label"),
+                        market_regime=lot.get("market_regime"),
+                        strategy_version=lot.get("strategy_version"),
                     )
             return
 
@@ -665,7 +722,7 @@ class SentimentStrategy:
         self.recorder.record_trade(
             action="sell", symbol=symbol, qty=order.qty, price=0.0, notional=0.0, sentiment=sentiment,
             stop_price=0.0, take_profit=0.0, reason=reason, rationale=sentiment.rationale,
-            dry_run=False, order_id=order.order_id, status=order.status,
+            dry_run=False, order_id=order.order_id, status=order.status, sector=sector_of(symbol),
         )
         self.recorder.record_decision(
             symbol=symbol, decision="sell", reason=reason, sentiment_score=sentiment.score,
@@ -691,7 +748,11 @@ class SentimentStrategy:
                     symbol=symbol, qty=lot["qty"], entry_price=lot["entry_price"],
                     exit_price=exit_price, pnl=pnl, pnl_pct=pnl_pct, exit_reason=reason,
                     entry_time=lot.get("entry_time"), buy_reason=lot.get("reason"),
-                    news_summary=lot.get("rationale"),
+                    news_summary=lot.get("rationale"), sector=lot.get("sector"),
+                    confidence_score=lot.get("sentiment_score"),
+                    confidence_label=lot.get("sentiment_label"),
+                    market_regime=lot.get("market_regime"),
+                    strategy_version=lot.get("strategy_version"),
                 )
                 logger.info("Closed trade %s: entry=%.2f exit=%.2f pnl=%.2f",
                             symbol, lot["entry_price"], exit_price, pnl,
