@@ -60,15 +60,9 @@ class _NullRecorder:
 
 
 class SentimentStrategy:
-    # Placeholder until Phase 2 (Strategy Version Management) exists - every
-    # trade entered so far is tagged with this version so Strategy
-    # Intelligence has something to attribute performance to from day one.
-    # Phase 2 replaces this with a real strategy_versions-table lookup.
-    CURRENT_STRATEGY_VERSION = "v1"
-
     def __init__(self, cfg, broker, universe, news, analyzer, risk,
                  trade_logger, summary_logger, state, closed_trade_logger=None,
-                 recorder=None):
+                 recorder=None, version_provider=None):
         self.cfg = cfg
         self.broker = broker
         self.universe = universe
@@ -83,6 +77,15 @@ class SentimentStrategy:
         # below simple (no "if self.recorder" checks needed) when no DB is
         # configured - see bot/persistence/db.py.
         self.recorder = recorder if recorder is not None else _NullRecorder()
+        # Read-only mirror of the dashboard's active strategy_versions row
+        # (see bot/strategy_version.py) - falls back to "v1" if unset/
+        # unreachable. The bot never creates or activates a version itself;
+        # this only tags trades with whichever version a human already made
+        # active on the dashboard.
+        from ..strategy_version import StrategyVersionProvider
+        self.version_provider = version_provider or StrategyVersionProvider(
+            getattr(recorder, "database_url", None)
+        )
         # Guards the daily-loss-limit notification so it fires once per
         # breach-day, not every 30-min cycle for the rest of the day.
         self._daily_loss_notified_date: Optional[str] = None
@@ -655,7 +658,7 @@ class SentimentStrategy:
                                sentiment_score=sentiment.score, sentiment_label=sentiment.label,
                                rationale=sentiment.rationale, sector=sector_of(symbol),
                                market_regime=market_regime,
-                               strategy_version=self.CURRENT_STRATEGY_VERSION)
+                               strategy_version=self.version_provider.current_version())
 
         open_positions[symbol] = plan.qty
         sector_counts[sector_of(symbol)] += 1

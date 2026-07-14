@@ -258,6 +258,40 @@ INSERT INTO strategy_versions (version, description, is_active) VALUES
     ('v1', 'Baseline strategy - the configuration in place before Strategy Intelligence was introduced.', true)
 ON CONFLICT (version) DO NOTHING;
 
+-- ---------------------------------------------------------------------
+-- strategy_recommendations: the Approval Workflow. Pattern Discovery
+-- (Phase 3) and the AI Research Assistant (Phase 4) INSERT rows here -
+-- they never touch trading behaviour directly. A human (you, from the
+-- dashboard) reviews each one and sets status to 'approved' or 'rejected'.
+-- Only an 'approved' recommendation can be turned into a new
+-- strategy_versions row (via "Deploy as new version" on the dashboard) -
+-- approval alone never changes what the bot does; creating the version
+-- row is the one and only action that does, and that's still a deliberate
+-- extra step you take, never automatic.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS strategy_recommendations (
+    id                      BIGSERIAL PRIMARY KEY,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    source                  TEXT NOT NULL DEFAULT 'manual',  -- 'manual' | 'pattern_discovery' | 'ai_research'
+    title                   TEXT NOT NULL,
+    observation             TEXT,
+    evidence                TEXT,
+    statistical_confidence  TEXT,        -- e.g. 'high (n=482, p<0.01)' - free text, source-dependent
+    estimated_impact        TEXT,
+    risks                   TEXT,
+    recommendation          TEXT,
+    priority                TEXT NOT NULL DEFAULT 'medium',  -- 'low' | 'medium' | 'high'
+    proposed_config_changes JSONB,       -- e.g. {"STRATEGY_BUY_THRESHOLD": 8.5} - what would actually change
+    status                  TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'approved' | 'rejected'
+    reviewed_at             TIMESTAMPTZ,
+    reviewed_by             TEXT,
+    review_notes            TEXT,
+    backtest_result         JSONB,       -- populated by Phase 6 (Backtesting & Simulation), null until then
+    deployed_as_version     TEXT         -- set once an approved recommendation becomes a strategy_versions row
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_recommendations_status ON strategy_recommendations (status);
+CREATE INDEX IF NOT EXISTS idx_strategy_recommendations_created ON strategy_recommendations (created_at DESC);
+
 INSERT INTO notification_settings (type, channel, enabled, label, description) VALUES
     ('bot_restart', 'immediate', true, 'Bot started / restarted', 'Fires whenever the process starts, including redeploys and crash-restarts.'),
     ('bot_stopped_unexpectedly', 'immediate', true, 'Bot stopped unexpectedly', 'Fires when the process exits due to an unhandled error, not a deliberate stop.'),
@@ -270,7 +304,8 @@ INSERT INTO notification_settings (type, channel, enabled, label, description) V
     ('database_failure', 'immediate', true, 'Database failure', 'Dashboard Postgres writes failing (trading itself is unaffected).'),
     ('scheduler_failure', 'immediate', true, 'Scheduler failure', 'The internal job scheduler crashed and is restarting itself.'),
     ('error', 'immediate', true, 'Critical application errors', 'Order failures, startup failures, and other unexpected errors.'),
-    ('pdt_warning', 'immediate', true, 'Pattern Day Trader warning', 'Fires once per day when day-trade count is approaching the 4-in-5-business-days PDT threshold on an account under $25,000.')
+    ('pdt_warning', 'immediate', true, 'Pattern Day Trader warning', 'Fires once per day when day-trade count is approaching the 4-in-5-business-days PDT threshold on an account under $25,000.'),
+    ('strategy_recommendation', 'daily_summary', true, 'New strategy recommendation', 'Fires when Pattern Discovery or the AI Research Assistant produces a new recommendation for your review - advisory only, never applied automatically.')
 ON CONFLICT (type) DO NOTHING;
 
 -- ---------------------------------------------------------------------
