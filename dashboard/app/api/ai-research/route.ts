@@ -89,12 +89,13 @@ export async function POST(req: Request) {
       const row = await queryOne<{ id: number }>(
         `INSERT INTO strategy_recommendations
            (source, title, observation, evidence, statistical_confidence, estimated_impact,
-            risks, recommendation, priority)
-         VALUES ('ai_research_assistant', $1, $2, $3, $4, $5, $6, $7, $8)
+            risks, recommendation, priority, proposed_config_changes)
+         VALUES ('ai_research_assistant', $1, $2, $3, $4, $5, $6, $7, $8, $9)
          RETURNING id`,
         [
           d.title, d.observation, d.evidence, d.statisticalConfidence,
           d.estimatedImpact, d.risks, d.recommendation, d.priority,
+          d.proposedConfigChange ? JSON.stringify(d.proposedConfigChange) : null,
         ]
       );
       if (row) inserted.push(row);

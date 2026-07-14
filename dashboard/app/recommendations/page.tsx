@@ -4,12 +4,34 @@ import { useEffect, useState } from "react";
 import LoadingSkeleton from "@/components/LoadingSkeleton";
 import ErrorState from "@/components/ErrorState";
 import { timeAgo } from "@/lib/format";
-import { CheckCircle2, XCircle, Sparkles, BrainCircuit, Loader2 } from "lucide-react";
+import { CheckCircle2, XCircle, Sparkles, BrainCircuit, Loader2, FlaskConical, Rocket, TriangleAlert } from "lucide-react";
 
 const SOURCE_LABEL: Record<string, string> = {
   manual: "Manual",
   pattern_discovery: "Pattern Discovery",
   ai_research_assistant: "AI Research Assistant",
+};
+
+type BacktestMetrics = {
+  totalTrades: number;
+  winRatePct: number | null;
+  profitFactor: number | null;
+  expectancyPct: number | null;
+  maxDrawdownPct: number | null;
+  riskAdjustedRatio: number | null;
+};
+
+type BacktestResult = {
+  simulable: boolean;
+  changeSummary: string;
+  baseline: BacktestMetrics | null;
+  proposed: BacktestMetrics | null;
+  tradesExcluded: number;
+  tradesExcludedPct: number | null;
+  recommendation: "deploy" | "do_not_deploy" | "inconclusive";
+  confidenceLevel: "insufficient" | "low" | "medium" | "high";
+  increasedRisks: string[];
+  limitations: string[];
 };
 
 type Recommendation = {
@@ -24,12 +46,98 @@ type Recommendation = {
   risks: string | null;
   recommendation: string | null;
   priority: "low" | "medium" | "high";
+  proposed_config_changes: Record<string, unknown> | null;
   status: "pending" | "approved" | "rejected";
   reviewed_at: string | null;
   reviewed_by: string | null;
   review_notes: string | null;
+  backtest_result: BacktestResult | null;
   deployed_as_version: string | null;
 };
+
+const BACKTEST_REC_STYLE: Record<string, string> = {
+  deploy: "bg-gain/15 text-gain",
+  do_not_deploy: "bg-loss/15 text-loss",
+  inconclusive: "bg-bg-panel2 text-muted",
+};
+
+const BACKTEST_REC_LABEL: Record<string, string> = {
+  deploy: "Backtest favours deploying",
+  do_not_deploy: "Backtest recommends against deploying",
+  inconclusive: "Backtest inconclusive",
+};
+
+function fmtPct(v: number | null | undefined, digits = 1) {
+  if (v == null || Number.isNaN(v)) return "—";
+  return `${v >= 0 ? "+" : ""}${v.toFixed(digits)}%`;
+}
+
+function BacktestMetricRow({ label, baseline, proposed, format }: {
+  label: string;
+  baseline: number | null | undefined;
+  proposed: number | null | undefined;
+  format: (v: number | null | undefined) => string;
+}) {
+  return (
+    <tr className="border-t border-bg-border">
+      <td className="py-1.5 pr-4 text-xs text-muted">{label}</td>
+      <td className="py-1.5 px-3 text-xs text-white">{format(baseline)}</td>
+      <td className="py-1.5 px-3 text-xs text-white">{format(proposed)}</td>
+    </tr>
+  );
+}
+
+function BacktestPanel({ result }: { result: BacktestResult }) {
+  if (!result.simulable) {
+    return (
+      <div className="mt-3 rounded-lg border border-dashed border-bg-border p-3 text-xs text-muted">
+        <div className="mb-1 font-medium text-white">Not simulable: {result.changeSummary}</div>
+        {result.limitations.map((l, i) => <p key={i} className="mt-1">{l}</p>)}
+      </div>
+    );
+  }
+  return (
+    <div className="mt-3 rounded-lg border border-bg-border bg-bg-panel2/40 p-3">
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${BACKTEST_REC_STYLE[result.recommendation]}`}>
+          {BACKTEST_REC_LABEL[result.recommendation]}
+        </span>
+        <span className="text-xs text-muted">{result.confidenceLevel} confidence</span>
+      </div>
+      <table className="w-full">
+        <thead>
+          <tr>
+            <th className="pb-1 text-left text-xs text-muted">Metric</th>
+            <th className="pb-1 px-3 text-left text-xs text-muted">Current</th>
+            <th className="pb-1 px-3 text-left text-xs text-muted">Proposed</th>
+          </tr>
+        </thead>
+        <tbody>
+          <BacktestMetricRow label="Trades" baseline={result.baseline?.totalTrades} proposed={result.proposed?.totalTrades} format={(v) => (v ?? "—").toString()} />
+          <BacktestMetricRow label="Win rate" baseline={result.baseline?.winRatePct} proposed={result.proposed?.winRatePct} format={(v) => (v != null ? `${v.toFixed(1)}%` : "—")} />
+          <BacktestMetricRow label="Profit factor" baseline={result.baseline?.profitFactor} proposed={result.proposed?.profitFactor} format={(v) => (v != null ? v.toFixed(2) : "—")} />
+          <BacktestMetricRow label="Expectancy (avg P&L%)" baseline={result.baseline?.expectancyPct} proposed={result.proposed?.expectancyPct} format={fmtPct} />
+          <BacktestMetricRow label="Max drawdown (synthetic)" baseline={result.baseline?.maxDrawdownPct} proposed={result.proposed?.maxDrawdownPct} format={(v) => (v != null ? `${v.toFixed(1)}%` : "—")} />
+        </tbody>
+      </table>
+      {result.increasedRisks.length > 0 && (
+        <div className="mt-2 space-y-1">
+          {result.increasedRisks.map((r, i) => (
+            <p key={i} className="flex items-start gap-1.5 text-xs text-accent/90">
+              <TriangleAlert size={12} className="mt-0.5 shrink-0" /> {r}
+            </p>
+          ))}
+        </div>
+      )}
+      <details className="mt-2">
+        <summary className="cursor-pointer text-xs text-muted">Limitations of this backtest</summary>
+        <div className="mt-1 space-y-1 text-xs text-muted">
+          {result.limitations.map((l, i) => <p key={i}>{l}</p>)}
+        </div>
+      </details>
+    </div>
+  );
+}
 
 const PRIORITY_STYLE: Record<string, string> = {
   high: "bg-loss/15 text-loss",
@@ -46,12 +154,50 @@ const STATUS_STYLE: Record<string, string> = {
 function RecCard({
   rec,
   onReview,
+  onBacktest,
+  onDeploy,
 }: {
   rec: Recommendation;
   onReview: (id: number, status: "approved" | "rejected", notes: string) => void;
+  onBacktest: (id: number) => Promise<void>;
+  onDeploy: (id: number, version: string, description: string) => Promise<void>;
 }) {
   const [notes, setNotes] = useState("");
   const [expanded, setExpanded] = useState(false);
+  const [backtesting, setBacktesting] = useState(false);
+  const [backtestError, setBacktestError] = useState<string | null>(null);
+  const [showDeploy, setShowDeploy] = useState(false);
+  const [deployVersion, setDeployVersion] = useState("");
+  const [deploying, setDeploying] = useState(false);
+  const [deployError, setDeployError] = useState<string | null>(null);
+
+  const hasConfigChange = rec.proposed_config_changes != null;
+  const backtestBlocksDeploy = rec.backtest_result?.simulable && rec.backtest_result.recommendation === "do_not_deploy";
+
+  async function runBacktest() {
+    setBacktesting(true);
+    setBacktestError(null);
+    try {
+      await onBacktest(rec.id);
+    } catch (err) {
+      setBacktestError(err instanceof Error ? err.message : "Backtest failed");
+    } finally {
+      setBacktesting(false);
+    }
+  }
+
+  async function deploy() {
+    setDeploying(true);
+    setDeployError(null);
+    try {
+      await onDeploy(rec.id, deployVersion, rec.title);
+      setShowDeploy(false);
+    } catch (err) {
+      setDeployError(err instanceof Error ? err.message : "Deploy failed");
+    } finally {
+      setDeploying(false);
+    }
+  }
 
   return (
     <div className="rounded-xl border border-bg-border bg-bg-panel p-5">
@@ -127,9 +273,85 @@ function RecCard({
       )}
 
       {rec.status === "approved" && !rec.deployed_as_version && (
-        <div className="mt-2 rounded-lg border border-dashed border-bg-border p-2 text-xs text-muted">
-          Approved. To actually change trading behaviour, go to Strategy Versions and deploy a new
-          version referencing this recommendation - approval alone changes nothing.
+        <div className="mt-2 space-y-2 border-t border-bg-border pt-3">
+          {!hasConfigChange && (
+            <div className="rounded-lg border border-dashed border-bg-border p-2 text-xs text-muted">
+              Approved. No structured config change attached to this recommendation, so it can&apos;t be
+              backtested automatically - review it manually, then deploy a new version on the Strategy
+              Versions page (or below) if you decide to proceed.
+            </div>
+          )}
+
+          {hasConfigChange && !rec.backtest_result && (
+            <button
+              onClick={runBacktest}
+              disabled={backtesting}
+              className="flex items-center gap-1.5 rounded-lg bg-accent/15 px-3 py-1.5 text-xs font-medium text-accent hover:bg-accent/25 disabled:opacity-50"
+            >
+              {backtesting ? <Loader2 size={14} className="animate-spin" /> : <FlaskConical size={14} />}
+              {backtesting ? "Backtesting..." : "Run Backtest"}
+            </button>
+          )}
+          {backtestError && <p className="text-xs text-loss">{backtestError}</p>}
+
+          {rec.backtest_result && <BacktestPanel result={rec.backtest_result} />}
+          {hasConfigChange && rec.backtest_result && (
+            <button
+              onClick={runBacktest}
+              disabled={backtesting}
+              className="text-xs text-accent hover:underline disabled:opacity-50"
+            >
+              {backtesting ? "Re-running..." : "Re-run backtest"}
+            </button>
+          )}
+
+          {!showDeploy ? (
+            <button
+              onClick={() => setShowDeploy(true)}
+              className="flex items-center gap-1.5 rounded-lg bg-bg-panel2 px-3 py-1.5 text-xs font-medium text-white hover:bg-bg-panel2/70"
+            >
+              <Rocket size={14} /> Deploy as new version
+            </button>
+          ) : (
+            <div className="space-y-2 rounded-lg border border-bg-border p-3">
+              {backtestBlocksDeploy && (
+                <div className="flex items-start gap-1.5 rounded-lg bg-loss/10 p-2 text-xs text-loss">
+                  <TriangleAlert size={13} className="mt-0.5 shrink-0" />
+                  The backtest recommends against deploying this. Proceed only if you have a specific
+                  reason to override it.
+                </div>
+              )}
+              <input
+                value={deployVersion}
+                onChange={(e) => setDeployVersion(e.target.value)}
+                placeholder="New version label, e.g. v2"
+                className="w-full rounded-lg border border-bg-border bg-bg-panel2 px-3 py-2 text-xs text-white"
+              />
+              <p className="text-xs text-muted">
+                This deactivates the current version and tags new trades with this one going forward.
+                It does not change any environment variables or code - you still need to make the
+                actual config change yourself to match this recommendation.
+              </p>
+              {deployError && <p className="text-xs text-loss">{deployError}</p>}
+              <div className="flex gap-2">
+                <button
+                  onClick={deploy}
+                  disabled={deploying || !deployVersion}
+                  className={`rounded-lg px-3 py-1.5 text-xs font-medium disabled:opacity-50 ${
+                    backtestBlocksDeploy ? "bg-loss/15 text-loss hover:bg-loss/25" : "bg-accent px-3 py-1.5 text-white hover:opacity-90"
+                  }`}
+                >
+                  {deploying ? "Deploying..." : backtestBlocksDeploy ? "Deploy anyway" : "Deploy"}
+                </button>
+                <button
+                  onClick={() => setShowDeploy(false)}
+                  className="rounded-lg px-3 py-1.5 text-xs font-medium text-muted hover:text-white"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -169,6 +391,28 @@ export default function RecommendationsPage() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id, status, reviewNotes: notes }),
     });
+    await load();
+  }
+
+  async function onBacktest(id: number) {
+    const res = await fetch("/api/backtest", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ recommendationId: id }),
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || "Backtest failed");
+    await load();
+  }
+
+  async function onDeploy(id: number, version: string, description: string) {
+    const res = await fetch("/api/strategy-versions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ version, description, fromRecommendationId: id }),
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || "Deploy failed");
     await load();
   }
 
@@ -274,7 +518,7 @@ export default function RecommendationsPage() {
       {!loading && !error && filtered.length > 0 && (
         <div className="space-y-4">
           {filtered.map((rec) => (
-            <RecCard key={rec.id} rec={rec} onReview={onReview} />
+            <RecCard key={rec.id} rec={rec} onReview={onReview} onBacktest={onBacktest} onDeploy={onDeploy} />
           ))}
         </div>
       )}

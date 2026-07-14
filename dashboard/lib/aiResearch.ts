@@ -22,6 +22,7 @@
 
 import type { Finding } from "./patternDiscovery";
 import type { PerformanceMetrics } from "./strategyAnalytics";
+import { parseConfigChangeSpec, type ConfigChangeSpec } from "./backtest";
 
 export type ResearchModel = "haiku" | "sonnet";
 
@@ -39,6 +40,12 @@ export type AIRecommendationDraft = {
   risks: string;
   recommendation: string;
   priority: "low" | "medium" | "high";
+  // Optional, only present when the finding directly supports a simple,
+  // mechanically-simulable rule change - Phase 6's backtester can only
+  // replay these four shapes (see dashboard/lib/backtest.ts). Most findings
+  // won't map cleanly to one of these, and that's fine - this is left
+  // undefined rather than forced.
+  proposedConfigChange?: ConfigChangeSpec;
 };
 
 export type ResearchContext = {
@@ -58,7 +65,12 @@ Hard rules:
 - If the provided findings do not support any actionable recommendation, return an empty array. Do not manufacture a recommendation just to have output.
 - Each recommendation must be traceable to at least one specific finding you were given - reference it in "evidence".
 - "priority" must be "low", "medium", or "high" based on a combination of statistical confidence and estimated impact - do not default to "medium" for everything.
-- Respond with ONLY a JSON array (no markdown code fences, no commentary before or after). Each element must have exactly these string fields: title, observation, evidence, statisticalConfidence, estimatedImpact, risks, recommendation, priority.`;
+- If (and only if) a recommendation maps directly and simply to one of these four mechanical rule changes, include an optional "proposedConfigChange" field so it can be backtested before deployment. Do not include this field otherwise - most recommendations won't have one, and that's fine:
+  - {"type": "min_confidence", "value": <number>} - require a higher confidence score than currently used
+  - {"type": "exclude_sector", "sector": "<sector name exactly as given in the input>"}
+  - {"type": "exclude_symbol", "symbol": "<symbol exactly as given in the input>"}
+  - {"type": "require_regime", "regimes": ["<one or more of: bull, bear, sideways, high_volatility, low_volatility>"]}
+- Respond with ONLY a JSON array (no markdown code fences, no commentary before or after). Each element must have exactly these string fields: title, observation, evidence, statisticalConfidence, estimatedImpact, risks, recommendation, priority, plus the optional proposedConfigChange object described above.`;
 
 function buildUserPrompt(ctx: ResearchContext): string {
   const findingsSummary = ctx.qualifyingFindings.map((f) => ({
@@ -114,7 +126,17 @@ function validateDraft(raw: unknown): AIRecommendationDraft | null {
     if (typeof r[key] !== "string" || (r[key] as string).length === 0) return null;
   }
   if (r.priority !== "low" && r.priority !== "medium" && r.priority !== "high") return null;
-  return r as unknown as AIRecommendationDraft;
+
+  const draft = r as unknown as AIRecommendationDraft;
+  if (r.proposedConfigChange != null) {
+    // Validate through the same parser the backtester itself uses, so a
+    // malformed field from the model is silently dropped (still keeping the
+    // rest of the recommendation) rather than stored as something the
+    // backtester can't actually read later.
+    const parsed = parseConfigChangeSpec(r.proposedConfigChange);
+    draft.proposedConfigChange = parsed ?? undefined;
+  }
+  return draft;
 }
 
 export async function generateResearchReport(
