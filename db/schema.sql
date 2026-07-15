@@ -373,6 +373,29 @@ CREATE TABLE IF NOT EXISTS monthly_research_reports (
 );
 CREATE INDEX IF NOT EXISTS idx_monthly_reports_generated ON monthly_research_reports (generated_at DESC);
 
+-- ---------------------------------------------------------------------
+-- bot_control: a single-row switch for pausing/resuming new trading
+-- activity from the dashboard (see dashboard/app/api/bot-control and
+-- bot/bot_control.py's BotControlProvider). This is a deliberate, explicit
+-- human action taken on the dashboard - the bot never sets is_paused
+-- itself. Pausing only blocks NEW entries (the same "block_new_entries"
+-- gate used for the daily loss limit and market filters); sentiment-driven
+-- sells and broker-side stop-loss/take-profit brackets keep managing
+-- existing positions while paused, so pausing never leaves open positions
+-- unprotected. "Emergency Stop" (surfaced on the dashboard) uses this same
+-- mechanism with more urgent framing - it does NOT liquidate positions;
+-- that is explicitly out of scope here and reserved for a future dedicated
+-- Kill Switch feature.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS bot_control (
+    id            INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),  -- singleton row
+    is_paused     BOOLEAN NOT NULL DEFAULT false,
+    reason        TEXT,               -- optional human-entered note, e.g. "manual pause" / "emergency stop"
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by    TEXT                -- session user's email, best-effort audit trail
+);
+INSERT INTO bot_control (id, is_paused) VALUES (1, false) ON CONFLICT (id) DO NOTHING;
+
 INSERT INTO notification_settings (type, channel, enabled, label, description) VALUES
     ('bot_restart', 'immediate', true, 'Bot started / restarted', 'Fires whenever the process starts, including redeploys and crash-restarts.'),
     ('bot_stopped_unexpectedly', 'immediate', true, 'Bot stopped unexpectedly', 'Fires when the process exits due to an unhandled error, not a deliberate stop.'),
@@ -387,7 +410,9 @@ INSERT INTO notification_settings (type, channel, enabled, label, description) V
     ('error', 'immediate', true, 'Critical application errors', 'Order failures, startup failures, and other unexpected errors.'),
     ('pdt_warning', 'immediate', true, 'Pattern Day Trader warning', 'Fires once per day when day-trade count is approaching the 4-in-5-business-days PDT threshold on an account under $25,000.'),
     ('strategy_recommendation', 'daily_summary', true, 'New strategy recommendation', 'Fires when Pattern Discovery or the AI Research Assistant produces a new recommendation for your review - advisory only, never applied automatically.'),
-    ('monthly_research_report', 'immediate', true, 'Monthly research report', 'Fires once a month (or whenever you generate one on-demand) with a short performance/pattern-health summary - full detail lives on the Monthly Report dashboard page.')
+    ('monthly_research_report', 'immediate', true, 'Monthly research report', 'Fires once a month (or whenever you generate one on-demand) with a short performance/pattern-health summary - full detail lives on the Monthly Report dashboard page.'),
+    ('bot_paused', 'immediate', true, 'Trading paused', 'Fires when new trading activity is paused (or Emergency Stop is used) from the dashboard. Existing positions keep being managed.'),
+    ('bot_resumed', 'immediate', true, 'Trading resumed', 'Fires when trading is resumed from the dashboard after a pause.')
 ON CONFLICT (type) DO NOTHING;
 
 -- ---------------------------------------------------------------------

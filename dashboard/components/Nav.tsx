@@ -1,5 +1,14 @@
 "use client";
 
+/**
+ * SUPERSEDED - no longer imported anywhere (see Shell.tsx, which now
+ * composes Sidebar.tsx + SectionTabs.tsx + MobileSectionBar.tsx instead).
+ * Kept in the repo only because this environment can't delete files handed
+ * to it here; safe to delete this file the next time you're editing
+ * locally - nothing references it. See docs/dashboard-ux-redesign-
+ * proposal.md for why the flat link list below was replaced.
+ */
+
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { signOut } from "next-auth/react";

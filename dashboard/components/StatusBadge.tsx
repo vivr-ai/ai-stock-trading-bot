@@ -6,7 +6,8 @@ export type Status =
   | "closed"
   | "connected"
   | "unknown"
-  | "not_configured";
+  | "not_configured"
+  | "paused";
 
 export default function StatusBadge({
   status,
@@ -24,6 +25,7 @@ export default function StatusBadge({
     error: { label: "Error", className: "bg-loss/15 text-loss" },
     unknown: { label: "Unknown", className: "bg-bg-panel2 text-muted" },
     not_configured: { label: "Not configured", className: "bg-bg-panel2 text-muted" },
+    paused: { label: "Paused", className: "bg-amber-400/15 text-amber-400" },
   };
   const { label, className } = map[status] ?? map.stopped;
 

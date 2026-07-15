@@ -62,7 +62,7 @@ class _NullRecorder:
 class SentimentStrategy:
     def __init__(self, cfg, broker, universe, news, analyzer, risk,
                  trade_logger, summary_logger, state, closed_trade_logger=None,
-                 recorder=None, version_provider=None):
+                 recorder=None, version_provider=None, bot_control_provider=None):
         self.cfg = cfg
         self.broker = broker
         self.universe = universe
@@ -86,11 +86,23 @@ class SentimentStrategy:
         self.version_provider = version_provider or StrategyVersionProvider(
             getattr(recorder, "database_url", None)
         )
+        # Read-only mirror of the dashboard's bot_control row (see
+        # bot/bot_control.py). Fails open (not paused) if unset/unreachable -
+        # a DB hiccup should never silently halt trading. Pausing/resuming
+        # is exclusively a dashboard action; the bot never sets this itself.
+        from ..bot_control import BotControlProvider
+        self.bot_control_provider = bot_control_provider or BotControlProvider(
+            getattr(recorder, "database_url", None)
+        )
         # Guards the daily-loss-limit notification so it fires once per
         # breach-day, not every 30-min cycle for the rest of the day.
         self._daily_loss_notified_date: Optional[str] = None
         # Same one-per-day guard for the PDT warning (see _maybe_notify_pdt).
         self._pdt_notified_date: Optional[str] = None
+        # Tracks the last-seen pause state so the bot_paused/bot_resumed
+        # notification fires once per state CHANGE, not every cycle while
+        # paused (or every cycle once resumed).
+        self._last_known_paused: bool = False
 
     def run_cycle(self, force: bool = False, scheduler_status: str = "scheduled") -> None:
         if not force and not self.broker.is_market_open():
@@ -151,10 +163,38 @@ class SentimentStrategy:
             for sym in exited:
                 self._log_auto_exit(sym)
 
-        new_entries_allowed = not self.risk.daily_loss_breached(
+        # Manual pause / Emergency Stop, set from the dashboard (see
+        # bot/bot_control.py). Same "block new entries only" semantics as
+        # every other gate here - sentiment sells and price brackets keep
+        # managing existing positions. Checked first since it's the cheapest
+        # (no API call) and most likely to be the actual reason on a given
+        # cycle when it's set.
+        is_paused, pause_reason = self.bot_control_provider.is_paused()
+        if is_paused != self._last_known_paused:
+            self._last_known_paused = is_paused
+            if is_paused:
+                logger.warning("Trading paused from dashboard%s; sentiment exits only this cycle.",
+                               f" ({pause_reason})" if pause_reason else "",
+                               extra={"decision": "block_new_entries", "reason": "manual_pause"})
+                self.recorder.record_notification(
+                    type_="bot_paused", severity="warning", title="Trading paused",
+                    message=(pause_reason or "Paused from the dashboard.")
+                    + " New entries are blocked; existing positions keep being managed.",
+                )
+            else:
+                logger.info("Trading resumed from dashboard.")
+                self.recorder.record_notification(
+                    type_="bot_resumed", severity="info", title="Trading resumed",
+                    message="New entries are allowed again.",
+                )
+        if is_paused:
+            self.recorder.record_decision(symbol="*", decision="block_new_entries",
+                                          reason="manual_pause")
+
+        new_entries_allowed = not is_paused and not self.risk.daily_loss_breached(
             acct["equity"], acct["last_equity"]
         )
-        if not new_entries_allowed:
+        if not new_entries_allowed and not is_paused:
             logger.warning("Daily loss limit breached; sentiment exits only this cycle.",
                            extra={"decision": "block_new_entries", "reason": "daily_loss_limit"})
             self.recorder.record_decision(symbol="*", decision="block_new_entries",

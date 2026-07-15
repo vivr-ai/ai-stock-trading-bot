@@ -133,6 +133,73 @@ into the repo.
   single-operator project; would need real scoping if this dashboard ever
   had multiple bot instances or external callers.
 
+## Dashboard redesign - Bot control (pause / resume / Emergency Stop)
+
+- **Pause only blocks NEW entries, not liquidation.** "Emergency Stop" uses
+  the exact same mechanism as Pause, just with more urgent framing/reason
+  text - it does NOT close open positions. Sentiment-driven sells and
+  broker-side stop-loss/take-profit brackets keep managing existing
+  positions while paused, so pausing never leaves a position unprotected.
+  A dedicated liquidating "Kill Switch" is out of scope here and listed as
+  a possible future page.
+- **The bot reads `bot_control` on up to a 60-second cache**, the same
+  pattern as `bot/strategy_version.py`'s active-version read. A pause set
+  on the dashboard takes effect on the bot's current or next cycle, not
+  instantly mid-cycle.
+- **A database outage fails OPEN (not paused), not fail-closed.** If the
+  bot can't reach Postgres to check `bot_control`, it keeps trading as
+  before rather than treating the outage itself as an implicit pause. This
+  mirrors how every other dashboard-persistence failure in this project is
+  handled (best-effort, never blocks trading) - a DB hiccup and a deliberate
+  human pause are different events and are not conflated.
+- **Pausing/resuming from the dashboard writes a `notifications` row
+  directly (TypeScript), but does not itself send a Telegram alert.** Only
+  the Python bot's `NotificationService` sends Telegram, and it does so the
+  next time `run_cycle()` notices the state changed. In the (rare) case the
+  bot's process is fully stopped or never runs again after a pause is set,
+  no Telegram alert for that pause will go out - the dashboard's own
+  Notifications feed and Home status strip still reflect it immediately,
+  since that write happens synchronously in the API route.
+
+## Dashboard redesign - Home page & navigation
+
+- **"Next Scheduled Run" and "Time Until Next Session" are heuristics, not
+  reads from Alpaca or the bot's actual scheduler process.** The dashboard
+  has no direct connection to either - `/api/home` computes both from
+  known, hard-coded assumptions (bot/scheduler.py's default cron: weekdays,
+  :00/:30 marks, 09:00-16:00 America/New_York; a plain Mon-Fri 9:30-16:00
+  regular session). Neither accounts for market holidays, early closes, or
+  a customized `SCHEDULE_RUN_MINUTES` env var. Both are labelled "Estimate"
+  in the UI. Revisit if: the dashboard gains a real market-calendar data
+  source, or the bot starts reporting its own next-run time directly.
+- **"Market Sentiment" on Home is just the most recent decision's sentiment
+  label**, not an aggregate across symbols or a time window. A single
+  outlier headline can swing this label. Revisit if: a proper aggregation
+  (e.g. mean sentiment across the last full cycle's scans) is wanted here
+  instead.
+- **"Win Rate" on Home is all-time**, matching this project's standing
+  "don't overfit to a recent streak" principle - deliberately not a
+  trailing-N-trades number, even though that's a common pattern elsewhere.
+- **"Current Risk Level" (normal/elevated/high) is a new, small derived
+  heuristic**, not a risk-industry-standard score - it combines daily P/L
+  vs. the daily loss limit and total exposure vs. the configured exposure
+  cap using hand-picked thresholds (70%/80% of each limit = "elevated"),
+  same spirit as Strategy Health's confidence tiers. Revisit once there's
+  more real history to see if the thresholds hold up.
+- **The command palette (⌘K) uses a small hand-written substring/
+  subsequence matcher, not a fuzzy-search library.** Deliberately minimal
+  per the approved proposal - fine at ~20 pages today and the ~50-page
+  target; revisit if search quality noticeably degrades at a much larger
+  page count.
+- **Section/page renames (e.g. "Strategy Intelligence" -> "Learning &
+  Insights") are DISPLAY LABELS ONLY** - see dashboard/lib/navigation.ts.
+  Every underlying route/URL is unchanged, so no bookmarks or links break.
+- **`dashboard/components/Nav.tsx` (the old flat link list) could not be
+  deleted from this environment** and is left in the repo with a
+  `SUPERSEDED` comment at the top - nothing imports it anymore (replaced by
+  Sidebar.tsx + SectionTabs.tsx + MobileSectionBar.tsx). Safe to delete the
+  file next time you're editing locally.
+
 ## Cross-cutting, applies to the whole layer
 
 - The research/analytics layer is read-only with respect to trading
