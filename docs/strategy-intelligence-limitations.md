@@ -199,6 +199,24 @@ into the repo.
   `SUPERSEDED` comment at the top - nothing imports it anymore (replaced by
   Sidebar.tsx + SectionTabs.tsx + MobileSectionBar.tsx). Safe to delete the
   file next time you're editing locally.
+- **Root cause found after shipping Home, then fixed everywhere it recurred:**
+  the bot writes a heartbeat every ~30 min around the clock, but on a
+  market-closed cycle it returns early and never calls Alpaca's
+  `account_snapshot()` (see `bot/trading/strategy.py`'s `run_cycle`) - so
+  that heartbeat row has `portfolio_value`, `cash`, `equity`,
+  `buying_power`, `daytrade_count`, `pattern_day_trader`, `trading_mode`,
+  and `api_latency_ms` all `NULL` by design. Since the market is only open
+  ~19% of the week, any dashboard code that read only "the latest
+  heartbeat" for these fields would show blank/incomplete values most of
+  the time. Fixed in: `/api/home` (falls back to the latest
+  `portfolio_snapshots` row), `/api/risk` (same fallback), `/api/system-
+  health` and `/api/live-readiness` (fall back to the latest heartbeat
+  row `WHERE portfolio_value IS NOT NULL`, since those fields don't exist
+  in `portfolio_snapshots`). `/api/status` (superseded, unused) was left
+  with the original bug since nothing calls it. Revisit if: the bot is
+  changed to also populate a "last known" account snapshot on the
+  market-closed heartbeat itself, which would make these fallbacks
+  unnecessary.
 
 ## Cross-cutting, applies to the whole layer
 

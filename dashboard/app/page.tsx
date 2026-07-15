@@ -61,6 +61,7 @@ type HomeResponse = {
     weeklyReturnPct: number | null;
     monthlyReturnPct: number | null;
     lifetimeReturnPct: number | null;
+    isAsOfLastActiveCycle: boolean;
   };
   tradingActivity: {
     openPositions: number;
@@ -220,8 +221,18 @@ export default function HomePage() {
           <AlertsBanner alerts={data.alerts} />
 
           <Section title="Portfolio">
-            <StatCard label="Portfolio Value" value={fmtMoney(data.portfolio.value)} icon={<Wallet size={15} />} />
-            <StatCard label="Cash Available" value={fmtMoney(data.portfolio.cash)} icon={<Banknote size={15} />} />
+            <StatCard
+              label="Portfolio Value"
+              value={fmtMoney(data.portfolio.value)}
+              sublabel={data.portfolio.isAsOfLastActiveCycle ? "As of last active cycle (market closed)" : undefined}
+              icon={<Wallet size={15} />}
+            />
+            <StatCard
+              label="Cash Available"
+              value={fmtMoney(data.portfolio.cash)}
+              sublabel={data.portfolio.isAsOfLastActiveCycle ? "As of last active cycle (market closed)" : undefined}
+              icon={<Banknote size={15} />}
+            />
             <StatCard
               label="Today's P/L"
               value={fmtMoney(data.portfolio.todaysPl)}

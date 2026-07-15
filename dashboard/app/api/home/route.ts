@@ -201,8 +201,8 @@ export async function GET() {
       queryOne<{ count: string }>(
         "SELECT count(*) FROM strategy_recommendations WHERE status = 'pending'"
       ),
-      query<{ ts: string; portfolio_value: number | null }>(
-        "SELECT ts, portfolio_value FROM portfolio_snapshots ORDER BY ts ASC LIMIT 5000"
+      query<{ ts: string; portfolio_value: number | null; cash: number | null }>(
+        "SELECT ts, portfolio_value, cash FROM portfolio_snapshots ORDER BY ts ASC LIMIT 5000"
       ),
       queryOne<{ count: string; wins: string; total_pnl: string | null }>(
         `SELECT count(*), count(*) FILTER (WHERE pnl > 0) AS wins, sum(pnl) as total_pnl
@@ -257,8 +257,20 @@ export async function GET() {
       : "running";
 
     // ---- Portfolio ----
+    // The latest heartbeat is written every ~30 min regardless of whether
+    // the market is open (see bot/trading/strategy.py's run_cycle) - but on
+    // a market-closed cycle it returns early and skips the Alpaca account
+    // call entirely, so portfolio_value/cash are NULL on that row by
+    // design. The market is only open ~19% of the week, so "just read the
+    // latest heartbeat" goes blank most of the time. Fall back to the
+    // latest portfolio_snapshots row instead, which is ONLY ever written
+    // right after a real, successful account_snapshot() call - i.e. the
+    // last genuinely known value, not a guess.
     const dailySeries = collapseToLastPerDay(snapshots);
-    const portfolioValue = heartbeat?.portfolio_value ?? null;
+    const latestSnapshotRow = snapshots.length > 0 ? snapshots[snapshots.length - 1] : null;
+    const portfolioValue = heartbeat?.portfolio_value ?? latestSnapshotRow?.portfolio_value ?? null;
+    const cashValue = heartbeat?.cash ?? latestSnapshotRow?.cash ?? null;
+    const portfolioValueIsStale = heartbeat?.portfolio_value == null && latestSnapshotRow != null;
     const weeklyBaseline = closestSnapshot(dailySeries, 7 * 86_400_000);
     const monthlyBaseline = closestSnapshot(dailySeries, 30 * 86_400_000);
     const lifetimeBaseline = dailySeries[0]?.value ?? null;
@@ -289,7 +301,7 @@ export async function GET() {
     const dailyLossBreached = dailyPnlPct != null && dailyPnlPct <= -riskConfig.dailyLossLimitPct;
     const totalExposurePct =
       portfolioValue && portfolioValue > 0
-        ? ((portfolioValue - (heartbeat?.cash ?? 0)) / portfolioValue) * 100
+        ? ((portfolioValue - (cashValue ?? 0)) / portfolioValue) * 100
         : null;
     const drawdownPct = maxDrawdownPct(dailySeries.map((p) => p.value));
 
@@ -354,14 +366,24 @@ export async function GET() {
       },
       portfolio: {
         value: portfolioValue,
-        cash: heartbeat?.cash ?? null,
+        cash: cashValue,
         todaysPl,
         weeklyReturnPct: pctReturn(weeklyBaseline),
         monthlyReturnPct: pctReturn(monthlyBaseline),
         lifetimeReturnPct: pctReturn(lifetimeBaseline),
+        // True when the latest heartbeat skipped the Alpaca account call
+        // (market-closed cycle) and this is the last known snapshot from a
+        // real cycle instead - disclosed on Home so a market-closed evening
+        // doesn't read as "portfolio value as of right now".
+        isAsOfLastActiveCycle: portfolioValueIsStale,
       },
       tradingActivity: {
-        openPositions: heartbeat?.open_positions ?? 0,
+        // The open_positions table is the persistent current book (one row
+        // per held symbol, upserted every real cycle, deleted the moment a
+        // position closes) - it doesn't go stale/null on a market-closed
+        // heartbeat the way heartbeats.open_positions can, so it's the more
+        // reliable source here.
+        openPositions: openPositionsAgg[0] ? Number(openPositionsAgg[0].count) : 0,
         openOrders: null, // N/A - this bot's model doesn't track resting limit orders; see Orders (future page)
         lastTrade: lastTrade
           ? { ts: lastTrade.ts, action: lastTrade.action, symbol: lastTrade.symbol, qty: lastTrade.qty, price: lastTrade.price }

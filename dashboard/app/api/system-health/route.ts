@@ -52,10 +52,23 @@ export async function GET() {
 
   const dbCallStarted = Date.now();
   try {
-    const [heartbeat, lastScan, lastDeploy, lastBrokerIssue, lastSchedulerFailure, lastDbFailure] =
+    const [heartbeat, lastFullHeartbeat, lastScan, lastDeploy, lastBrokerIssue, lastSchedulerFailure, lastDbFailure] =
       await Promise.all([
         queryOne<Heartbeat>(
           "SELECT ts, status, scheduler_status, market_open, dry_run, api_latency_ms, trading_mode, daytrade_count, pattern_day_trader FROM heartbeats ORDER BY ts DESC LIMIT 1"
+        ),
+        // trading_mode / daytrade_count / pattern_day_trader / api_latency_ms
+        // are only populated on a heartbeat written after a successful
+        // Alpaca account_snapshot() call - the market-closed early-return
+        // heartbeat (see bot/trading/strategy.py's run_cycle) skips that
+        // call entirely, leaving these NULL on that row. Since the market
+        // is closed ~81% of the week, reading only "the latest heartbeat"
+        // would blank these out most of the time. This fallback query gets
+        // the latest heartbeat that DOES have a portfolio_value (i.e. ran
+        // the real account call), so these fields show the last genuinely
+        // known reading instead of going blank on a quiet evening/weekend.
+        queryOne<Heartbeat>(
+          "SELECT ts, status, scheduler_status, market_open, dry_run, api_latency_ms, trading_mode, daytrade_count, pattern_day_trader FROM heartbeats WHERE portfolio_value IS NOT NULL ORDER BY ts DESC LIMIT 1"
         ),
         queryOne<{ ts: string }>(
           "SELECT ts FROM decisions WHERE decision = 'scan' ORDER BY ts DESC LIMIT 1"
@@ -126,9 +139,9 @@ export async function GET() {
         ageMinutes: heartbeatAgeMinutes,
         marketOpen: heartbeat?.market_open ?? null,
         dryRun: heartbeat?.dry_run ?? null,
-        tradingMode: heartbeat?.trading_mode ?? null,
-        daytradeCount: heartbeat?.daytrade_count ?? null,
-        patternDayTrader: heartbeat?.pattern_day_trader ?? null,
+        tradingMode: heartbeat?.trading_mode ?? lastFullHeartbeat?.trading_mode ?? null,
+        daytradeCount: heartbeat?.daytrade_count ?? lastFullHeartbeat?.daytrade_count ?? null,
+        patternDayTrader: heartbeat?.pattern_day_trader ?? lastFullHeartbeat?.pattern_day_trader ?? null,
       },
       botStatus,
       scheduler: {
@@ -140,7 +153,7 @@ export async function GET() {
       },
       alpaca: {
         status: alpacaStatus,
-        apiLatencyMs: heartbeat?.api_latency_ms ?? null,
+        apiLatencyMs: heartbeat?.api_latency_ms ?? lastFullHeartbeat?.api_latency_ms ?? null,
         lastIssue: lastBrokerIssue
           ? { ts: lastBrokerIssue.ts, message: lastBrokerIssue.message }
           : null,

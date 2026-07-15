@@ -39,9 +39,20 @@ export async function GET() {
   }
 
   try {
-    const [heartbeat, positions, todayFirstSnapshot, recentBlocks] = await Promise.all([
+    const [heartbeat, lastFullHeartbeat, positions, todayFirstSnapshot, recentBlocks] = await Promise.all([
       queryOne<Heartbeat>(
         "SELECT ts, portfolio_value, cash, equity, buying_power, market_open FROM heartbeats ORDER BY ts DESC LIMIT 1"
+      ),
+      // The latest heartbeat is written every ~30 min even when the market
+      // is closed - but that cycle returns early and never calls Alpaca's
+      // account_snapshot(), so portfolio_value/cash/equity/buying_power are
+      // NULL on that row by design (see bot/trading/strategy.py's run_cycle
+      // early return). Since the market is only open ~19% of the week, the
+      // plain "latest heartbeat" would show blank risk numbers most of the
+      // time. This second query gets the latest heartbeat that DOES have
+      // real account data - i.e. the last genuinely known reading.
+      queryOne<Heartbeat>(
+        "SELECT ts, portfolio_value, cash, equity, buying_power, market_open FROM heartbeats WHERE portfolio_value IS NOT NULL ORDER BY ts DESC LIMIT 1"
       ),
       query<OpenPosition>(
         "SELECT symbol, qty, market_value, allocation_pct, current_price, avg_entry_price FROM open_positions ORDER BY market_value DESC NULLS LAST"
@@ -58,8 +69,8 @@ export async function GET() {
       ),
     ]);
 
-    const portfolioValue = heartbeat?.portfolio_value ?? null;
-    const cash = heartbeat?.cash ?? null;
+    const portfolioValue = heartbeat?.portfolio_value ?? lastFullHeartbeat?.portfolio_value ?? null;
+    const cash = heartbeat?.cash ?? lastFullHeartbeat?.cash ?? null;
 
     const totalMarketValue = positions.reduce((sum, p) => sum + Number(p.market_value ?? 0), 0);
     const totalExposurePct =

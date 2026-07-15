@@ -52,7 +52,7 @@ export async function GET() {
   }
 
   try {
-    const [config, heartbeat] = await Promise.all([
+    const [config, heartbeat, lastFullHeartbeat] = await Promise.all([
       queryOne<ConfigStatus>(
         `SELECT ts, trading_mode, live_confirmed, risk_dry_run, allow_submit,
                 has_paper_keys, has_live_keys, has_telegram, has_database,
@@ -62,6 +62,17 @@ export async function GET() {
       queryOne<Heartbeat>(
         `SELECT ts, daytrade_count, pattern_day_trader, portfolio_value, equity
          FROM heartbeats ORDER BY ts DESC LIMIT 1`
+      ),
+      // daytrade_count/pattern_day_trader/equity are only populated on a
+      // heartbeat written after a successful Alpaca account_snapshot() call
+      // - the market-closed early-return heartbeat (see bot/trading/
+      // strategy.py's run_cycle) skips that call, leaving these NULL. Since
+      // the market is closed ~81% of the week, the PDT checklist item below
+      // would silently disappear most of the time without this fallback to
+      // the last heartbeat that DID have real account data.
+      queryOne<Heartbeat>(
+        `SELECT ts, daytrade_count, pattern_day_trader, portfolio_value, equity
+         FROM heartbeats WHERE portfolio_value IS NOT NULL ORDER BY ts DESC LIMIT 1`
       ),
     ]);
 
@@ -148,9 +159,9 @@ export async function GET() {
       });
 
       // PDT counter - informational unless already flagged or close to it.
-      const daytradeCount = heartbeat?.daytrade_count ?? null;
-      const patternDayTrader = heartbeat?.pattern_day_trader ?? false;
-      const equity = heartbeat?.equity ?? null;
+      const daytradeCount = heartbeat?.daytrade_count ?? lastFullHeartbeat?.daytrade_count ?? null;
+      const patternDayTrader = heartbeat?.pattern_day_trader ?? lastFullHeartbeat?.pattern_day_trader ?? false;
+      const equity = heartbeat?.equity ?? lastFullHeartbeat?.equity ?? null;
       const under25k = equity != null && equity < 25000;
       if (daytradeCount != null) {
         checklist.push({

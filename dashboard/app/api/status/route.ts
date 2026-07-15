@@ -1,3 +1,13 @@
+/**
+ * SUPERSEDED - the Home page now calls /api/home instead (see
+ * app/api/home/route.ts), which also fixes a bug this route still has:
+ * portfolioValue/cash go null whenever the latest heartbeat happens to be
+ * a market-closed cycle (which skips the Alpaca account call by design -
+ * see bot/trading/strategy.py's run_cycle early return). /api/home falls
+ * back to the latest portfolio_snapshots row instead. Left in place only
+ * because nothing currently calls it, not because it's still correct -
+ * safe to delete next time you're editing locally.
+ */
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
