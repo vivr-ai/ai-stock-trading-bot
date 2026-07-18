@@ -18,6 +18,8 @@ type Position = {
   entry_reason: string | null;
   entry_time: string | null;
   updated_at: string;
+  stop_loss_price: number | null;
+  take_profit_price: number | null;
 };
 
 type PositionsResponse = {
@@ -85,13 +87,14 @@ export default function PortfolioPage() {
 
       {!loading && !error && data && data.positions.length > 0 && (
         <div className="overflow-x-auto rounded-xl border border-bg-border bg-bg-panel">
-          <table className="w-full min-w-[900px] text-left text-sm">
+          <table className="w-full min-w-[1000px] text-left text-sm">
             <thead>
               <tr className="border-b border-bg-border text-xs uppercase tracking-wide text-muted">
                 <th className="px-4 py-3 font-medium">Symbol</th>
                 <th className="px-4 py-3 font-medium">Qty</th>
                 <th className="px-4 py-3 font-medium">Avg Entry</th>
                 <th className="px-4 py-3 font-medium">Current Price</th>
+                <th className="px-4 py-3 font-medium">Stop Loss</th>
                 <th className="px-4 py-3 font-medium">Unrealized P/L</th>
                 <th className="px-4 py-3 font-medium">Allocation</th>
                 <th className="px-4 py-3 font-medium">AI Confidence</th>
@@ -107,6 +110,9 @@ export default function PortfolioPage() {
                     <td className="px-4 py-3 tabular-nums">{fmtNumber(p.qty)}</td>
                     <td className="px-4 py-3 tabular-nums">{fmtMoney(p.avg_entry_price)}</td>
                     <td className="px-4 py-3 tabular-nums">{fmtMoney(p.current_price)}</td>
+                    <td className="px-4 py-3 tabular-nums text-loss/90" title={p.take_profit_price != null ? `Take profit: ${fmtMoney(p.take_profit_price)}` : undefined}>
+                      {p.stop_loss_price != null ? fmtMoney(p.stop_loss_price) : "—"}
+                    </td>
                     <td
                       className={`px-4 py-3 tabular-nums ${
                         tone === "gain" ? "text-gain" : tone === "loss" ? "text-loss" : ""

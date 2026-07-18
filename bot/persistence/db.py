@@ -366,6 +366,98 @@ class Recorder:
             except Exception:  # noqa: BLE001
                 pass
 
+    def get_last_buy_trade(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Read-only escape hatch - the only read path in this otherwise
+        write-only module, kept narrowly scoped on purpose.
+
+        Used solely as a fallback by _log_auto_exit() in
+        bot/trading/strategy.py when the bot's own open-lot state
+        (bot/state.py's local JSON file) has been lost - most commonly
+        because Railway's ephemeral filesystem wiped it on a redeploy
+        before a position closed. Without this, that exit would be
+        silently dropped from closed_trades entirely (see that method's
+        docstring). Returns the most recent 'buy' row for `symbol` from
+        the trades table - the same table the dashboard's Portfolio page
+        Stop Loss column reads from - or None if the DB is unavailable or
+        has no matching row (e.g. a manually-opened position, or trade
+        history predating this table)."""
+        if not self.enabled:
+            return None
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB connect failed (last-buy lookup skipped for %s): %s",
+                            symbol, exc)
+            return None
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT ts, qty, price, stop_price, take_profit, reason, rationale,
+                               sector, market_regime, sentiment_score, sentiment_label
+                        FROM trades
+                        WHERE symbol = %(symbol)s AND action = 'buy'
+                        ORDER BY ts DESC LIMIT 1
+                        """,
+                        dict(symbol=symbol),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        return None
+                    cols = [d[0] for d in cur.description]
+                    return dict(zip(cols, row))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB last-buy lookup failed for %s: %s", symbol, exc)
+            return None
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def has_logged_closed_trade_since(self, symbol: str, since_ts) -> bool:
+        """True if a closed_trades row already exists for `symbol` with an
+        exit time at or after `since_ts`. Paired with get_last_buy_trade()
+        as a duplicate guard for the state-loss fallback in
+        bot/trading/strategy.py's _log_closed_trade_from_history: if the
+        normal sell path already logged this round-trip's exit (the common,
+        harmless reason an open-lot lookup can come back empty - see that
+        method's docstring), this returns True and the fallback skips
+        rather than writing a second row for the same trade. Fails toward
+        "not logged" (False) on any DB problem or missing timestamp, since
+        the caller's fallback behavior on False is itself safe to repeat -
+        worst case a rare harmless duplicate, never a silently dropped
+        trade."""
+        if not self.enabled or since_ts is None:
+            return False
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB connect failed (dup-check skipped for %s): %s",
+                            symbol, exc)
+            return False
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT 1 FROM closed_trades
+                        WHERE symbol = %(symbol)s AND ts >= %(since_ts)s
+                        LIMIT 1
+                        """,
+                        dict(symbol=symbol, since_ts=since_ts),
+                    )
+                    return cur.fetchone() is not None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB dup-check failed for %s: %s", symbol, exc)
+            return False
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
     def record_notification(self, *, type_: str, title: str, message: Optional[str] = None,
                              severity: str = "info", metadata: Optional[Dict] = None) -> None:
         self._execute(

@@ -218,6 +218,66 @@ into the repo.
   market-closed heartbeat itself, which would make these fallbacks
   unnecessary.
 
+## Portfolio page - stop-loss column, blank AI Confidence/Entry Reason
+
+- Added a **Stop Loss** column to the Portfolio table. `open_positions`
+  has no stop-loss/take-profit columns (it only tracks the current book),
+  but every buy order records `stop_price`/`take_profit` on its `trades`
+  row at entry time. `/api/positions` now does a `DISTINCT ON (symbol)`
+  lookup of each open symbol's latest 'buy' trade and attaches those
+  levels. If a symbol's stop is ever adjusted intra-trade outside of this
+  flow (not currently done), this column would not reflect that - it only
+  reflects the level set when the position was opened.
+- **AI Confidence / Entry Reason blank for positions opened before a
+  redeploy**: these two fields come from `BotState.peek_open()`
+  (`bot/state.py`), which is backed by a local JSON file
+  (`logs/state.json` by default, path configurable via `STATE_PATH`).
+  That file's own docstring warns Railway's filesystem is ephemeral
+  without an attached Volume - a redeploy wipes it. Any position opened
+  before the wipe loses its `ai_confidence`/`entry_reason`/other open-lot
+  metadata permanently; new positions opened after the wipe populate
+  normally. **More serious side effect**: `_log_auto_exit()` in
+  `bot/trading/strategy.py` silently skips writing a `closed_trades` row
+  entirely if `state.peek_open(symbol)` returns `None` - so if one of
+  these "orphaned" positions closes, its P/L will not appear anywhere in
+  performance reporting. Fix going forward: attach a Railway Volume
+  mounted at the `STATE_PATH` directory so `logs/state.json` survives
+  redeploys (see `DEPLOYMENT.md`). Not yet done as of this writing - it's
+  an infra change outside this dashboard/bot codebase, left to the user.
+
+## Silent closed_trades loss on state-loss exit - now fixed
+
+- **Follow-up on the item above.** The blank-columns problem had a sharper
+  edge: `_log_auto_exit()` and both branches of `_do_sell()` in
+  `bot/trading/strategy.py` used to silently `return` (no-op) whenever
+  `state.peek_open(symbol)` came back `None` - meaning any position that
+  closed after its open-lot record was lost (redeploy wipe, or any other
+  cause) never got a `closed_trades` row at all. Its P/L would vanish from
+  every performance report with no error anywhere.
+- **Fix**: added `Recorder.get_last_buy_trade()` and
+  `Recorder.has_logged_closed_trade_since()` (`bot/persistence/db.py` -
+  the module's only read paths, deliberately narrow) and a new
+  `SentimentStrategy._log_closed_trade_from_history()` fallback
+  (`bot/trading/strategy.py`) called from all three sites when the
+  open-lot lookup misses. It reconstructs entry price/qty/context from the
+  symbol's most recent `trades` 'buy' row instead of dropping the exit.
+- **Duplicate-write guard, important nuance**: `lot is None` has two
+  different causes that look identical from the caller - (a) this exit was
+  already logged through the normal path in an earlier cycle (harmless,
+  common - `state.pop_open()` already removed it), or (b) the open-lot
+  record was actually lost. Naively reconstructing on every `None` would
+  double-log every ordinary sell one cycle later. The fallback checks
+  `has_logged_closed_trade_since(symbol, last_buy_ts)` first and skips if
+  a `closed_trades` row already exists for that round-trip - verified with
+  a dedicated duplicate-guard test case in addition to the reconstruction
+  path itself and the untouched normal path.
+- **Still doesn't fully replace an attached Volume.** If the DB itself has
+  no prior 'buy' row for a symbol either (e.g. `DATABASE_URL` wasn't set
+  when it was bought), there's no third source of truth - the trade is
+  logged as unrecoverable with a warning, same as before. Attaching a
+  Railway Volume at `STATE_PATH` remains the real fix; this is a safety
+  net for when that hasn't happened (yet), not a replacement for it.
+
 ## Cross-cutting, applies to the whole layer
 
 - The research/analytics layer is read-only with respect to trading

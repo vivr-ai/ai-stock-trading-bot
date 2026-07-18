@@ -399,17 +399,97 @@ class SentimentStrategy:
             })
         self.recorder.sync_open_positions(rows)
 
+    def _log_closed_trade_from_history(self, symbol: str, exit_price: Optional[float],
+                                        exit_reason: str) -> None:
+        """Fallback exit-logging path, called whenever BotState has no
+        open-lot record for `symbol` at exit time - almost always because
+        bot/state.py's local JSON file was wiped by a Railway redeploy
+        (ephemeral filesystem, no Volume attached) since this position was
+        opened, NOT because the exit was already logged through the normal
+        path. That second case is real too though (see _log_auto_exit's
+        docstring), so before writing anything here we check whether a
+        closed_trades row already exists for this symbol dated after its
+        last buy - if so, the normal path already handled it and we skip,
+        rather than double-counting one round-trip's P/L.
+
+        Reconstructs entry price/qty/context from the trades table - the
+        same table the dashboard's Portfolio page Stop Loss column reads
+        from - instead of silently dropping this trade's P/L from every
+        performance report forever."""
+        if self.closed_trade_logger is None or self.recorder is None:
+            return
+        if exit_price is None:
+            logger.warning("Exit for %s: no open-lot state and no exit price "
+                           "available; trade not logged.", symbol)
+            return
+        last_buy = self.recorder.get_last_buy_trade(symbol)
+        if last_buy is None:
+            logger.warning(
+                "Exit for %s: no open-lot state AND no prior buy row in "
+                "trades table; entry price is unrecoverable, so this trade's "
+                "P/L cannot be added to closed_trades. Exit price was %.2f.",
+                symbol, exit_price,
+            )
+            return
+        if self.recorder.has_logged_closed_trade_since(symbol, last_buy.get("ts")):
+            logger.info(
+                "Exit for %s: already logged via the normal sell path for "
+                "this round-trip; skipping to avoid a duplicate closed_trades row.",
+                symbol,
+            )
+            return
+        entry_price = last_buy["price"]
+        qty = last_buy["qty"]
+        full_reason = f"{exit_reason} (reconstructed - open-lot state was lost)"
+        pnl = self.closed_trade_logger.log(
+            symbol, qty, entry_price, exit_price,
+            exit_reason=full_reason, entry_time=None,
+        )
+        logger.info(
+            "Closed trade (reconstructed from trades table - open-lot state "
+            "was missing) %s: entry=%.2f exit=%.2f pnl=%.2f",
+            symbol, entry_price, exit_price, pnl,
+            extra={"symbol": symbol, "decision": "closed_trade", "entry_price": entry_price,
+                   "exit_price": exit_price, "pnl": pnl, "exit_reason": exit_reason},
+        )
+        pnl_pct = ((exit_price - entry_price) / entry_price * 100.0) if entry_price else 0.0
+        self.recorder.record_closed_trade(
+            symbol=symbol, qty=qty, entry_price=entry_price, exit_price=exit_price,
+            pnl=pnl, pnl_pct=pnl_pct, exit_reason=full_reason,
+            entry_time=None, buy_reason=last_buy.get("reason"),
+            news_summary=last_buy.get("rationale"), sector=last_buy.get("sector"),
+            confidence_score=last_buy.get("sentiment_score"),
+            confidence_label=last_buy.get("sentiment_label"),
+            market_regime=last_buy.get("market_regime"), strategy_version=None,
+        )
+        self.recorder.record_notification(
+            type_="trade_executed", title=f"{symbol} position closed (reconstructed)",
+            message=(f"entry={entry_price:.2f} exit={exit_price:.2f} pnl={pnl:.2f} - "
+                     f"reconstructed from trade history because open-lot state was lost"),
+            severity="info" if pnl >= 0 else "warning",
+        )
+
     def _log_auto_exit(self, symbol: str) -> None:
         """A position vanished since last cycle without us closing it here —
         almost always a bracket stop-loss/take-profit fill. Look up the fill
         and log realized P/L against the open-lot entry we recorded at buy
         time. If we already logged this exit ourselves (see _do_sell), the
-        open lot is already gone and this is a no-op."""
+        open lot is already gone - `_log_closed_trade_from_history` below
+        detects that case (via has_logged_closed_trade_since) and no-ops
+        rather than double-logging it. If the open lot is gone because
+        bot/state.py's local file was wiped by a redeploy instead, that same
+        fallback reconstructs the trade from the trades table so it isn't
+        silently lost from closed_trades."""
         if self.closed_trade_logger is None:
             return
         lot = self.state.peek_open(symbol)
         if lot is None:
-            return  # already closed out explicitly by _do_sell this run
+            fill = self.broker.last_fill(symbol, side="sell")
+            exit_price = fill.filled_avg_price if fill else self.broker.latest_price(symbol)
+            self._log_closed_trade_from_history(
+                symbol, exit_price, "auto_exit (stop_loss_or_take_profit)"
+            )
+            return
         fill = self.broker.last_fill(symbol, side="sell")
         exit_price = fill.filled_avg_price if fill else self.broker.latest_price(symbol)
         if exit_price is None:
@@ -745,6 +825,11 @@ class SentimentStrategy:
                         market_regime=lot.get("market_regime"),
                         strategy_version=lot.get("strategy_version"),
                     )
+                else:
+                    # Same open-lot-loss scenario documented on
+                    # _log_closed_trade_from_history - reconstruct from the
+                    # trades table instead of dropping this exit.
+                    self._log_closed_trade_from_history(symbol, exit_price, f"dry_run: {reason}")
             return
 
         order = self.broker.close_position(symbol)
@@ -802,3 +887,8 @@ class SentimentStrategy:
                             extra={"symbol": symbol, "decision": "closed_trade",
                                    "entry_price": lot["entry_price"], "exit_price": exit_price,
                                    "pnl": pnl})
+            elif exit_price is not None:
+                # Same open-lot-loss scenario documented on
+                # _log_closed_trade_from_history - reconstruct from the
+                # trades table instead of dropping this exit.
+                self._log_closed_trade_from_history(symbol, exit_price, reason)
