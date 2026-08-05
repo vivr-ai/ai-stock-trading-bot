@@ -282,6 +282,24 @@ class AlpacaBroker:
             history = series
             today_volume = None  # can't confirm today's print yet; fail closed on the volume gate
 
+        if len(history) < sma_period:
+            # Diagnostic: get_stock_bars DID return bars (the "not series"
+            # branch above didn't fire), but fewer than requested for this
+            # SMA window - if history ends up empty, `sma` silently stays
+            # None a few lines down with no other log line to explain why.
+            # Capture exactly how many bars came back and their dates so we
+            # can tell "account's data plan only returns a thin window" apart
+            # from a one-off date-boundary fluke. Remove alongside the other
+            # market_snapshot diagnostic once the root cause is confirmed and
+            # STRATEGY_MARKET_REGIME_FILTER_ENABLED is back on.
+            logger.warning(
+                "market_snapshot: %s got only %d history bar(s) (%d total "
+                "incl. today) for a %d-day SMA (requested limit=%d). "
+                "bar_dates=%s",
+                symbol, len(history), len(series), sma_period, limit,
+                [str(_bar_date(b)) for b in series],
+            )
+
         prev_close = float(history[-1].close) if history else float(series[-1].open)
         change_pct = (last - prev_close) / prev_close * 100.0 if prev_close > 0 else None
 
