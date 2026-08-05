@@ -248,6 +248,25 @@ class AlpacaBroker:
             return MarketSnapshot(symbol, last, None, None, None, None, None, None)
 
         if not series:
+            # Diagnostic: get_stock_bars raised no exception but came back with
+            # zero bars for `symbol` specifically - log exactly what the SDK
+            # handed us (response type / whether it has a `.data` dict / what
+            # keys are actually in it) so a data-plan or permissions gap can be
+            # told apart from a key-mismatch bug, instead of silently failing
+            # closed every cycle with no trace of why. Remove once the market
+            # regime filter (STRATEGY_MARKET_REGIME_FILTER_ENABLED) is back on.
+            keys = None
+            if hasattr(bars_resp, "data"):
+                try:
+                    keys = list(bars_resp.data.keys())
+                except Exception:  # noqa: BLE001
+                    keys = "<unavailable>"
+            logger.warning(
+                "market_snapshot: get_stock_bars(%s, limit=%d) returned no bars for "
+                "this symbol (no exception raised). response_type=%s has_data_attr=%s "
+                "data_keys=%s",
+                symbol, limit, type(bars_resp).__name__, hasattr(bars_resp, "data"), keys,
+            )
             return MarketSnapshot(symbol, last, None, None, None, None, None, None)
 
         today = datetime.now(timezone.utc).date()
