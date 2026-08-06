@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set
 
 from ..utils.retry import call_with_retry
@@ -235,10 +235,21 @@ class AlpacaBroker:
             return None
 
         limit = max(sma_period, volume_lookback_days) + 2
+        # Alpaca's bars endpoint does NOT infer a historical window from
+        # `limit` alone - without an explicit `start` it only returns bars
+        # from "now" onward as they form: nothing before the market opens,
+        # and exactly one (still-forming) bar for the rest of the day. That
+        # silently starved every SMA/volume-average below, which is why the
+        # market regime filter and every per-symbol confirmation filter were
+        # fail-closing on every single cycle (confirmed via the diagnostic
+        # logging this replaced - see git history). ~1.6x calendar-day buffer
+        # covers weekends; +5 extra days covers typical holiday clusters.
+        start = datetime.now(timezone.utc) - timedelta(days=int(limit * 1.6) + 5)
         try:
             bars_resp = self._retry(
                 lambda: self._data.get_stock_bars(
-                    StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, limit=limit)
+                    StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day,
+                                      start=start, limit=limit)
                 ),
                 f"get_stock_bars({symbol})",
             )
@@ -248,25 +259,8 @@ class AlpacaBroker:
             return MarketSnapshot(symbol, last, None, None, None, None, None, None)
 
         if not series:
-            # Diagnostic: get_stock_bars raised no exception but came back with
-            # zero bars for `symbol` specifically - log exactly what the SDK
-            # handed us (response type / whether it has a `.data` dict / what
-            # keys are actually in it) so a data-plan or permissions gap can be
-            # told apart from a key-mismatch bug, instead of silently failing
-            # closed every cycle with no trace of why. Remove once the market
-            # regime filter (STRATEGY_MARKET_REGIME_FILTER_ENABLED) is back on.
-            keys = None
-            if hasattr(bars_resp, "data"):
-                try:
-                    keys = list(bars_resp.data.keys())
-                except Exception:  # noqa: BLE001
-                    keys = "<unavailable>"
-            logger.warning(
-                "market_snapshot: get_stock_bars(%s, limit=%d) returned no bars for "
-                "this symbol (no exception raised). response_type=%s has_data_attr=%s "
-                "data_keys=%s",
-                symbol, limit, type(bars_resp).__name__, hasattr(bars_resp, "data"), keys,
-            )
+            logger.warning("market_snapshot: get_stock_bars(%s, start=%s, limit=%d) "
+                           "returned no bars for this symbol.", symbol, start.date(), limit)
             return MarketSnapshot(symbol, last, None, None, None, None, None, None)
 
         today = datetime.now(timezone.utc).date()
@@ -283,21 +277,11 @@ class AlpacaBroker:
             today_volume = None  # can't confirm today's print yet; fail closed on the volume gate
 
         if len(history) < sma_period:
-            # Diagnostic: get_stock_bars DID return bars (the "not series"
-            # branch above didn't fire), but fewer than requested for this
-            # SMA window - if history ends up empty, `sma` silently stays
-            # None a few lines down with no other log line to explain why.
-            # Capture exactly how many bars came back and their dates so we
-            # can tell "account's data plan only returns a thin window" apart
-            # from a one-off date-boundary fluke. Remove alongside the other
-            # market_snapshot diagnostic once the root cause is confirmed and
-            # STRATEGY_MARKET_REGIME_FILTER_ENABLED is back on.
             logger.warning(
-                "market_snapshot: %s got only %d history bar(s) (%d total "
-                "incl. today) for a %d-day SMA (requested limit=%d). "
-                "bar_dates=%s",
-                symbol, len(history), len(series), sma_period, limit,
-                [str(_bar_date(b)) for b in series],
+                "market_snapshot: %s got only %d history bar(s) (%d total incl. "
+                "today) for a %d-day SMA (start=%s, limit=%d) - SMA will be "
+                "computed over a shorter window than intended.",
+                symbol, len(history), len(series), sma_period, start.date(), limit,
             )
 
         prev_close = float(history[-1].close) if history else float(series[-1].open)
