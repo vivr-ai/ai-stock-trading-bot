@@ -216,18 +216,19 @@ class AlpacaBroker:
 
         change_pct is measured from the PREVIOUS DAY'S CLOSE, not today's
         open, so it captures overnight gaps — exactly the move that news
-        creates. SMA/avg-volume are computed over COMPLETED prior days only;
-        if today's bar is already forming (mid-session) it is excluded from
-        the average and reported separately as `today_volume`, so we're
-        comparing today's volume against a clean historical baseline instead
-        of leaking today into its own average.
+        creates. SMA/avg-volume are computed over COMPLETED prior days
+        (get_stock_bars with TimeFrame.Day never returns an in-progress
+        "today" bar, confirmed empirically - see today_volume below).
+        today's volume-so-far comes from a separate Snapshot call, so we're
+        comparing it against a clean historical baseline instead of leaking
+        a same-day bar into its own average.
 
         Note: on Alpaca's free IEX feed, bars reflect IEX-only trades, not
         the full consolidated tape — a reasonable proxy for relative volume,
         not an authoritative print. Fine for this bot's filters; upgrade to a
         SIP subscription if you need exact volume.
         """
-        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.requests import StockBarsRequest, StockSnapshotRequest
         from alpaca.data.timeframe import TimeFrame
 
         last = self.latest_price(symbol)
@@ -263,28 +264,49 @@ class AlpacaBroker:
                            "returned no bars for this symbol.", symbol, start.date(), limit)
             return MarketSnapshot(symbol, last, None, None, None, None, None, None)
 
-        today = datetime.now(timezone.utc).date()
-
-        def _bar_date(bar):
-            ts = getattr(bar, "timestamp", None)
-            return ts.date() if ts else None
-
-        if _bar_date(series[-1]) == today:
-            history = series[:-1]
-            today_volume = float(series[-1].volume)
-        else:
-            history = series
-            today_volume = None  # can't confirm today's print yet; fail closed on the volume gate
+        # get_stock_bars(TimeFrame.Day) only ever returns COMPLETED trading
+        # days - Alpaca does not backfill an in-progress "today" bar into
+        # this endpoint, even mid-session (confirmed empirically: checking
+        # the last bar's date against today never matched, at any hour,
+        # across multiple trading days - that dead branch used to live
+        # here and silently left today_volume=None on every single call,
+        # which permanently fail-closed the volume-confirmation gate below
+        # for every symbol, every day). So every bar in `series` is history.
+        history = series
 
         if len(history) < sma_period:
             logger.warning(
-                "market_snapshot: %s got only %d history bar(s) (%d total incl. "
-                "today) for a %d-day SMA (start=%s, limit=%d) - SMA will be "
-                "computed over a shorter window than intended.",
-                symbol, len(history), len(series), sma_period, start.date(), limit,
+                "market_snapshot: %s got only %d history bar(s) for a %d-day "
+                "SMA (start=%s, limit=%d) - SMA will be computed over a "
+                "shorter window than intended.",
+                symbol, len(history), sma_period, start.date(), limit,
             )
 
-        prev_close = float(history[-1].close) if history else float(series[-1].open)
+        # Today's volume-so-far has to come from a different endpoint: the
+        # Snapshot API's `daily_bar` is the actual in-progress current-session
+        # bar (unlike get_stock_bars above). Best-effort - if this fails, or
+        # the market hasn't printed a bar yet (e.g. pre-market), today_volume
+        # stays None and the volume gate correctly fails closed rather than
+        # guessing, same as before.
+        today_volume = None
+        try:
+            snap_resp = self._retry(
+                lambda: self._data.get_stock_snapshot(
+                    StockSnapshotRequest(symbol_or_symbols=symbol)
+                ),
+                f"get_stock_snapshot({symbol})",
+            )
+            snap = snap_resp.get(symbol)
+            daily_bar = getattr(snap, "daily_bar", None) if snap else None
+            if daily_bar is not None:
+                bar_ts = getattr(daily_bar, "timestamp", None)
+                if bar_ts is not None and bar_ts.date() == datetime.now(timezone.utc).date():
+                    today_volume = float(daily_bar.volume)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("market_snapshot: could not fetch today's volume for "
+                           "%s via snapshot: %s", symbol, exc)
+
+        prev_close = float(history[-1].close) if history else last
         change_pct = (last - prev_close) / prev_close * 100.0 if prev_close > 0 else None
 
         sma = None
