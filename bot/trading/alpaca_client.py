@@ -230,6 +230,7 @@ class AlpacaBroker:
         """
         from alpaca.data.requests import StockBarsRequest, StockSnapshotRequest
         from alpaca.data.timeframe import TimeFrame
+        from alpaca.data.enums import DataFeed
 
         last = self.latest_price(symbol)
         if last is None:
@@ -247,10 +248,22 @@ class AlpacaBroker:
         # covers weekends; +5 extra days covers typical holiday clusters.
         start = datetime.now(timezone.utc) - timedelta(days=int(limit * 1.6) + 5)
         try:
+            # feed=IEX pinned explicitly on BOTH this call and the snapshot
+            # call below. Without it, get_stock_bars silently returns
+            # full SIP-consolidated historical volume while the snapshot's
+            # real-time daily_bar is IEX-only (all this account is entitled
+            # to live) - an apples-to-oranges mismatch that showed up as
+            # today's volume ratio reading ~0.01-0.04x on every symbol, every
+            # cycle, all day (confirmed in production logs after the previous
+            # fix deployed) - i.e. still permanently fail-closed on
+            # min_volume_ratio, just via a different, more deceptive number
+            # instead of "unavailable". Pinning both to IEX keeps the
+            # comparison apples-to-apples on the feed this account actually
+            # has real-time access to.
             bars_resp = self._retry(
                 lambda: self._data.get_stock_bars(
                     StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day,
-                                      start=start, limit=limit)
+                                      start=start, limit=limit, feed=DataFeed.IEX)
                 ),
                 f"get_stock_bars({symbol})",
             )
@@ -292,7 +305,7 @@ class AlpacaBroker:
         try:
             snap_resp = self._retry(
                 lambda: self._data.get_stock_snapshot(
-                    StockSnapshotRequest(symbol_or_symbols=symbol)
+                    StockSnapshotRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
                 ),
                 f"get_stock_snapshot({symbol})",
             )
