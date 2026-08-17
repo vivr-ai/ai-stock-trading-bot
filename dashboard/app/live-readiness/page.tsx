@@ -17,6 +17,7 @@ type ChecklistItem = {
 type LiveReadinessResponse = {
   currentMode: string | null;
   allowSubmit: boolean;
+  liveRealMoneyActive: boolean;
   configReportedAt: string | null;
   deployment: { commitShort: string | null; environment: string | null };
   readyForLive: boolean;
@@ -74,12 +75,30 @@ export default function LiveReadinessPage() {
       {loading && <LoadingSkeleton rows={4} />}
       {!loading && error && <ErrorState message={error} />}
 
+      {!loading && !error && data && data.liveRealMoneyActive && (
+        <div className="mb-6 flex items-start gap-3 rounded-xl border border-loss bg-loss/10 p-4">
+          <AlertTriangle size={20} className="mt-0.5 shrink-0 text-loss" />
+          <div>
+            <div className="text-sm font-semibold text-loss">
+              LIVE — real money orders are being submitted right now
+            </div>
+            <div className="mt-1 text-xs text-loss/90">
+              TRADING_MODE=live and RISK_DRY_RUN=false are both set on this deployment. Every buy/sell
+              this bot decides on goes to your live Alpaca account, not paper. If that&apos;s not
+              intentional, set RISK_DRY_RUN=true or TRADING_MODE=paper in Railway and redeploy.
+            </div>
+          </div>
+        </div>
+      )}
+
       {!loading && !error && data && (
         <div className="space-y-6">
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
             <div className="rounded-xl border border-bg-border bg-bg-panel p-4">
               <div className="text-xs text-muted">Current operating mode</div>
-              <div className="mt-2 text-2xl font-semibold text-white">{modeLabel(data.currentMode)}</div>
+              <div className={`mt-2 text-2xl font-semibold ${data.currentMode === "live" ? "text-loss" : "text-white"}`}>
+                {modeLabel(data.currentMode)}
+              </div>
               <div className="mt-1 text-xs text-muted">
                 {data.deployment.commitShort
                   ? `commit ${data.deployment.commitShort}${data.deployment.environment ? ` · ${data.deployment.environment}` : ""}`
@@ -88,12 +107,22 @@ export default function LiveReadinessPage() {
             </div>
             <div className="rounded-xl border border-bg-border bg-bg-panel p-4">
               <div className="text-xs text-muted">Order submission</div>
-              <div className="mt-2 text-2xl font-semibold text-white">
+              <div
+                className={`mt-2 text-2xl font-semibold ${
+                  data.liveRealMoneyActive
+                    ? "text-loss"
+                    : data.allowSubmit
+                    ? "text-gain"
+                    : "text-white"
+                }`}
+              >
                 {data.allowSubmit ? "Enabled" : "Disabled"}
               </div>
               <div className="mt-1 text-xs text-muted">
-                {data.allowSubmit
-                  ? "This deployment CAN submit real orders."
+                {data.liveRealMoneyActive
+                  ? "Real orders against your LIVE account."
+                  : data.allowSubmit
+                  ? "This deployment CAN submit real orders (paper account - no real money)."
                   : "Orders are blocked at the broker layer in this deployment."}
               </div>
             </div>

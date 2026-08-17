@@ -120,16 +120,49 @@ export async function GET() {
         status: config.live_confirmed ? "pass" : "manual",
         automatic: true,
       });
-      checklist.push({
-        id: "risk_dry_run",
-        label: "RISK_DRY_RUN gate",
-        detail: config.risk_dry_run
-          ? "Currently true - even in TRADING_MODE=live this blocks real order submission until " +
-            "set to false."
-          : "Currently false - this gate will NOT block live orders. Confirm this is intentional.",
-        status: config.risk_dry_run ? "manual" : "warning",
-        automatic: true,
-      });
+      // This gate's meaning flips depending on TRADING_MODE, so the label,
+      // detail, and severity are computed per-mode rather than one generic
+      // message - a permanently-shown "warning" on a correctly-configured
+      // paper deployment trains you to ignore it, which is exactly wrong for
+      // the one time it matters (going live). See the Aug 2026 incident:
+      // RISK_DRY_RUN defaulted true and silently blocked every paper order
+      // for weeks with nothing on this page calling it out clearly.
+      if (config.trading_mode === "live") {
+        checklist.push({
+          id: "risk_dry_run",
+          label: "RISK_DRY_RUN gate (LIVE account)",
+          detail: config.risk_dry_run
+            ? "Currently true - real-money order submission is blocked. The bot is only simulating " +
+              "against your live account."
+            : "REAL MONEY ORDERS ARE LIVE. RISK_DRY_RUN=false with TRADING_MODE=live - every buy/sell " +
+              "decision submits a real order against your live Alpaca account right now.",
+          status: config.risk_dry_run ? "manual" : "warning",
+          automatic: true,
+        });
+      } else if (config.trading_mode === "dry_run") {
+        checklist.push({
+          id: "risk_dry_run",
+          label: "RISK_DRY_RUN gate",
+          detail: "TRADING_MODE=dry_run always blocks order submission regardless of this flag - " +
+            "that's the point of this mode, rehearsing against the live account risk-free.",
+          status: "pass",
+          automatic: true,
+        });
+      } else {
+        // paper
+        checklist.push({
+          id: "risk_dry_run",
+          label: "RISK_DRY_RUN gate (PAPER account)",
+          detail: config.risk_dry_run
+            ? "Currently true - this is blocking every paper-trade buy/sell from actually submitting, " +
+              "even candidates that clear every strategy gate. Set to false to let paper trading run " +
+              "for real (no real money is at risk in paper mode)."
+            : "Currently false - paper orders submit normally. This is the expected setting for active " +
+              "paper trading.",
+          status: config.risk_dry_run ? "warning" : "pass",
+          automatic: true,
+        });
+      }
       checklist.push({
         id: "telegram",
         label: "Telegram notifications configured",
@@ -233,6 +266,9 @@ export async function GET() {
     return NextResponse.json({
       currentMode: config?.trading_mode ?? null,
       allowSubmit: config?.allow_submit ?? false,
+      // Single unambiguous flag for the page to key its most prominent
+      // warning off of - true only when real money can move right now.
+      liveRealMoneyActive: config?.trading_mode === "live" && !!config?.allow_submit,
       configReportedAt: config?.ts ?? null,
       deployment: { commitShort: config?.commit_short ?? null, environment: config?.environment ?? null },
       readyForLive,
