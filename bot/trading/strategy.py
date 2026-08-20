@@ -498,11 +498,15 @@ class SentimentStrategy:
                 backfill_tp = take_profit_price if protected_now else 0.0
                 order_id_for_row = protect_order_id or (fill.order_id if fill else "")
                 status = "adopted" if protected_now else "adopted_unprotected"
-                self.trade_logger.log(
-                    "buy", symbol, qty, entry_price, notional, placeholder,
-                    backfill_stop, backfill_tp, reason, dry_run=False,
-                    order_id=order_id_for_row, status=status,
-                )
+                # Deliberately NOT logged to self.trade_logger (the local CSV):
+                # bot/reporting/performance.py's daily "Trades today" count
+                # (and the EOD Telegram summary) sums that CSV's action=='buy'
+                # rows for today's date - a backfill isn't a trading decision
+                # made today, just bookkeeping catching up on one made outside
+                # the bot, and counting it there would overstate the day's
+                # real buy activity. record_trade below (the Postgres `trades`
+                # table) still gets it, since that's what the Portfolio/Trade
+                # History pages and get_last_buy_trade() need.
                 self.recorder.record_trade(
                     action="buy", symbol=symbol, qty=qty, price=entry_price, notional=notional,
                     sentiment=placeholder, stop_price=backfill_stop, take_profit=backfill_tp,
@@ -953,6 +957,32 @@ class SentimentStrategy:
                     # _log_closed_trade_from_history - reconstruct from the
                     # trades table instead of dropping this exit.
                     self._log_closed_trade_from_history(symbol, exit_price, f"dry_run: {reason}")
+            return
+
+        # Guard against racing a working order for the same symbol - most
+        # commonly _adopt_legacy_positions placing a protective stop/take-
+        # profit in THIS SAME cycle (its qty check runs before this sentiment
+        # sell does, using a pending-orders snapshot taken before adoption
+        # ran, so it doesn't know a new order now holds the shares). Without
+        # this, close_position's own cancel-then-close attempts to flatten a
+        # position whose shares are already committed to that other order,
+        # fails with Alpaca's "insufficient qty available", and fires a
+        # scary but harmless "SELL failed" alert - the position is usually
+        # already being closed by the order that beat it here. Checking
+        # fresh (not the cycle-start `pending` set) since that's exactly
+        # what's stale in this scenario.
+        if symbol in self.broker.pending_order_symbols():
+            logger.info(
+                "SELL %s skipped: a working order already exists for this symbol (likely "
+                "today's protective stop/take-profit) - avoiding a duplicate close_position "
+                "call. If sentiment is still bearish next cycle and that order hasn't "
+                "resolved it yet, this will retry then.",
+                symbol, extra={"symbol": symbol, "decision": "sell_skipped", "reason": "already_closing"},
+            )
+            self.recorder.record_decision(
+                symbol=symbol, decision="sell_skipped", reason="already_closing",
+                sentiment_score=sentiment.score, sentiment_label=sentiment.label,
+            )
             return
 
         order = self.broker.close_position(symbol)
