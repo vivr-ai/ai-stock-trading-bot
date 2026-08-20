@@ -502,6 +502,66 @@ class AlpacaBroker:
             status=str(order.status),
         )
 
+    def get_protected_symbols(self) -> Set[str]:
+        """Symbols with a live BRACKET or OCO order working at the broker -
+        i.e. already have a stop-loss/take-profit protecting them. A normal
+        bot-initiated buy always shows up here (submit_bracket_buy always
+        attaches one) - this only matters for positions that exist at the
+        broker but weren't bought through this bot (manually opened, or
+        predate this codebase's trade tracking), which get no bracket by
+        default. Used by SentimentStrategy._adopt_legacy_positions to decide
+        whether such a position still needs a protective order placed."""
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus, OrderSide, OrderClass
+
+        try:
+            orders = self._retry(
+                lambda: self._trading.get_orders(
+                    GetOrdersRequest(status=QueryOrderStatus.OPEN, side=OrderSide.SELL)
+                ),
+                "get_orders(open, sell)",
+            )
+            return {
+                o.symbol for o in orders
+                if getattr(o, "order_class", None) in (OrderClass.OCO, OrderClass.BRACKET)
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not fetch protective-order status: %s", exc)
+            return set()
+
+    def submit_protective_exit(self, symbol: str, qty: float, stop_price: float,
+                               take_profit_price: float, client_order_id: str = None) -> PlacedOrder:
+        """Attach a stop-loss + take-profit OCO SELL to shares already held
+        that the bot did NOT buy itself (see SentimentStrategy.
+        _adopt_legacy_positions) - the same protection submit_bracket_buy
+        gives a bot-initiated entry, just issued against an existing
+        position instead of as part of the buy order. OCO here means two
+        linked SELL legs (a limit at take-profit, a stop at stop-loss);
+        whichever fills first cancels the other - functionally equivalent
+        to a BRACKET's exit legs without needing a new entry order."""
+        if not self.allow_submit:
+            raise RuntimeError(
+                f"submit_protective_exit({symbol}) blocked: order submission is disabled in "
+                f"mode={self.mode}. This should never be reached in normal operation - the "
+                "strategy layer checks this first; this is the second line of defense."
+            )
+        from alpaca.trading.requests import LimitOrderRequest, StopLossRequest, TakeProfitRequest
+        from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+
+        req = LimitOrderRequest(
+            symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC,
+            order_class=OrderClass.OCO, limit_price=round(take_profit_price, 2),
+            take_profit=TakeProfitRequest(limit_price=round(take_profit_price, 2)),
+            stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
+            client_order_id=client_order_id,
+        )
+        order = self._retry(lambda: self._trading.submit_order(req), f"submit_protective_exit({symbol})")
+        return PlacedOrder(
+            order_id=str(order.id), symbol=symbol, side="sell", qty=qty,
+            stop_price=round(stop_price, 2), take_profit_price=round(take_profit_price, 2),
+            status=str(order.status),
+        )
+
     def cancel_orders_for(self, symbol: str) -> None:
         """Cancel any live orders for a symbol (the leftover bracket legs)."""
         from alpaca.trading.requests import GetOrdersRequest

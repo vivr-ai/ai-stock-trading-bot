@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
+from ..sentiment.base import SentimentResult
 from ..universe.static_universe import sector_of
 
 logger = logging.getLogger(__name__)
@@ -155,6 +156,7 @@ class SentimentStrategy:
             unrealized_pl=None, open_positions=len(open_positions), exposure=exposure,
         )
         self._sync_open_positions_snapshot(acct.get("portfolio_value"))
+        self._adopt_legacy_positions()
 
         exited = self.state.detect_exits(list(open_positions.keys()))
         if exited:
@@ -398,6 +400,127 @@ class SentimentStrategy:
                 "entry_reason": lot.get("reason"), "entry_time": lot.get("entry_time"),
             })
         self.recorder.sync_open_positions(rows)
+
+    def _adopt_legacy_positions(self) -> None:
+        """Positions that exist at the broker but weren't bought through this
+        bot - manually opened, or predating this codebase's trade tracking
+        (the Aug 2026 NVDA/TSLA/AAPL incident: real positions sitting with no
+        stop-loss and no trades-table row, because submit_bracket_buy only
+        attaches a bracket at the moment THIS bot buys something) - get two
+        things backfilled here: a protective stop/take-profit order if one
+        isn't already live, and a 'buy' row in the trades table if one is
+        missing (needed for P/L reporting on exit - see
+        _log_closed_trade_from_history - and for the Portfolio page's Stop
+        Loss column, which reads the latest buy row's stop_price/take_profit).
+
+        Runs every cycle but is cheap and a no-op once both are in place for
+        every held symbol - not gated behind new_entries_allowed/pause since
+        this manages risk on EXISTING positions, not new entries (same
+        philosophy as the sentiment-driven sell path elsewhere in this file)."""
+        try:
+            detailed = self.broker.open_positions_detailed()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Legacy-position adoption: could not fetch open positions: %s", exc)
+            return
+        if not detailed:
+            return
+
+        protected = self.broker.get_protected_symbols()
+
+        for symbol, pos in detailed.items():
+            has_buy_row = self.recorder.get_last_buy_trade(symbol) is not None
+            needs_protection = symbol not in protected
+            if has_buy_row and not needs_protection:
+                continue  # fully tracked and protected already
+
+            entry_price = pos.avg_entry_price
+            qty = pos.qty
+            if not entry_price or entry_price <= 0 or not qty or qty <= 0:
+                continue
+            stop_price = round(entry_price * (1.0 - self.cfg.risk.stop_loss_pct / 100.0), 2)
+            take_profit_price = round(entry_price * (1.0 + self.cfg.risk.take_profit_pct / 100.0), 2)
+
+            protected_now = not needs_protection  # already had a bracket/OCO before this cycle
+            protect_order_id = ""
+            if needs_protection:
+                if self.cfg.risk.dry_run:
+                    logger.info(
+                        "[DRY RUN] would protect adopted position %s: %.4g shares @ %.2f "
+                        "(stop %.2f / tp %.2f)", symbol, qty, entry_price, stop_price, take_profit_price,
+                    )
+                else:
+                    try:
+                        order = self.broker.submit_protective_exit(
+                            symbol, qty, stop_price, take_profit_price,
+                            client_order_id=f"adopt-{symbol}-{int(time.time())}",
+                        )
+                        protected_now = True
+                        protect_order_id = order.order_id
+                        logger.info(
+                            "Adopted %s: submitted protective stop/take-profit order %s "
+                            "(stop %.2f / tp %.2f) for a position this bot didn't buy itself.",
+                            symbol, order.order_id, stop_price, take_profit_price,
+                            extra={"symbol": symbol, "decision": "adopt_protect",
+                                   "order_id": order.order_id, "stop_price": stop_price,
+                                   "take_profit_price": take_profit_price},
+                        )
+                        self.recorder.record_notification(
+                            type_="position_adopted", severity="info",
+                            title=f"Protected adopted position: {symbol}",
+                            message=(
+                                f"{symbol} was already held but had no stop-loss (bought outside "
+                                f"this bot, or predates its trade tracking). Submitted a protective "
+                                f"stop @ {stop_price:.2f} / take-profit @ {take_profit_price:.2f}, "
+                                f"based on its entry price of {entry_price:.2f}."
+                            ),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error("Legacy-position protection failed for %s: %s", symbol, exc)
+                        self.recorder.record_notification(
+                            type_="error", severity="warning",
+                            title=f"Could not protect adopted position: {symbol}",
+                            message=str(exc),
+                        )
+
+            if not has_buy_row:
+                fill = self.broker.last_fill(symbol, side="buy")
+                reason = "adopted_legacy_position"
+                rationale = (
+                    "Already held when this bot's trade tracking started (or bought outside "
+                    "the bot). Entry price is Alpaca's recorded average entry price for the "
+                    "position; backfilled automatically so P/L reporting works normally on exit."
+                )
+                placeholder = SentimentResult(
+                    symbol=symbol, score=0.0, label="unknown", rationale=rationale, article_count=0,
+                )
+                notional = entry_price * qty
+                backfill_stop = stop_price if protected_now else 0.0
+                backfill_tp = take_profit_price if protected_now else 0.0
+                order_id_for_row = protect_order_id or (fill.order_id if fill else "")
+                status = "adopted" if protected_now else "adopted_unprotected"
+                self.trade_logger.log(
+                    "buy", symbol, qty, entry_price, notional, placeholder,
+                    backfill_stop, backfill_tp, reason, dry_run=False,
+                    order_id=order_id_for_row, status=status,
+                )
+                self.recorder.record_trade(
+                    action="buy", symbol=symbol, qty=qty, price=entry_price, notional=notional,
+                    sentiment=placeholder, stop_price=backfill_stop, take_profit=backfill_tp,
+                    reason=reason, rationale=rationale, dry_run=False,
+                    order_id=order_id_for_row, status=status,
+                    sector=sector_of(symbol), market_regime=None,
+                )
+                self.state.record_open(
+                    symbol, entry_price, qty, reason=reason, sentiment_score=0.0,
+                    sentiment_label="unknown", rationale=rationale, sector=sector_of(symbol),
+                    market_regime=None, strategy_version=self.version_provider.current_version(),
+                )
+                logger.info(
+                    "Adopted %s: backfilled trades-table entry (%.4g shares @ %.2f) so P/L "
+                    "reporting and the dashboard work normally for this position going forward.",
+                    symbol, qty, entry_price,
+                    extra={"symbol": symbol, "decision": "adopt_backfill"},
+                )
 
     def _log_closed_trade_from_history(self, symbol: str, exit_price: Optional[float],
                                         exit_reason: str) -> None:
