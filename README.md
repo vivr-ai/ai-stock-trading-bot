@@ -180,7 +180,7 @@ pins 3.12 to sidestep this entirely.
 **Buy** requires ALL of:
 - sentiment score >= `STRATEGY_BUY_THRESHOLD` (+8) from >= `STRATEGY_MIN_HEADLINES` (5) headlines
 - price above its `STRATEGY_SMA_PERIOD`-day (20) SMA
-- today's volume >= `STRATEGY_MIN_VOLUME_RATIO` (1.5x) its `STRATEGY_VOLUME_LOOKBACK_DAYS`-day (20) average
+- today's volume-so-far >= `STRATEGY_MIN_VOLUME_RATIO` (1.5x) the volume normally expected by **this point in the trading session** — its `STRATEGY_VOLUME_LOOKBACK_DAYS`-day (20) average scaled down by the fraction of the 9:30am-4:00pm ET session elapsed, not the raw full-day average (a 10am check needs ~10% of a full day's average, not 100% of it)
 - not already up more than `STRATEGY_MAX_INTRADAY_RUNUP_PCT` (8%) since yesterday's close
 - SPY (or `STRATEGY_MARKET_FILTER_SYMBOL`) not down more than `STRATEGY_MARKET_FILTER_MAX_DROP_PCT` (2%) today
 - SPY above its own `STRATEGY_MARKET_REGIME_MA_PERIOD`-day (50) SMA (`STRATEGY_MARKET_REGIME_FILTER_ENABLED`)

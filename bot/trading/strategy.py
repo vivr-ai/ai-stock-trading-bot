@@ -17,7 +17,15 @@ Buy rule (ALL must hold):
   * not already held, no live order pending, not in re-entry cooldown
   * sentiment score >= buy_threshold (+8) with >= min_headlines (5) headlines
   * price above its sma_period-day SMA (require_price_above_sma)
-  * today's volume >= min_volume_ratio x its volume_lookback_days-day average
+  * today's volume-so-far >= min_volume_ratio x the volume normally expected
+    by THIS POINT in the trading session - its volume_lookback_days-day
+    average scaled down by the fraction of the session elapsed (a 10am
+    check is compared to ~10% of a full day's average, not the full
+    average - see AlpacaBroker.market_snapshot / _session_elapsed_fraction).
+    Comparing to the raw full-day average made this gate nearly impossible
+    to clear before mid-afternoon regardless of how strong a stock's volume
+    genuinely was; fixed August 2026 after multiple days of score 9-10
+    candidates (AMZN, MSFT) still under 0.6x with 30 minutes left to trade.
   * NOT already up more than max_intraday_runup_pct since yesterday's close
   * under the per-cycle new-position cap AND the per-sector cap
   * passes the risk manager (size, position count, exposure cap)
@@ -311,6 +319,7 @@ class SentimentStrategy:
                 self.cfg.strategy.market_filter_symbol,
                 sma_period=self.cfg.strategy.market_regime_ma_period,
                 volume_lookback_days=self.cfg.strategy.market_regime_ma_period,
+                session_tz=self.cfg.schedule.market_timezone,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not compute market regime: %s", exc)
@@ -747,6 +756,7 @@ class SentimentStrategy:
         snap = self.broker.market_snapshot(
             symbol, sma_period=self.cfg.strategy.sma_period,
             volume_lookback_days=self.cfg.strategy.volume_lookback_days,
+            session_tz=self.cfg.schedule.market_timezone,
         )
         if snap is None:
             return exposure
@@ -784,7 +794,9 @@ class SentimentStrategy:
                                               price=snap.last, sma=snap.sma)
                 return exposure
 
-        # --- Confirmation filter: today's volume >= min_volume_ratio x avg ---
+        # --- Confirmation filter: today's volume >= min_volume_ratio x the
+        # volume normally expected by THIS POINT in the trading session (NOT
+        # the raw full-day average - see AlpacaBroker.market_snapshot) ---
         if self.cfg.strategy.min_volume_ratio > 0:
             if snap.volume_ratio is None:
                 logger.info("BUY %s skipped: today's volume not yet confirmable "
@@ -797,8 +809,11 @@ class SentimentStrategy:
                                               sentiment_label=sentiment.label)
                 return exposure
             if snap.volume_ratio < self.cfg.strategy.min_volume_ratio:
-                logger.info("BUY %s skipped: volume ratio %.2fx < required %.2fx",
+                logger.info("BUY %s skipped: volume ratio %.2fx < required %.2fx "
+                            "(today %.0f vs %.0f expected by now, %d-day full-day avg %.0f)",
                             symbol, snap.volume_ratio, self.cfg.strategy.min_volume_ratio,
+                            snap.today_volume, snap.expected_volume_so_far,
+                            self.cfg.strategy.volume_lookback_days, snap.avg_volume,
                             extra={"symbol": symbol, "decision": "buy_skipped",
                                    "reason": "low_volume", "volume_ratio": snap.volume_ratio})
                 self.recorder.record_decision(symbol=symbol, decision="buy_skipped", reason="low_volume",

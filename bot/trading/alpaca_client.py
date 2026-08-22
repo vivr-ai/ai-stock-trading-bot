@@ -21,6 +21,52 @@ from ..utils.retry import call_with_retry
 
 logger = logging.getLogger(__name__)
 
+# Standard NYSE/Nasdaq regular-session hours. Deliberately not calendar-aware
+# (early closes - e.g. the day after Thanksgiving - aren't accounted for);
+# on those rare days this over-estimates remaining session time, which makes
+# _session_elapsed_fraction UNDER-estimate how much of the day has elapsed,
+# which makes the volume gate MORE conservative than it needs to be that one
+# day - consistent with this bot's fail-closed philosophy elsewhere, and far
+# simpler than a calendar lookup for a handful of days a year.
+_SESSION_OPEN_HOUR, _SESSION_OPEN_MINUTE = 9, 30
+_SESSION_CLOSE_HOUR, _SESSION_CLOSE_MINUTE = 16, 0
+# Floor on the elapsed fraction: without one, the first minute or two after
+# the open would divide by a near-zero expected volume and produce a
+# meaningless, huge volume_ratio. 5% of the session (~20 min) is a
+# deliberately conservative floor - early trades are volatile and thin
+# enough that "confirmed" shouldn't be easy to claim in the first few
+# minutes anyway.
+_MIN_SESSION_FRACTION = 0.05
+
+
+def _session_elapsed_fraction(tz_name: str) -> float:
+    """Fraction (0..1) of today's regular trading session elapsed right now.
+
+    Used to scale a full trading day's historical average volume down to
+    what's normally expected BY THIS POINT in the day, so today's
+    volume-so-far is compared against a fair same-time-of-day baseline
+    instead of a full day's total. Comparing partial-day volume to a full
+    day's average made the volume-confirmation gate nearly impossible to
+    clear before mid-afternoon, regardless of how genuinely elevated a
+    stock's volume was - see market_snapshot's docstring.
+
+    Clamped to [_MIN_SESSION_FRACTION, 1.0]: the floor avoids a near-zero
+    denominator right after the open; the ceiling means a run well after the
+    close (e.g. `main.py --force` outside market hours) just compares
+    against the full day's average, same as before this change.
+    """
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(tz_name))
+    session_open = now.replace(hour=_SESSION_OPEN_HOUR, minute=_SESSION_OPEN_MINUTE,
+                               second=0, microsecond=0)
+    session_close = now.replace(hour=_SESSION_CLOSE_HOUR, minute=_SESSION_CLOSE_MINUTE,
+                                second=0, microsecond=0)
+    session_len = (session_close - session_open).total_seconds()
+    elapsed = (now - session_open).total_seconds()
+    fraction = elapsed / session_len if session_len > 0 else 1.0
+    return max(_MIN_SESSION_FRACTION, min(1.0, fraction))
+
 
 @dataclass
 class PlacedOrder:
@@ -52,9 +98,17 @@ class MarketSnapshot:
     prev_close: Optional[float]
     change_pct: Optional[float]
     sma: Optional[float]
-    avg_volume: Optional[float]
+    avg_volume: Optional[float]  # full trading day's N-day average - unchanged meaning
     today_volume: Optional[float]
-    volume_ratio: Optional[float]  # today_volume / avg_volume
+    # today_volume / expected_volume_so_far, NOT today_volume / avg_volume - see
+    # _session_elapsed_fraction and market_snapshot's docstring for why.
+    volume_ratio: Optional[float]
+    # avg_volume scaled down to what's normally expected by THIS POINT in the
+    # trading session - the actual denominator behind volume_ratio. Exposed
+    # separately (rather than folded silently into volume_ratio) so logs and
+    # the dashboard can show both the raw historical average and the
+    # time-of-day-adjusted baseline it was compared against.
+    expected_volume_so_far: Optional[float] = None
 
 
 @dataclass
@@ -210,7 +264,8 @@ class AlpacaBroker:
             return None
 
     def market_snapshot(self, symbol: str, sma_period: int = 20,
-                        volume_lookback_days: int = 20) -> Optional[MarketSnapshot]:
+                        volume_lookback_days: int = 20,
+                        session_tz: str = "America/New_York") -> Optional[MarketSnapshot]:
         """One data pull -> last price, prior-close-based change_pct, N-day
         SMA of close, N-day average volume, and today's volume-so-far.
 
@@ -222,6 +277,19 @@ class AlpacaBroker:
         today's volume-so-far comes from a separate Snapshot call, so we're
         comparing it against a clean historical baseline instead of leaking
         a same-day bar into its own average.
+
+        volume_ratio is time-of-day adjusted: today_volume is compared
+        against avg_volume scaled down by how much of the trading session
+        has elapsed (see _session_elapsed_fraction), NOT against the raw
+        full-day average. Comparing a partial day directly to a full day's
+        average made the gate nearly impossible to clear before mid-
+        afternoon regardless of how genuinely elevated a stock's volume was
+        - confirmed in production logs across multiple days where stocks
+        with strong, sustained bullish coverage all day (e.g. sentiment
+        score 9-10) still couldn't clear 0.6x by 30 minutes before the
+        close. Comparing to the expected volume for THIS point in the day
+        instead makes the STRATEGY_MIN_VOLUME_RATIO threshold meaningful at
+        any hour, not just near the close.
 
         Note: on Alpaca's free IEX feed, bars reflect IEX-only trades, not
         the full consolidated tape — a reasonable proxy for relative volume,
@@ -332,13 +400,18 @@ class AlpacaBroker:
             window = history[-volume_lookback_days:]
             avg_volume = sum(float(b.volume) for b in window) / len(window)
 
+        expected_volume_so_far = (
+            avg_volume * _session_elapsed_fraction(session_tz) if avg_volume is not None else None
+        )
         volume_ratio = (
-            today_volume / avg_volume if today_volume is not None and avg_volume else None
+            today_volume / expected_volume_so_far
+            if today_volume is not None and expected_volume_so_far else None
         )
 
         return MarketSnapshot(
             symbol=symbol, last=last, prev_close=prev_close, change_pct=change_pct,
             sma=sma, avg_volume=avg_volume, today_volume=today_volume, volume_ratio=volume_ratio,
+            expected_volume_so_far=expected_volume_so_far,
         )
 
     def quote(self, symbol: str):
