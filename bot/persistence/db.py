@@ -271,6 +271,106 @@ class Recorder:
                  market_regime=market_regime, strategy_version=strategy_version),
         )
 
+    # ---- reads (for the bot's OWN daily/weekly performance report) ----
+    # Everything above this point is write-only, by design (see module
+    # docstring: this class exists to feed the dashboard, not to be read
+    # back by the bot). These two methods are the one deliberate exception:
+    # bot/reporting/performance.py needs *some* durable source for realized
+    # P/L and trade counts, and the local CSVs it used to read
+    # (logs/trades.csv, logs/closed_trades.csv) live on Railway's ephemeral
+    # disk - wiped on every redeploy unless a Volume is attached. Postgres
+    # survives redeploys and is the same data the dashboard already shows,
+    # so reading it back here keeps the bot's own Telegram/log report
+    # consistent with the dashboard instead of silently resetting to zero
+    # every time we ship a fix.
+    #
+    # Both return None (not an empty list) on any failure - disabled
+    # recorder, connect error, query error - so callers can tell "genuinely
+    # no rows" apart from "couldn't read the table" and fall back to CSV
+    # instead of reporting a false zero.
+    def fetch_closed_trades(self, since: Optional[datetime] = None) -> Optional[list]:
+        """Rows from closed_trades, newest first. Each row is a dict with at
+        least 'ts' (exit time, UTC) and 'pnl'."""
+        if not self.enabled:
+            return None
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB connect failed (closed_trades read): %s", exc)
+            self.healthy = False
+            self.last_error = str(exc)
+            return None
+        try:
+            from psycopg2.extras import RealDictCursor
+
+            with conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    if since is not None:
+                        cur.execute(
+                            "SELECT ts, symbol, pnl, pnl_pct, exit_reason FROM closed_trades "
+                            "WHERE ts >= %(since)s ORDER BY ts DESC",
+                            {"since": since},
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT ts, symbol, pnl, pnl_pct, exit_reason FROM closed_trades "
+                            "ORDER BY ts DESC"
+                        )
+                    rows = cur.fetchall()
+            self.healthy = True
+            self.last_error = None
+            return list(rows)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB read failed (closed_trades): %s", exc)
+            self.healthy = False
+            self.last_error = str(exc)
+            return None
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def fetch_trades(self, since: Optional[datetime] = None) -> Optional[list]:
+        """Rows from trades, newest first. Each row is a dict with at least
+        'ts' and 'action' ('buy' | 'sell')."""
+        if not self.enabled:
+            return None
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB connect failed (trades read): %s", exc)
+            self.healthy = False
+            self.last_error = str(exc)
+            return None
+        try:
+            from psycopg2.extras import RealDictCursor
+
+            with conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    if since is not None:
+                        cur.execute(
+                            "SELECT ts, symbol, action FROM trades "
+                            "WHERE ts >= %(since)s ORDER BY ts DESC",
+                            {"since": since},
+                        )
+                    else:
+                        cur.execute("SELECT ts, symbol, action FROM trades ORDER BY ts DESC")
+                    rows = cur.fetchall()
+            self.healthy = True
+            self.last_error = None
+            return list(rows)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB read failed (trades): %s", exc)
+            self.healthy = False
+            self.last_error = str(exc)
+            return None
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
     def record_portfolio_snapshot(self, *, portfolio_value: Optional[float], cash: Optional[float],
                                    equity: Optional[float], buying_power: Optional[float],
                                    unrealized_pl: Optional[float], open_positions: Optional[int],

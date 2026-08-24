@@ -111,13 +111,14 @@ def build(cfg):
         cfg.logging.daily_summary_path, cfg.logging.trade_log_path
     )
     state = BotState(cfg.logging.state_path)
-    reporter = PerformanceReporter(
-        broker, cfg.logging.trade_log_path, cfg.logging.closed_trades_path, cfg.logging.report_dir
-    )
     # Dashboard persistence: purely additive observability, no bearing on
     # trading decisions. No-ops automatically if DATABASE_URL isn't set.
     telegram = TelegramNotifier(cfg.telegram.bot_token, cfg.telegram.chat_id) if cfg.telegram.enabled else TelegramNotifier("", "")
     recorder = NotificationService(Recorder(), telegram=telegram)
+    reporter = PerformanceReporter(
+        broker, cfg.logging.trade_log_path, cfg.logging.closed_trades_path, cfg.logging.report_dir,
+        recorder=recorder,
+    )
     strategy = SentimentStrategy(
         cfg, broker, universe, news, analyzer, risk, trade_logger, summary_logger, state,
         closed_trade_logger=closed_trade_logger, recorder=recorder,
