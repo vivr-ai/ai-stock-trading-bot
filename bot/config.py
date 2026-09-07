@@ -92,6 +92,29 @@ class StrategyConfig:
     volume_lookback_days: int
     market_regime_filter_enabled: bool
     market_regime_ma_period: int
+    # --- Strategy v2, Path A: sentiment-momentum as a weighted composite
+    # score instead of a hard sentiment>=buy_threshold AND-gate. See
+    # SentimentStrategy._evaluate_momentum_path. Weights must sum to 1.0. ---
+    sentiment_weight: float
+    headline_weight: float
+    volume_weight: float
+    momentum_buy_score: float
+    # --- Strategy v2, Path B: short-term mean-reversion (Larry Connors
+    # RSI-2 style) - buys an oversold dip within an established long-term
+    # uptrend, volume-confirmed, vetoed if sentiment is actively bearish. See
+    # SentimentStrategy._evaluate_reversion_path. reversion_live defaults to
+    # False (shadow/decision-only mode): the bot logs what it WOULD have
+    # bought but places no order, until you flip it on after reviewing a few
+    # days of shadow decisions. ---
+    reversion_enabled: bool
+    reversion_live: bool
+    rsi_period: int
+    rsi_oversold: float
+    rsi_exit: float
+    reversion_trend_sma_period: int
+    reversion_min_volume_ratio: float
+    reversion_sentiment_veto: float
+    reversion_max_hold_days: int
 
 
 @dataclass
@@ -288,6 +311,45 @@ def load_config(path: str = "config.ini") -> Config:
             market_regime_ma_period=_get(
                 parser, "strategy", "market_regime_ma_period", "STRATEGY_MARKET_REGIME_MA_PERIOD", 50, int
             ),
+            sentiment_weight=_get(
+                parser, "strategy", "sentiment_weight", "STRATEGY_SENTIMENT_WEIGHT", 0.5, float
+            ),
+            headline_weight=_get(
+                parser, "strategy", "headline_weight", "STRATEGY_HEADLINE_WEIGHT", 0.2, float
+            ),
+            volume_weight=_get(
+                parser, "strategy", "volume_weight", "STRATEGY_VOLUME_WEIGHT", 0.3, float
+            ),
+            momentum_buy_score=_get(
+                parser, "strategy", "momentum_buy_score", "STRATEGY_MOMENTUM_BUY_SCORE", 0.6, float
+            ),
+            reversion_enabled=_get(
+                parser, "strategy", "reversion_enabled", "STRATEGY_REVERSION_ENABLED", True, bool
+            ),
+            reversion_live=_get(
+                parser, "strategy", "reversion_live", "STRATEGY_REVERSION_LIVE", False, bool
+            ),
+            rsi_period=_get(parser, "strategy", "rsi_period", "STRATEGY_RSI_PERIOD", 2, int),
+            rsi_oversold=_get(
+                parser, "strategy", "rsi_oversold", "STRATEGY_RSI_OVERSOLD", 10.0, float
+            ),
+            rsi_exit=_get(parser, "strategy", "rsi_exit", "STRATEGY_RSI_EXIT", 65.0, float),
+            reversion_trend_sma_period=_get(
+                parser, "strategy", "reversion_trend_sma_period",
+                "STRATEGY_REVERSION_TREND_SMA_PERIOD", 200, int
+            ),
+            reversion_min_volume_ratio=_get(
+                parser, "strategy", "reversion_min_volume_ratio",
+                "STRATEGY_REVERSION_MIN_VOLUME_RATIO", 1.3, float
+            ),
+            reversion_sentiment_veto=_get(
+                parser, "strategy", "reversion_sentiment_veto",
+                "STRATEGY_REVERSION_SENTIMENT_VETO", -5.0, float
+            ),
+            reversion_max_hold_days=_get(
+                parser, "strategy", "reversion_max_hold_days",
+                "STRATEGY_REVERSION_MAX_HOLD_DAYS", 5, int
+            ),
         ),
         risk=RiskConfig(
             dry_run=_get(parser, "risk", "dry_run", "RISK_DRY_RUN", True, bool),
@@ -433,3 +495,41 @@ def _validate(cfg: Config) -> None:
         raise ValueError("thresholds must satisfy -10 <= sell < buy <= 10")
     if cfg.logging.log_format not in ("text", "json"):
         raise ValueError("logging.log_format / LOG_FORMAT must be 'text' or 'json'")
+
+    # ---- Strategy v2: Path A weighted composite -------------------------
+    weight_sum = (cfg.strategy.sentiment_weight + cfg.strategy.headline_weight
+                  + cfg.strategy.volume_weight)
+    if abs(weight_sum - 1.0) > 0.01:
+        raise ValueError(
+            "strategy sentiment/headline/volume weights must sum to 1.0 (got "
+            f"{weight_sum:.3f}). Adjust STRATEGY_SENTIMENT_WEIGHT / "
+            "STRATEGY_HEADLINE_WEIGHT / STRATEGY_VOLUME_WEIGHT."
+        )
+    if not (0.0 < cfg.strategy.momentum_buy_score <= 1.5):
+        raise ValueError(
+            "strategy.momentum_buy_score / STRATEGY_MOMENTUM_BUY_SCORE must be in (0, 1.5]"
+        )
+
+    # ---- Strategy v2: Path B mean-reversion ------------------------------
+    if cfg.strategy.reversion_enabled:
+        if cfg.strategy.rsi_period < 2:
+            raise ValueError("strategy.rsi_period / STRATEGY_RSI_PERIOD must be >= 2")
+        if not (0 < cfg.strategy.rsi_oversold < cfg.strategy.rsi_exit < 100):
+            raise ValueError(
+                "strategy RSI thresholds must satisfy "
+                "0 < STRATEGY_RSI_OVERSOLD < STRATEGY_RSI_EXIT < 100"
+            )
+        if cfg.strategy.reversion_trend_sma_period < 2:
+            raise ValueError(
+                "strategy.reversion_trend_sma_period / STRATEGY_REVERSION_TREND_SMA_PERIOD "
+                "must be >= 2"
+            )
+        if cfg.strategy.reversion_min_volume_ratio < 0:
+            raise ValueError(
+                "strategy.reversion_min_volume_ratio / STRATEGY_REVERSION_MIN_VOLUME_RATIO "
+                "must be >= 0"
+            )
+        if cfg.strategy.reversion_max_hold_days < 1:
+            raise ValueError(
+                "strategy.reversion_max_hold_days / STRATEGY_REVERSION_MAX_HOLD_DAYS must be >= 1"
+            )

@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     id                  BIGSERIAL PRIMARY KEY,
     ts                  TIMESTAMPTZ NOT NULL DEFAULT now(),
     symbol              TEXT NOT NULL,
-    decision            TEXT NOT NULL,           -- 'buy' | 'sell' | 'hold' | 'buy_skipped' | 'buy_blocked' | 'sell_skipped' | 'scan' | 'block_new_entries' | 'error'
+    decision            TEXT NOT NULL,           -- 'buy' | 'sell' | 'hold' | 'buy_skipped' | 'buy_blocked' | 'sell_skipped' | 'scan' | 'block_new_entries' | 'error' | 'reversion_skipped' | 'reversion_shadow_buy'
     reason              TEXT,                    -- machine reason code, e.g. 'below_sma', 'cooldown'
     sentiment_score     NUMERIC,
     sentiment_label     TEXT,
@@ -72,11 +72,16 @@ CREATE TABLE IF NOT EXISTS decisions (
     sma                 NUMERIC,
     change_pct          NUMERIC,
     volume_ratio        NUMERIC,
-    extra               JSONB                     -- anything else (sector, dry_run, etc.)
+    extra               JSONB,                    -- anything else (sector, dry_run, etc.)
+    entry_path          TEXT                      -- 'sentiment_momentum' | 'mean_reversion' (Strategy v2), null for non-buy/sell decisions
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions (ts DESC);
 CREATE INDEX IF NOT EXISTS idx_decisions_symbol ON decisions (symbol);
 CREATE INDEX IF NOT EXISTS idx_decisions_decision ON decisions (decision);
+
+-- Added by the Strategy v2 (weighted composite + mean-reversion leg) phase;
+-- ALTER-for-existing-DBs, same reasoning as api_latency_ms above.
+ALTER TABLE decisions ADD COLUMN IF NOT EXISTS entry_path TEXT;
 
 -- ---------------------------------------------------------------------
 -- trades: one row per order the bot actually placed (mirrors trades.csv),
@@ -103,7 +108,8 @@ CREATE TABLE IF NOT EXISTS trades (
     order_id            TEXT,
     status              TEXT,
     sector              TEXT,        -- from bot/universe/static_universe.sector_of(), for Strategy Intelligence breakdowns
-    market_regime       TEXT         -- 'bull' | 'bear' | 'sideways' | 'high_volatility' | 'low_volatility', see strategy.py
+    market_regime       TEXT,        -- 'bull' | 'bear' | 'sideways' | 'high_volatility' | 'low_volatility', see strategy.py
+    entry_path          TEXT         -- 'sentiment_momentum' | 'mean_reversion' (Strategy v2) - which leg generated this trade
 );
 CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades (ts DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades (symbol);
@@ -112,6 +118,9 @@ CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades (symbol);
 -- reasoning as api_latency_ms above.
 ALTER TABLE trades ADD COLUMN IF NOT EXISTS sector TEXT;
 ALTER TABLE trades ADD COLUMN IF NOT EXISTS market_regime TEXT;
+
+-- Added by the Strategy v2 (weighted composite + mean-reversion leg) phase.
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry_path TEXT;
 
 -- ---------------------------------------------------------------------
 -- closed_trades: one row per completed round-trip (mirrors closed_trades.csv)

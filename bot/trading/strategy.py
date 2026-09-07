@@ -683,31 +683,56 @@ class SentimentStrategy:
 
         holding = symbol in open_positions and open_positions[symbol] != 0
 
-        # ---- SELL (sentiment leg) ----
-        if holding and sentiment.score < self.cfg.strategy.sell_threshold:
-            if sentiment.article_count < self.cfg.strategy.sell_min_headlines:
-                logger.info("SELL %s skipped: only %d headlines (< %d); leaving price "
-                            "bracket to manage it", symbol, sentiment.article_count,
-                            self.cfg.strategy.sell_min_headlines,
-                            extra={"symbol": symbol, "decision": "sell_skipped",
-                                   "reason": "too_few_headlines"})
-                self.recorder.record_decision(
-                    symbol=symbol, decision="sell_skipped", reason="too_few_headlines",
-                    sentiment_score=sentiment.score, sentiment_label=sentiment.label,
-                    headline_count=sentiment.article_count,
+        # ---- SELL / holding management ----
+        # Strategy v2: a position's exit rule depends on which leg opened it
+        # (see bot/state.py's record_open). Mean-reversion entries exit on
+        # their own RSI/max-hold rule, not the sentiment-sell rule below -
+        # they were never entered on sentiment in the first place. Missing
+        # open-lot data (state file lost, or a position predating v2) falls
+        # back to 'sentiment_momentum', i.e. today's existing behavior.
+        if holding:
+            lot = self.state.peek_open(symbol)
+            entry_path = (lot or {}).get("entry_path") or "sentiment_momentum"
+
+            if entry_path == "mean_reversion":
+                snap = self.broker.market_snapshot(
+                    symbol, sma_period=self.cfg.strategy.sma_period,
+                    volume_lookback_days=self.cfg.strategy.volume_lookback_days,
+                    session_tz=self.cfg.schedule.market_timezone,
+                    rsi_period=self.cfg.strategy.rsi_period,
                 )
+                exit_reason = self._reversion_exit_reason(snap, lot)
+                if exit_reason:
+                    self._do_sell(symbol, sentiment, reason=exit_reason, entry_path="mean_reversion")
+                    self.state.mark_exit(symbol)
+                    sector_counts[sector_of(symbol)] -= 1
+                    stats.sells += 1
                 return exposure
-            self._do_sell(symbol, sentiment,
-                          reason=f"sentiment {sentiment.score:.1f} < {self.cfg.strategy.sell_threshold}")
-            self.state.mark_exit(symbol)
-            sector_counts[sector_of(symbol)] -= 1
-            stats.sells += 1
+
+            # ---- SELL (sentiment leg) - sentiment-momentum positions ----
+            if sentiment.score < self.cfg.strategy.sell_threshold:
+                if sentiment.article_count < self.cfg.strategy.sell_min_headlines:
+                    logger.info("SELL %s skipped: only %d headlines (< %d); leaving price "
+                                "bracket to manage it", symbol, sentiment.article_count,
+                                self.cfg.strategy.sell_min_headlines,
+                                extra={"symbol": symbol, "decision": "sell_skipped",
+                                       "reason": "too_few_headlines"})
+                    self.recorder.record_decision(
+                        symbol=symbol, decision="sell_skipped", reason="too_few_headlines",
+                        sentiment_score=sentiment.score, sentiment_label=sentiment.label,
+                        headline_count=sentiment.article_count,
+                    )
+                    return exposure
+                self._do_sell(symbol, sentiment,
+                              reason=f"sentiment {sentiment.score:.1f} < {self.cfg.strategy.sell_threshold}",
+                              entry_path="sentiment_momentum")
+                self.state.mark_exit(symbol)
+                sector_counts[sector_of(symbol)] -= 1
+                stats.sells += 1
             return exposure
 
-        # ---- BUY gates (cheap checks first, API calls last) ----
-        if holding or not new_entries_allowed:
-            return exposure
-        if sentiment.score < self.cfg.strategy.buy_threshold:
+        # ---- BUY gates (cheap checks first, API calls last) - shared by both paths ----
+        if not new_entries_allowed:
             return exposure
         if symbol in pending:
             logger.info("BUY %s skipped: an order is already pending", symbol,
@@ -720,16 +745,6 @@ class SentimentStrategy:
                        extra={"symbol": symbol, "decision": "buy_skipped", "reason": "cooldown"})
             self.recorder.record_decision(symbol=symbol, decision="buy_skipped", reason="cooldown",
                                           sentiment_score=sentiment.score, sentiment_label=sentiment.label)
-            return exposure
-        if sentiment.article_count < self.cfg.strategy.min_headlines:
-            logger.info("BUY %s skipped: only %d headlines (< %d)",
-                        symbol, sentiment.article_count, self.cfg.strategy.min_headlines,
-                        extra={"symbol": symbol, "decision": "buy_skipped",
-                               "reason": "too_few_headlines"})
-            self.recorder.record_decision(symbol=symbol, decision="buy_skipped",
-                                          reason="too_few_headlines", sentiment_score=sentiment.score,
-                                          sentiment_label=sentiment.label,
-                                          headline_count=sentiment.article_count)
             return exposure
         if stats.buys >= self.cfg.risk.max_new_positions_per_cycle:
             logger.info("BUY %s skipped: per-cycle new-position cap reached (%d)",
@@ -752,80 +767,230 @@ class SentimentStrategy:
                                           extra={"sector": sector})
             return exposure
 
-        # One data call gives price, gap-aware run-up, SMA, and volume ratio.
+        # One data call gives price, gap-aware run-up, SMA, volume ratio, and
+        # (when the reversion leg is enabled) the long-horizon trend SMA and RSI.
         snap = self.broker.market_snapshot(
             symbol, sma_period=self.cfg.strategy.sma_period,
             volume_lookback_days=self.cfg.strategy.volume_lookback_days,
             session_tz=self.cfg.schedule.market_timezone,
+            trend_sma_period=(self.cfg.strategy.reversion_trend_sma_period
+                               if self.cfg.strategy.reversion_enabled else None),
+            rsi_period=self.cfg.strategy.rsi_period if self.cfg.strategy.reversion_enabled else None,
         )
         if snap is None:
             return exposure
 
+        # ---- Path A: sentiment-momentum, weighted composite score ----
+        momentum_reason = self._evaluate_momentum_path(symbol, sentiment, snap)
+        if momentum_reason is not None:
+            return self._do_buy(symbol, sentiment, snap.last, acct, exposure, open_positions,
+                                sector_counts, stats, market_regime,
+                                entry_path="sentiment_momentum", reason=momentum_reason)
+
+        # ---- Path B: technical mean-reversion (RSI-2 style), volume-confirmed ----
+        if self.cfg.strategy.reversion_enabled:
+            reversion_reason = self._evaluate_reversion_path(symbol, sentiment, snap)
+            if reversion_reason is not None:
+                if self.cfg.strategy.reversion_live:
+                    return self._do_buy(symbol, sentiment, snap.last, acct, exposure, open_positions,
+                                        sector_counts, stats, market_regime,
+                                        entry_path="mean_reversion", reason=reversion_reason)
+                # Shadow mode (default): log what Path B WOULD have bought,
+                # place no order. See StrategyConfig.reversion_live.
+                logger.info(
+                    "[SHADOW] BUY %s (reversion) would fire: %s - reversion_live=False, "
+                    "no order placed", symbol, reversion_reason,
+                    extra={"symbol": symbol, "decision": "reversion_shadow_buy",
+                           "reason": reversion_reason},
+                )
+                self.recorder.record_decision(
+                    symbol=symbol, decision="reversion_shadow_buy", reason=reversion_reason,
+                    sentiment_score=sentiment.score, sentiment_label=sentiment.label,
+                    headline_count=sentiment.article_count, price=snap.last,
+                    entry_path="mean_reversion",
+                )
+
+        return exposure
+
+    def _evaluate_momentum_path(self, symbol, sentiment, snap) -> Optional[str]:
+        """Strategy v2, Path A: sentiment-momentum as a weighted composite
+        score instead of the old all-or-nothing chain (sentiment>=8 AND
+        >=5 headlines AND price>SMA AND volume>=1.5x). A strong signal on
+        two legs can now compensate a merely-adequate third leg, instead of
+        one weak leg silently killing an otherwise good setup.
+
+        Runup and the short-term SMA trend check stay hard gates - those are
+        genuine risk conditions ("already priced in" / "not even in a
+        short-term uptrend"), not degrees of quality that should earn
+        partial credit.
+
+        Returns a human-readable reason if the composite score clears
+        STRATEGY_MOMENTUM_BUY_SCORE, else None."""
+        cfg = self.cfg.strategy
+
         runup = snap.change_pct
-        if runup is not None and runup > self.cfg.strategy.max_intraday_runup_pct:
-            logger.info("BUY %s skipped: already up %.1f%% since prev close (> %.1f%%); "
-                        "news likely priced in", symbol, runup,
-                        self.cfg.strategy.max_intraday_runup_pct,
+        if runup is not None and runup > cfg.max_intraday_runup_pct:
+            logger.info("BUY %s (momentum) skipped: already up %.1f%% since prev close (> %.1f%%); "
+                        "news likely priced in", symbol, runup, cfg.max_intraday_runup_pct,
                         extra={"symbol": symbol, "decision": "buy_skipped",
                                "reason": "runup", "change_pct": runup})
             self.recorder.record_decision(symbol=symbol, decision="buy_skipped", reason="runup",
                                           sentiment_score=sentiment.score, sentiment_label=sentiment.label,
-                                          change_pct=runup)
-            return exposure
+                                          change_pct=runup, entry_path="sentiment_momentum")
+            return None
 
-        # --- Confirmation filter: price above its N-day SMA ---
-        if self.cfg.strategy.require_price_above_sma:
+        if cfg.require_price_above_sma:
             if snap.sma is None:
-                logger.info("BUY %s skipped: %d-day SMA unavailable (fail-closed)",
-                            symbol, self.cfg.strategy.sma_period,
+                logger.info("BUY %s (momentum) skipped: %d-day SMA unavailable (fail-closed)",
+                            symbol, cfg.sma_period,
                             extra={"symbol": symbol, "decision": "buy_skipped",
                                    "reason": "sma_unavailable"})
                 self.recorder.record_decision(symbol=symbol, decision="buy_skipped",
                                               reason="sma_unavailable", sentiment_score=sentiment.score,
-                                              sentiment_label=sentiment.label)
-                return exposure
+                                              sentiment_label=sentiment.label,
+                                              entry_path="sentiment_momentum")
+                return None
             if snap.last <= snap.sma:
-                logger.info("BUY %s skipped: price %.2f not above %d-day SMA %.2f",
-                            symbol, snap.last, self.cfg.strategy.sma_period, snap.sma,
+                logger.info("BUY %s (momentum) skipped: price %.2f not above %d-day SMA %.2f",
+                            symbol, snap.last, cfg.sma_period, snap.sma,
                             extra={"symbol": symbol, "decision": "buy_skipped",
                                    "reason": "below_sma", "price": snap.last, "sma": snap.sma})
                 self.recorder.record_decision(symbol=symbol, decision="buy_skipped", reason="below_sma",
                                               sentiment_score=sentiment.score, sentiment_label=sentiment.label,
-                                              price=snap.last, sma=snap.sma)
-                return exposure
+                                              price=snap.last, sma=snap.sma,
+                                              entry_path="sentiment_momentum")
+                return None
 
-        # --- Confirmation filter: today's volume >= min_volume_ratio x the
-        # volume normally expected by THIS POINT in the trading session (NOT
-        # the raw full-day average - see AlpacaBroker.market_snapshot) ---
-        if self.cfg.strategy.min_volume_ratio > 0:
-            if snap.volume_ratio is None:
-                logger.info("BUY %s skipped: today's volume not yet confirmable "
-                           "vs %d-day average (fail-closed)",
-                            symbol, self.cfg.strategy.volume_lookback_days,
-                            extra={"symbol": symbol, "decision": "buy_skipped",
-                                   "reason": "volume_unavailable"})
-                self.recorder.record_decision(symbol=symbol, decision="buy_skipped",
-                                              reason="volume_unavailable", sentiment_score=sentiment.score,
-                                              sentiment_label=sentiment.label)
-                return exposure
-            if snap.volume_ratio < self.cfg.strategy.min_volume_ratio:
-                logger.info("BUY %s skipped: volume ratio %.2fx < required %.2fx "
-                            "(today %.0f vs %.0f expected by now, %d-day full-day avg %.0f)",
-                            symbol, snap.volume_ratio, self.cfg.strategy.min_volume_ratio,
-                            snap.today_volume, snap.expected_volume_so_far,
-                            self.cfg.strategy.volume_lookback_days, snap.avg_volume,
-                            extra={"symbol": symbol, "decision": "buy_skipped",
-                                   "reason": "low_volume", "volume_ratio": snap.volume_ratio})
-                self.recorder.record_decision(symbol=symbol, decision="buy_skipped", reason="low_volume",
-                                              sentiment_score=sentiment.score, sentiment_label=sentiment.label,
-                                              volume_ratio=snap.volume_ratio)
-                return exposure
+        # Weighted composite - partial credit instead of a hard cutoff on
+        # headline count / volume ratio. Sentiment only ever contributes
+        # positively (negative/neutral sentiment scores 0 toward a buy).
+        sentiment_component = max(0.0, min(sentiment.score, 10.0)) / 10.0
+        headline_component = (
+            min(sentiment.article_count / cfg.min_headlines, 1.0) if cfg.min_headlines > 0 else 1.0
+        )
+        if cfg.min_volume_ratio <= 0:
+            volume_component = 1.0  # gate disabled
+        elif snap.volume_ratio is None:
+            volume_component = 0.0  # unconfirmable -> no credit (fail-closed, same spirit as before)
+        else:
+            volume_component = min(snap.volume_ratio / cfg.min_volume_ratio, 1.0)
 
-        return self._do_buy(symbol, sentiment, snap.last, acct, exposure,
-                            open_positions, sector_counts, stats, market_regime)
+        score = (cfg.sentiment_weight * sentiment_component
+                 + cfg.headline_weight * headline_component
+                 + cfg.volume_weight * volume_component)
+
+        if score < cfg.momentum_buy_score:
+            logger.info(
+                "BUY %s (momentum) skipped: composite score %.2f < %.2f "
+                "(sentiment %.2f x%.1f + headlines %.2f x%.1f + volume %.2f x%.1f)",
+                symbol, score, cfg.momentum_buy_score,
+                sentiment_component, cfg.sentiment_weight, headline_component, cfg.headline_weight,
+                volume_component, cfg.volume_weight,
+                extra={"symbol": symbol, "decision": "buy_skipped", "reason": "low_composite_score",
+                       "composite_score": score},
+            )
+            self.recorder.record_decision(
+                symbol=symbol, decision="buy_skipped", reason="low_composite_score",
+                sentiment_score=sentiment.score, sentiment_label=sentiment.label,
+                headline_count=sentiment.article_count, volume_ratio=snap.volume_ratio,
+                extra={"composite_score": score}, entry_path="sentiment_momentum",
+            )
+            return None
+
+        volume_txt = f"{snap.volume_ratio:.2f}x" if snap.volume_ratio is not None else "n/a"
+        return (f"composite score {score:.2f} >= {cfg.momentum_buy_score:.2f} "
+                f"(sentiment {sentiment.score:.1f}, {sentiment.article_count} headlines, "
+                f"volume {volume_txt})")
+
+    def _evaluate_reversion_path(self, symbol, sentiment, snap) -> Optional[str]:
+        """Strategy v2, Path B: short-term mean-reversion (Larry Connors
+        RSI(2)-style). Buys an oversold dip WITHIN an established long-term
+        uptrend, confirmed by volume, vetoed if sentiment is actively
+        bearish (news likely explains the drop, not a technical dip worth
+        buying). All hard gates - this is a binary "does this specific dip
+        qualify" signal, not a scored one, since a dip either is or isn't
+        confirmed.
+
+        Returns a human-readable reason if it fires, else None (silently -
+        "not oversold" isn't worth a skip-log every cycle for every symbol,
+        unlike the other gates below which only get reached once RSI *is*
+        oversold and are worth recording when they block an entry)."""
+        cfg = self.cfg.strategy
+
+        if snap.trend_sma is None:
+            logger.info("BUY %s (reversion) skipped: %d-day trend SMA unavailable (fail-closed)",
+                        symbol, cfg.reversion_trend_sma_period,
+                        extra={"symbol": symbol, "decision": "reversion_skipped",
+                               "reason": "trend_sma_unavailable"})
+            return None
+        if snap.last <= snap.trend_sma:
+            return None  # not in a long-term uptrend - routine, not worth logging every cycle
+        if snap.rsi is None:
+            logger.info("BUY %s (reversion) skipped: %d-period RSI unavailable (fail-closed)",
+                        symbol, cfg.rsi_period,
+                        extra={"symbol": symbol, "decision": "reversion_skipped",
+                               "reason": "rsi_unavailable"})
+            return None
+        if snap.rsi > cfg.rsi_oversold:
+            return None  # not oversold - no signal, routine
+
+        if cfg.reversion_min_volume_ratio > 0 and (
+            snap.volume_ratio is None or snap.volume_ratio < cfg.reversion_min_volume_ratio
+        ):
+            volume_txt = f"{snap.volume_ratio:.2f}x" if snap.volume_ratio is not None else "unavailable"
+            logger.info(
+                "BUY %s (reversion) skipped: RSI(%d)=%.1f is oversold but volume ratio %s < "
+                "required %.2fx (reversion needs volume confirmation)",
+                symbol, cfg.rsi_period, snap.rsi, volume_txt, cfg.reversion_min_volume_ratio,
+                extra={"symbol": symbol, "decision": "reversion_skipped", "reason": "low_volume"},
+            )
+            self.recorder.record_decision(
+                symbol=symbol, decision="reversion_skipped", reason="low_volume",
+                sentiment_score=sentiment.score, sentiment_label=sentiment.label,
+                volume_ratio=snap.volume_ratio, entry_path="mean_reversion",
+            )
+            return None
+
+        if sentiment.score <= cfg.reversion_sentiment_veto:
+            logger.info(
+                "BUY %s (reversion) skipped: RSI(%d)=%.1f is oversold but sentiment %.1f <= "
+                "%.1f veto threshold (news likely explains the drop)",
+                symbol, cfg.rsi_period, snap.rsi, sentiment.score, cfg.reversion_sentiment_veto,
+                extra={"symbol": symbol, "decision": "reversion_skipped", "reason": "sentiment_veto"},
+            )
+            self.recorder.record_decision(
+                symbol=symbol, decision="reversion_skipped", reason="sentiment_veto",
+                sentiment_score=sentiment.score, sentiment_label=sentiment.label,
+                entry_path="mean_reversion",
+            )
+            return None
+
+        volume_txt = f"{snap.volume_ratio:.2f}x" if snap.volume_ratio is not None else "n/a"
+        return (f"RSI({cfg.rsi_period})={snap.rsi:.1f} <= {cfg.rsi_oversold:.0f} oversold, "
+                f"price {snap.last:.2f} > {cfg.reversion_trend_sma_period}-day SMA {snap.trend_sma:.2f}, "
+                f"volume {volume_txt}, sentiment {sentiment.score:.1f} (no veto)")
+
+    def _reversion_exit_reason(self, snap, lot) -> Optional[str]:
+        """Exit rule for a Path B (mean-reversion) position: RSI climbing
+        back out of oversold (the Connors-style profit-taking exit), or a
+        max hold time so a dip that never reverts doesn't just sit there
+        indefinitely - the -10%/+20% bracket is still the safety net under
+        both. `snap` may be None (fetch failed - fail-closed, keep holding,
+        no exit signal); `lot` may be None (open-lot state lost - skip the
+        hold-time check, RSI-exit still applies if snap is available)."""
+        cfg = self.cfg.strategy
+        if snap is not None and snap.rsi is not None and snap.rsi >= cfg.rsi_exit:
+            return f"RSI({cfg.rsi_period})={snap.rsi:.1f} >= {cfg.rsi_exit:.0f} exit threshold"
+        entry_time = (lot or {}).get("entry_time")
+        if entry_time:
+            held_days = (time.time() - entry_time) / 86400.0
+            if held_days >= cfg.reversion_max_hold_days:
+                return f"max hold of {cfg.reversion_max_hold_days} day(s) reached ({held_days:.1f}d)"
+        return None
 
     def _do_buy(self, symbol, sentiment, price, acct, exposure, open_positions,
-                sector_counts, stats, market_regime=None) -> float:
+                sector_counts, stats, market_regime=None,
+                entry_path: str = "sentiment_momentum", reason: Optional[str] = None) -> float:
         if price is None or price <= 0:
             return exposure
 
@@ -838,32 +1003,41 @@ class SentimentStrategy:
                        extra={"symbol": symbol, "decision": "buy_blocked", "reason": decision.reason})
             self.recorder.record_decision(symbol=symbol, decision="buy_blocked",
                                           reason=decision.reason, sentiment_score=sentiment.score,
-                                          sentiment_label=sentiment.label)
+                                          sentiment_label=sentiment.label, entry_path=entry_path)
             stats.blocked += 1
             return exposure
 
         plan = decision.plan
-        reason = (f"score {sentiment.score:.1f} >= {self.cfg.strategy.buy_threshold}, "
-                  f"{sentiment.article_count} headlines")
+        if reason is None:
+            # Fallback for any future caller that doesn't pass one - matches
+            # the pre-v2 message shape.
+            reason = (f"score {sentiment.score:.1f} >= {self.cfg.strategy.buy_threshold}, "
+                      f"{sentiment.article_count} headlines")
+        tagged_reason = f"[{entry_path}] {reason}"
 
         if self.cfg.risk.dry_run:
-            logger.info("[DRY RUN] would BUY %d %s @ ~%.2f (stop %.2f / tp %.2f)",
+            logger.info("[DRY RUN] would BUY %d %s @ ~%.2f (stop %.2f / tp %.2f) via %s",
                         plan.qty, symbol, plan.price, plan.stop_price, plan.take_profit_price,
+                        entry_path,
                         extra={"symbol": symbol, "decision": "buy", "dry_run": True,
-                               "qty": plan.qty, "price": plan.price, "notional": plan.notional})
+                               "qty": plan.qty, "price": plan.price, "notional": plan.notional,
+                               "entry_path": entry_path})
             self.trade_logger.log("buy", symbol, plan.qty, plan.price, plan.notional,
                                   sentiment, plan.stop_price, plan.take_profit_price,
-                                  reason, dry_run=True, order_id="", status="dry_run")
+                                  tagged_reason, dry_run=True, order_id="", status="dry_run",
+                                  entry_path=entry_path)
             self.recorder.record_trade(
                 action="buy", symbol=symbol, qty=plan.qty, price=plan.price, notional=plan.notional,
                 sentiment=sentiment, stop_price=plan.stop_price, take_profit=plan.take_profit_price,
-                reason=reason, rationale=sentiment.rationale, dry_run=True, order_id="", status="dry_run",
-                sector=sector_of(symbol), market_regime=market_regime,
+                reason=tagged_reason, rationale=sentiment.rationale, dry_run=True, order_id="",
+                status="dry_run", sector=sector_of(symbol), market_regime=market_regime,
+                entry_path=entry_path,
             )
             self.recorder.record_decision(
-                symbol=symbol, decision="buy", reason=reason, sentiment_score=sentiment.score,
+                symbol=symbol, decision="buy", reason=tagged_reason, sentiment_score=sentiment.score,
                 sentiment_label=sentiment.label, headline_count=sentiment.article_count,
                 rationale=sentiment.rationale, price=plan.price, extra={"dry_run": True},
+                entry_path=entry_path,
             )
         else:
             # Idempotency key stable within a 30-min slot, so a crash/restart or a
@@ -880,65 +1054,71 @@ class SentimentStrategy:
                             extra={"symbol": symbol, "decision": "buy_failed", "error": str(exc)})
                 self.recorder.record_decision(symbol=symbol, decision="buy_failed",
                                               reason=str(exc), sentiment_score=sentiment.score,
-                                              sentiment_label=sentiment.label)
+                                              sentiment_label=sentiment.label, entry_path=entry_path)
                 self.recorder.record_notification(
                     type_="error", severity="warning", title=f"BUY {symbol} failed",
                     message=str(exc),
                 )
                 return exposure
-            logger.info("Submitted BUY %s: order %s status %s",
-                        symbol, order.order_id, order.status,
+            logger.info("Submitted BUY %s: order %s status %s via %s",
+                        symbol, order.order_id, order.status, entry_path,
                         extra={"symbol": symbol, "decision": "buy", "dry_run": False,
                                "qty": plan.qty, "price": plan.price, "notional": plan.notional,
-                               "order_id": order.order_id, "status": order.status})
+                               "order_id": order.order_id, "status": order.status,
+                               "entry_path": entry_path})
             self.trade_logger.log("buy", symbol, plan.qty, plan.price, plan.notional,
                                   sentiment, plan.stop_price, plan.take_profit_price,
-                                  reason, dry_run=False, order_id=order.order_id,
-                                  status=order.status)
+                                  tagged_reason, dry_run=False, order_id=order.order_id,
+                                  status=order.status, entry_path=entry_path)
             self.recorder.record_trade(
                 action="buy", symbol=symbol, qty=plan.qty, price=plan.price, notional=plan.notional,
                 sentiment=sentiment, stop_price=plan.stop_price, take_profit=plan.take_profit_price,
-                reason=reason, rationale=sentiment.rationale, dry_run=False,
+                reason=tagged_reason, rationale=sentiment.rationale, dry_run=False,
                 order_id=order.order_id, status=order.status,
-                sector=sector_of(symbol), market_regime=market_regime,
+                sector=sector_of(symbol), market_regime=market_regime, entry_path=entry_path,
             )
             self.recorder.record_decision(
-                symbol=symbol, decision="buy", reason=reason, sentiment_score=sentiment.score,
+                symbol=symbol, decision="buy", reason=tagged_reason, sentiment_score=sentiment.score,
                 sentiment_label=sentiment.label, headline_count=sentiment.article_count,
                 rationale=sentiment.rationale, price=plan.price,
                 extra={"dry_run": False, "order_id": order.order_id, "status": order.status},
+                entry_path=entry_path,
             )
             self.recorder.record_notification(
                 type_="trade_executed", title=f"BUY {symbol}",
-                message=f"{plan.qty} shares @ ~{plan.price:.2f} ({reason})",
+                message=f"{plan.qty} shares @ ~{plan.price:.2f} ({tagged_reason})",
             )
 
         # Remember what we paid (real or simulated) so the performance report
         # can compute P/L whenever this position eventually closes. Also keep
-        # the reason/confidence so the dashboard can show why we bought it.
-        self.state.record_open(symbol, plan.price, plan.qty, reason=reason,
+        # the reason/confidence and entry_path so the dashboard can show why
+        # we bought it, and so the exit logic above knows which rule to use.
+        self.state.record_open(symbol, plan.price, plan.qty, reason=tagged_reason,
                                sentiment_score=sentiment.score, sentiment_label=sentiment.label,
                                rationale=sentiment.rationale, sector=sector_of(symbol),
                                market_regime=market_regime,
-                               strategy_version=self.version_provider.current_version())
+                               strategy_version=self.version_provider.current_version(),
+                               entry_path=entry_path)
 
         open_positions[symbol] = plan.qty
         sector_counts[sector_of(symbol)] += 1
         stats.buys += 1
         return exposure + plan.notional
 
-    def _do_sell(self, symbol, sentiment, reason) -> None:
+    def _do_sell(self, symbol, sentiment, reason, entry_path: str = "sentiment_momentum") -> None:
         if self.cfg.risk.dry_run:
             exit_price = self.broker.latest_price(symbol)
             logger.info("[DRY RUN] would CLOSE %s (%s)", symbol, reason,
                        extra={"symbol": symbol, "decision": "sell", "dry_run": True,
                               "reason": reason})
             self.trade_logger.log("sell", symbol, 0, 0.0, 0.0, sentiment, 0.0, 0.0,
-                                  reason, dry_run=True, order_id="", status="dry_run")
+                                  reason, dry_run=True, order_id="", status="dry_run",
+                                  entry_path=entry_path)
             self.recorder.record_trade(
                 action="sell", symbol=symbol, qty=0, price=0.0, notional=0.0, sentiment=sentiment,
                 stop_price=0.0, take_profit=0.0, reason=reason, rationale=sentiment.rationale,
                 dry_run=True, order_id="", status="dry_run", sector=sector_of(symbol),
+                entry_path=entry_path,
             )
             self.recorder.record_decision(
                 symbol=symbol, decision="sell", reason=reason, sentiment_score=sentiment.score,
@@ -1014,11 +1194,12 @@ class SentimentStrategy:
                            "order_id": order.order_id, "reason": reason})
         self.trade_logger.log("sell", symbol, order.qty, 0.0, 0.0, sentiment, 0.0, 0.0,
                               reason, dry_run=False, order_id=order.order_id,
-                              status=order.status)
+                              status=order.status, entry_path=entry_path)
         self.recorder.record_trade(
             action="sell", symbol=symbol, qty=order.qty, price=0.0, notional=0.0, sentiment=sentiment,
             stop_price=0.0, take_profit=0.0, reason=reason, rationale=sentiment.rationale,
             dry_run=False, order_id=order.order_id, status=order.status, sector=sector_of(symbol),
+            entry_path=entry_path,
         )
         self.recorder.record_decision(
             symbol=symbol, decision="sell", reason=reason, sentiment_score=sentiment.score,

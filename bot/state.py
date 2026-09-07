@@ -93,7 +93,7 @@ class BotState:
                      reason: str = None, sentiment_score: float = None,
                      sentiment_label: str = None, rationale: str = None,
                      sector: str = None, market_regime: str = None,
-                     strategy_version: str = None) -> None:
+                     strategy_version: str = None, entry_path: str = None) -> None:
         self._data["open_lots"][symbol] = {
             "entry_price": entry_price,
             "qty": qty,
@@ -109,6 +109,14 @@ class BotState:
             "sector": sector,
             "market_regime": market_regime,
             "strategy_version": strategy_version,
+            # Strategy v2: which leg opened this position -
+            # 'sentiment_momentum' | 'mean_reversion'. Read back at exit time
+            # (see SentimentStrategy._process_symbol) so a mean-reversion
+            # position exits on its own RSI/max-hold rule instead of the
+            # sentiment-sell rule. None/missing (positions opened before this
+            # field existed, or adopted legacy positions) is treated as
+            # 'sentiment_momentum' by the reader - the existing behavior.
+            "entry_path": entry_path,
         }
         self._save()
 

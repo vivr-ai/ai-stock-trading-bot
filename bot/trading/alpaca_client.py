@@ -39,6 +39,40 @@ _SESSION_CLOSE_HOUR, _SESSION_CLOSE_MINUTE = 16, 0
 _MIN_SESSION_FRACTION = 0.05
 
 
+def _compute_rsi(closes: List[float], period: int) -> Optional[float]:
+    """Wilder's RSI over `closes` (oldest -> newest), for `period` bars.
+
+    Used for the Strategy v2 mean-reversion leg's RSI(2) signal (see
+    bot/trading/strategy.py's _evaluate_reversion_path). With only `period`
+    changes available (the minimum this function accepts), the Wilder
+    smoothing loop below has nothing left to smooth over and this reduces to
+    a plain average of gains/losses over that window - the standard way
+    short-period RSI (e.g. Connors' RSI(2)) is computed in practice, since
+    Wilder's extra smoothing barely matters at such a short period anyway.
+
+    Returns None if there isn't at least `period` + 1 closes (i.e. `period`
+    price changes) to work with - fail-closed, same as every other
+    confirmation filter in this module.
+    """
+    if period <= 0 or len(closes) < period + 1:
+        return None
+    gains: List[float] = []
+    losses: List[float] = []
+    for i in range(1, len(closes)):
+        change = closes[i] - closes[i - 1]
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
 def _session_elapsed_fraction(tz_name: str) -> float:
     """Fraction (0..1) of today's regular trading session elapsed right now.
 
@@ -109,6 +143,11 @@ class MarketSnapshot:
     # the dashboard can show both the raw historical average and the
     # time-of-day-adjusted baseline it was compared against.
     expected_volume_so_far: Optional[float] = None
+    # --- Strategy v2, Path B (mean-reversion) fields - only populated when
+    # market_snapshot() is called with trend_sma_period / rsi_period set;
+    # None otherwise (existing callers that don't ask for them are unaffected). ---
+    trend_sma: Optional[float] = None   # long-horizon (e.g. 200-day) SMA of close, for the uptrend filter
+    rsi: Optional[float] = None         # short-period (e.g. 2-day) Wilder RSI, intraday-updated via `last`
 
 
 @dataclass
@@ -265,9 +304,20 @@ class AlpacaBroker:
 
     def market_snapshot(self, symbol: str, sma_period: int = 20,
                         volume_lookback_days: int = 20,
-                        session_tz: str = "America/New_York") -> Optional[MarketSnapshot]:
+                        session_tz: str = "America/New_York",
+                        trend_sma_period: Optional[int] = None,
+                        rsi_period: Optional[int] = None) -> Optional[MarketSnapshot]:
         """One data pull -> last price, prior-close-based change_pct, N-day
         SMA of close, N-day average volume, and today's volume-so-far.
+
+        trend_sma_period / rsi_period are optional additions for the
+        Strategy v2 mean-reversion leg (see bot/trading/strategy.py's
+        _evaluate_reversion_path / _reversion_exit_reason): when given, this
+        also computes a long-horizon SMA (e.g. 200-day, the Connors-style
+        uptrend filter) and a short-period RSI (e.g. RSI(2), intraday-updated
+        using `last` as the most recent "close" - see _compute_rsi). Both
+        stay None when their period isn't passed in, so every existing
+        caller is unaffected.
 
         change_pct is measured from the PREVIOUS DAY'S CLOSE, not today's
         open, so it captures overnight gaps — exactly the move that news
@@ -304,7 +354,8 @@ class AlpacaBroker:
         if last is None:
             return None
 
-        limit = max(sma_period, volume_lookback_days) + 2
+        limit = max(sma_period, volume_lookback_days, trend_sma_period or 0,
+                    (rsi_period or 0) + 1) + 2
         # Alpaca's bars endpoint does NOT infer a historical window from
         # `limit` alone - without an explicit `start` it only returns bars
         # from "now" onward as they form: nothing before the market opens,
@@ -400,6 +451,25 @@ class AlpacaBroker:
             window = history[-volume_lookback_days:]
             avg_volume = sum(float(b.volume) for b in window) / len(window)
 
+        trend_sma = None
+        if trend_sma_period and len(history) >= 1:
+            window = history[-trend_sma_period:]
+            trend_sma = sum(float(b.close) for b in window) / len(window)
+            if len(history) < trend_sma_period:
+                logger.warning(
+                    "market_snapshot: %s got only %d history bar(s) for a %d-day trend "
+                    "SMA - computed over a shorter window than intended.",
+                    symbol, len(history), trend_sma_period,
+                )
+
+        rsi = None
+        if rsi_period and len(history) >= rsi_period:
+            # Last `rsi_period` completed closes plus today's live price as
+            # the most-recent "close" - same intraday-updated treatment
+            # `change_pct` above gives `last` vs prev_close.
+            closes = [float(b.close) for b in history[-rsi_period:]] + [last]
+            rsi = _compute_rsi(closes, rsi_period)
+
         expected_volume_so_far = (
             avg_volume * _session_elapsed_fraction(session_tz) if avg_volume is not None else None
         )
@@ -412,6 +482,7 @@ class AlpacaBroker:
             symbol=symbol, last=last, prev_close=prev_close, change_pct=change_pct,
             sma=sma, avg_volume=avg_volume, today_volume=today_volume, volume_ratio=volume_ratio,
             expected_volume_so_far=expected_volume_so_far,
+            trend_sma=trend_sma, rsi=rsi,
         )
 
     def quote(self, symbol: str):

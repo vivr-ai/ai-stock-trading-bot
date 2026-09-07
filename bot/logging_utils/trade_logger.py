@@ -28,6 +28,7 @@ _FIELDS = [
     "dry_run",
     "order_id",
     "status",
+    "entry_path",
 ]
 
 
@@ -40,7 +41,8 @@ class TradeLogger:
                 csv.DictWriter(f, fieldnames=_FIELDS).writeheader()
 
     def log(self, action, symbol, qty, price, notional, sentiment,
-            stop_price, take_profit, reason, dry_run, order_id, status) -> None:
+            stop_price, take_profit, reason, dry_run, order_id, status,
+            entry_path: str = "sentiment_momentum") -> None:
         row = {
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "action": action,
@@ -60,6 +62,11 @@ class TradeLogger:
             "dry_run": dry_run,
             "order_id": order_id,
             "status": status,
+            # Strategy v2: 'sentiment_momentum' | 'mean_reversion' - which
+            # leg generated this row. Defaults to 'sentiment_momentum' so
+            # every pre-v2 call site (and sell rows, which don't pass this)
+            # keeps its previous meaning.
+            "entry_path": entry_path,
         }
         with open(self.path, "a", newline="") as f:
             csv.DictWriter(f, fieldnames=_FIELDS).writerow(row)

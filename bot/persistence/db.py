@@ -195,41 +195,42 @@ class Recorder:
                          negative_headlines: Optional[int] = None, rationale: Optional[str] = None,
                          price: Optional[float] = None, sma: Optional[float] = None,
                          change_pct: Optional[float] = None, volume_ratio: Optional[float] = None,
-                         extra: Optional[Dict] = None) -> None:
+                         extra: Optional[Dict] = None, entry_path: Optional[str] = None) -> None:
         self._execute(
             """
             INSERT INTO decisions
                 (symbol, decision, reason, sentiment_score, sentiment_label, headline_count,
                  positive_headlines, negative_headlines, rationale, price, sma, change_pct,
-                 volume_ratio, extra)
+                 volume_ratio, extra, entry_path)
             VALUES
                 (%(symbol)s, %(decision)s, %(reason)s, %(sentiment_score)s, %(sentiment_label)s,
                  %(headline_count)s, %(positive_headlines)s, %(negative_headlines)s, %(rationale)s,
-                 %(price)s, %(sma)s, %(change_pct)s, %(volume_ratio)s, %(extra)s)
+                 %(price)s, %(sma)s, %(change_pct)s, %(volume_ratio)s, %(extra)s, %(entry_path)s)
             """,
             dict(symbol=symbol, decision=decision, reason=reason, sentiment_score=sentiment_score,
                  sentiment_label=sentiment_label, headline_count=headline_count,
                  positive_headlines=positive_headlines, negative_headlines=negative_headlines,
                  rationale=rationale, price=price, sma=sma, change_pct=change_pct,
-                 volume_ratio=volume_ratio, extra=self._json(extra)),
+                 volume_ratio=volume_ratio, extra=self._json(extra), entry_path=entry_path),
         )
 
     def record_trade(self, *, action: str, symbol: str, qty: float, price: float, notional: float,
                       sentiment, stop_price: float, take_profit: float, reason: str, rationale: str,
                       dry_run: bool, order_id: str, status: str,
-                      sector: Optional[str] = None, market_regime: Optional[str] = None) -> None:
+                      sector: Optional[str] = None, market_regime: Optional[str] = None,
+                      entry_path: Optional[str] = None) -> None:
         self._execute(
             """
             INSERT INTO trades
                 (action, symbol, qty, price, notional, stop_price, take_profit,
                  sentiment_score, sentiment_label, headline_count, positive_headlines,
                  negative_headlines, reason, rationale, dry_run, order_id, status,
-                 sector, market_regime)
+                 sector, market_regime, entry_path)
             VALUES
                 (%(action)s, %(symbol)s, %(qty)s, %(price)s, %(notional)s, %(stop_price)s,
                  %(take_profit)s, %(sentiment_score)s, %(sentiment_label)s, %(headline_count)s,
                  %(positive_headlines)s, %(negative_headlines)s, %(reason)s, %(rationale)s,
-                 %(dry_run)s, %(order_id)s, %(status)s, %(sector)s, %(market_regime)s)
+                 %(dry_run)s, %(order_id)s, %(status)s, %(sector)s, %(market_regime)s, %(entry_path)s)
             """,
             dict(action=action, symbol=symbol, qty=qty, price=price, notional=notional,
                  stop_price=stop_price, take_profit=take_profit,
@@ -239,7 +240,7 @@ class Recorder:
                  positive_headlines=getattr(sentiment, "positive_count", None),
                  negative_headlines=getattr(sentiment, "negative_count", None),
                  reason=reason, rationale=rationale, dry_run=dry_run, order_id=order_id,
-                 status=status, sector=sector, market_regime=market_regime),
+                 status=status, sector=sector, market_regime=market_regime, entry_path=entry_path),
         )
 
     def record_closed_trade(self, *, symbol: str, qty: float, entry_price: float, exit_price: float,
