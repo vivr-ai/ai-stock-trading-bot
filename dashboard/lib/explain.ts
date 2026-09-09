@@ -24,6 +24,18 @@ const REASON_EXPLANATIONS: Record<string, string> = {
     "The price hasn't confirmed the news yet - it's still below its recent average.",
   volume_unavailable: "Couldn't confirm today's trading volume yet.",
   low_volume: "Not enough trading activity today to confirm the move.",
+
+  // ---- Strategy v2, Path A: weighted composite score -----------------
+  low_composite_score:
+    "The combined score (news, headline coverage, and volume, weighted together) didn't clear the buy bar this cycle.",
+
+  // ---- Strategy v2, Path B: RSI-2 mean-reversion (shadow mode) --------
+  trend_sma_unavailable:
+    "Couldn't confirm this stock's long-term trend, so the mean-reversion signal is skipped (fail-closed).",
+  rsi_unavailable:
+    "Couldn't compute the short-term RSI reading yet, so the mean-reversion signal is skipped (fail-closed).",
+  sentiment_veto:
+    "This looks like an oversold dip, but the news behind it is bad enough that it's treated as a real decline, not a bounce worth buying.",
 };
 
 export function explainReason(reason: string | null | undefined): string {
@@ -31,8 +43,21 @@ export function explainReason(reason: string | null | undefined): string {
   return REASON_EXPLANATIONS[reason] ?? reason;
 }
 
-export function decisionLabel(decision: string): "Buy" | "Sell" | "Hold" {
+export type DecisionLabel = "Buy" | "Sell" | "Hold" | "Shadow Buy" | "Shadow Close";
+
+export function decisionLabel(decision: string): DecisionLabel {
   if (decision === "buy") return "Buy";
   if (decision === "sell") return "Sell";
+  // Strategy v2, Path B shadow mode: these are never real orders - labeled
+  // distinctly so they don't read as an ordinary Hold in the Decision Log.
+  if (decision === "reversion_shadow_buy") return "Shadow Buy";
+  if (decision === "reversion_shadow_exit") return "Shadow Close";
   return "Hold";
+}
+
+// True for any decision that represents a Path B shadow-mode event (no real
+// order was placed either way) - used by the Decision Log to style these
+// rows distinctly from genuine Buy/Sell/Hold outcomes.
+export function isShadowDecision(decision: string): boolean {
+  return decision === "reversion_shadow_buy" || decision === "reversion_shadow_exit";
 }

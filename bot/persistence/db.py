@@ -517,6 +517,168 @@ class Recorder:
             except Exception:  # noqa: BLE001
                 pass
 
+    def get_open_shadow_position(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Read-only, same narrowly-scoped exception as get_last_buy_trade()
+        above: the bot needs to know, every cycle, whether a Strategy v2
+        Path B (mean-reversion) SHADOW signal for `symbol` is still "open"
+        so it can re-check the RSI-recovery/max-hold exit rule against it -
+        see SentimentStrategy._process_symbol / _reversion_exit_reason in
+        bot/trading/strategy.py.
+
+        Deliberately NOT tracked in bot/state.py's local JSON file: that
+        file lives on Railway's ephemeral disk and is wiped on every
+        redeploy (see that module's docstring), which would silently
+        orphan any shadow position open at deploy time - exactly the
+        failure mode this bot already works around for real open-lot
+        tracking via _log_closed_trade_from_history. Reading Postgres
+        instead (the same durable store the dashboard's Shadow vs Live
+        page reads) means a redeploy mid-signal just costs one missed
+        cycle of exit-checking, never a lost or duplicated shadow round-trip.
+
+        A shadow position is "open" when the most recent
+        'reversion_shadow_buy' decision for `symbol` has no later
+        'reversion_shadow_exit' decision after it. Returns that buy row
+        (ts/price/reason/sentiment/...) or None if there isn't one, or if
+        the DB is unreachable (fails toward "nothing open" - shadow
+        tracking is purely observational and must never affect anything
+        the bot actually trades)."""
+        if not self.enabled:
+            return None
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB connect failed (shadow-position lookup skipped for %s): %s",
+                            symbol, exc)
+            return None
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, ts, price, reason, sentiment_score, sentiment_label, rationale
+                        FROM decisions
+                        WHERE symbol = %(symbol)s AND decision = 'reversion_shadow_buy'
+                        ORDER BY ts DESC LIMIT 1
+                        """,
+                        dict(symbol=symbol),
+                    )
+                    buy_row = cur.fetchone()
+                    if buy_row is None:
+                        return None
+                    buy_cols = [d[0] for d in cur.description]
+                    buy = dict(zip(buy_cols, buy_row))
+
+                    cur.execute(
+                        """
+                        SELECT 1 FROM decisions
+                        WHERE symbol = %(symbol)s AND decision = 'reversion_shadow_exit'
+                          AND ts > %(buy_ts)s
+                        LIMIT 1
+                        """,
+                        dict(symbol=symbol, buy_ts=buy["ts"]),
+                    )
+                    if cur.fetchone() is not None:
+                        return None  # already resolved - not open
+                    return buy
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB shadow-position lookup failed for %s: %s", symbol, exc)
+            return None
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def get_shadow_verdict_progress(self) -> Optional[Dict[str, Any]]:
+        """{"closed_count": int, "since_ts": datetime | None} for Path B's
+        shadow round-trips - the exact figures the dashboard's Shadow vs
+        Live page shows (see dashboard/app/api/shadow-comparison/route.ts:
+        `since_ts` is the earliest reversion_shadow_buy/reversion_shadow_exit
+        row, `closed_count` the count of reversion_shadow_exit rows). Used
+        by NotificationService's one-time 'shadow_verdict_ready' alert so it
+        fires off the same numbers a person checking the page would see, not
+        a separately-computed approximation.
+
+        Note this counts raw reversion_shadow_exit rows, not collapsed
+        episodes - that's fine going forward (get_open_shadow_position's
+        duplicate-open guard means one exit row per resolved episode from
+        here on), but historical pre-fix data with an unresolved signal
+        re-firing every cycle never produced exit rows at all, so it can't
+        inflate this count either.
+
+        Returns None (not a dict with zeros) on any DB problem, so the
+        caller fails toward "can't tell yet" rather than treating an
+        outage as "definitely not ready"."""
+        if not self.enabled:
+            return None
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB connect failed (shadow-verdict-progress lookup skipped): %s", exc)
+            return None
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            COUNT(*) FILTER (WHERE decision = 'reversion_shadow_exit') AS closed_count,
+                            MIN(ts) FILTER (WHERE decision IN ('reversion_shadow_buy', 'reversion_shadow_exit')) AS since_ts
+                        FROM decisions
+                        """
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        return None
+                    closed_count, since_ts = row
+                    return {"closed_count": closed_count or 0, "since_ts": since_ts}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB shadow-verdict-progress lookup failed: %s", exc)
+            return None
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def has_ever_notified(self, type_: str) -> bool:
+        """True if a notification of this type has ever been recorded -
+        a durable, redeploy-safe "fire once, ever" guard (unlike the
+        in-memory _daily_loss_notified_date-style guards elsewhere in
+        strategy.py, which reset on restart and are only meant to dedupe
+        within a single day). Used by the one-time 'shadow_verdict_ready'
+        alert: an in-memory guard would re-announce readiness on every
+        Railway redeploy after the threshold is first crossed, which is
+        exactly the kind of alert fatigue this is meant to avoid.
+
+        Fails toward False (not yet notified) on any DB problem - worst
+        case a rare duplicate alert if the DB was down at exactly the wrong
+        moment, never a permanently-suppressed one."""
+        if not self.enabled:
+            return False
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB connect failed (has_ever_notified check skipped for %s): %s",
+                            type_, exc)
+            return False
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT 1 FROM notifications WHERE type = %(type)s LIMIT 1",
+                        dict(type=type_),
+                    )
+                    return cur.fetchone() is not None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB has_ever_notified check failed for %s: %s", type_, exc)
+            return False
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
     def has_logged_closed_trade_since(self, symbol: str, since_ts) -> bool:
         """True if a closed_trades row already exists for `symbol` with an
         exit time at or after `since_ts`. Paired with get_last_buy_trade()

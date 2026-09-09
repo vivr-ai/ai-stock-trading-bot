@@ -2,7 +2,6 @@ import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { query, queryOne } from "@/lib/db";
-import { strategyConfig } from "@/lib/strategyConfig";
 
 export const dynamic = "force-dynamic";
 
@@ -17,19 +16,28 @@ type DecisionRow = {
   headline_count: number | null;
   rationale: string | null;
   price: number | null;
+  entry_path: string | null;
+  extra: Record<string, unknown> | null;
 };
 
 type ClosedTradeLite = { symbol: string; entry_time: string | null; pnl: number };
 
 // Every symbol is evaluated in two steps each cycle: a "scan" row is written
-// first with the confidence/headline context, and - only if the score cleared
-// the buy threshold - a second row records what happened next (bought, or
-// blocked by a gate like SMA/volume/sector cap). Shown separately, the scan
-// row looks like an unexplained Hold. This merges each scan row with its
-// companion outcome row (same symbol, shortly after) into one row that has
-// both the confidence context AND the reason, and synthesizes a reason for
-// scan rows that never got a companion (most commonly: score never reached
-// the buy threshold, so no buy was even considered).
+// first with the confidence/headline context, and a second row records what
+// happened next - bought, blocked by a gate (SMA/volume/sector cap/composite
+// score), a Path B shadow signal, or nothing at all (see below). Shown
+// separately, the scan row looks like an unexplained Hold. This merges each
+// scan row with its companion outcome row (same symbol, shortly after) into
+// one row that has both the confidence context AND the reason, and
+// synthesizes a reason for scan rows that never got a companion.
+//
+// Strategy v2 note: Path A no longer has a hard sentiment>=buy_threshold
+// gate that skips evaluation entirely (see bot/trading/strategy.py's
+// weighted composite score) - essentially every non-held, non-paused symbol
+// gets SOME outcome row every cycle now, paired below. An orphaned scan row
+// (no companion at all) is therefore almost always a symbol the bot is
+// already holding with sentiment not bad enough to review selling, or a
+// cycle where new entries were paused market-wide - see fallbackScanReason.
 const OUTCOME_DECISIONS = new Set([
   "buy",
   "sell",
@@ -37,6 +45,9 @@ const OUTCOME_DECISIONS = new Set([
   "buy_blocked",
   "buy_failed",
   "sell_skipped",
+  "reversion_shadow_buy",
+  "reversion_shadow_exit",
+  "reversion_skipped",
 ]);
 const PAIR_WINDOW_MS = 2 * 60_000;
 
@@ -44,17 +55,10 @@ function tsMs(d: DecisionRow): number {
   return new Date(d.ts).getTime();
 }
 
-function fallbackScanReason(d: DecisionRow): string {
-  if (d.sentiment_score != null && d.sentiment_score < strategyConfig.buyThreshold) {
-    return `Confidence (${d.sentiment_score.toFixed(1)}) is below the buy threshold (${strategyConfig.buyThreshold.toFixed(
-      1
-    )}) - no buy was considered this cycle.`;
-  }
-  if (d.headline_count != null && d.headline_count < strategyConfig.minHeadlines) {
-    return `Only ${d.headline_count} headline(s) found, below the minimum of ${strategyConfig.minHeadlines} needed to act.`;
-  }
-  return "Confidence cleared the buy threshold, but no buy was evaluated this cycle - most likely because the bot was already holding this position, or new entries were paused.";
-}
+const FALLBACK_SCAN_REASON =
+  "No buy or sell was evaluated for this stock this cycle - most likely it was already held " +
+  "with sentiment not negative enough to review selling it, or new entries were paused " +
+  "market-wide (see the market filter and daily-loss-limit rows around this time).";
 
 function mergeScanPairs(rows: DecisionRow[]): DecisionRow[] {
   const asc = [...rows].sort((a, b) => tsMs(a) - tsMs(b) || a.id - b.id);
@@ -80,18 +84,25 @@ function mergeScanPairs(rows: DecisionRow[]): DecisionRow[] {
     }
 
     if (pairIdx === -1) {
-      merged.push({ ...row, reason: fallbackScanReason(row) });
+      merged.push({ ...row, reason: FALLBACK_SCAN_REASON });
       continue;
     }
 
     const outcome = asc[pairIdx];
     consumed.add(outcome.id);
+    const idFollowsOutcome =
+      outcome.decision === "buy" ||
+      outcome.decision === "sell" ||
+      outcome.decision === "reversion_shadow_buy" ||
+      outcome.decision === "reversion_shadow_exit";
     merged.push({
       ...row,
-      id: outcome.decision === "buy" || outcome.decision === "sell" ? outcome.id : row.id,
+      id: idFollowsOutcome ? outcome.id : row.id,
       decision: outcome.decision,
       reason: outcome.reason,
       price: outcome.price ?? row.price,
+      entry_path: outcome.entry_path ?? row.entry_path,
+      extra: outcome.extra ?? row.extra,
     });
   }
 
@@ -129,7 +140,7 @@ export async function GET(req: Request) {
     const [rawDecisions, heartbeat] = await Promise.all([
       query<DecisionRow>(
         `SELECT id, ts, symbol, decision, reason, sentiment_score, sentiment_label,
-                headline_count, rationale, price
+                headline_count, rationale, price, entry_path, extra
          FROM decisions
          ${whereClause}
          ORDER BY ts DESC
@@ -174,6 +185,19 @@ export async function GET(req: Request) {
     }
 
     const annotated = decisions.map((d) => {
+      if (d.decision === "reversion_shadow_buy") {
+        return { ...d, outcome: "Shadow only - no real order placed" };
+      }
+      if (d.decision === "reversion_shadow_exit") {
+        const pnlPct = d.extra?.pnl_pct;
+        return {
+          ...d,
+          outcome:
+            typeof pnlPct === "number"
+              ? `Shadow closed ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}% (simulated, no real position)`
+              : "Shadow closed (simulated, no real position)",
+        };
+      }
       if (d.decision !== "buy" && d.decision !== "sell") {
         return { ...d, outcome: null };
       }

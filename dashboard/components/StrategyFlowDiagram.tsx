@@ -1,99 +1,107 @@
-export default function StrategyFlowDiagram() {
-  const box = "fill-bg-panel2 stroke-bg-border";
-  const outcomeBoxClass = (tone: "gain" | "loss" | "neutral") =>
-    tone === "gain" ? "fill-gain/10 stroke-gain" : tone === "loss" ? "fill-loss/10 stroke-loss" : "fill-bg-panel2 stroke-bg-border";
+import { ArrowDown, TrendingUp, TrendingDown, Minus, FlaskConical } from "lucide-react";
+import type { ReactNode } from "react";
 
+function Step({ children }: { children: ReactNode }) {
   return (
-    <svg viewBox="0 0 700 700" className="w-full" role="img" aria-label="Flow diagram of how the bot makes a trade decision">
-      <defs>
-        <marker id="arrow" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto">
-          <path d="M0,0 L8,4 L0,8 Z" fill="#8592a8" />
-        </marker>
-      </defs>
+    <div className="rounded-lg border border-bg-border bg-bg-panel2 px-3 py-2.5 text-center text-xs leading-relaxed text-white">
+      {children}
+    </div>
+  );
+}
 
-      {/* connecting lines */}
-      <line x1="350" y1="70" x2="350" y2="93" stroke="#8592a8" strokeWidth="1.5" markerEnd="url(#arrow)" />
-      <line x1="350" y1="150" x2="350" y2="173" stroke="#8592a8" strokeWidth="1.5" markerEnd="url(#arrow)" />
-      <line x1="350" y1="230" x2="350" y2="253" stroke="#8592a8" strokeWidth="1.5" markerEnd="url(#arrow)" />
-      <line x1="350" y1="310" x2="350" y2="333" stroke="#8592a8" strokeWidth="1.5" markerEnd="url(#arrow)" />
-      <line x1="350" y1="390" x2="350" y2="405" stroke="#8592a8" strokeWidth="1.5" />
+function Connector() {
+  return (
+    <div className="flex justify-center py-1">
+      <ArrowDown size={14} className="text-muted" />
+    </div>
+  );
+}
 
-      {/* fan-out to 3 outcomes */}
-      <path d="M350,405 L110,405 L110,418" fill="none" stroke="#8592a8" strokeWidth="1.5" markerEnd="url(#arrow)" />
-      <path d="M350,405 L350,418" fill="none" stroke="#8592a8" strokeWidth="1.5" markerEnd="url(#arrow)" />
-      <path d="M350,405 L590,405 L590,418" fill="none" stroke="#8592a8" strokeWidth="1.5" markerEnd="url(#arrow)" />
+function Outcome({
+  tone,
+  children,
+}: {
+  tone: "gain" | "amber";
+  children: ReactNode;
+}) {
+  const toneClass =
+    tone === "gain" ? "border-gain/50 bg-gain/10 text-gain" : "border-amber-500/50 bg-amber-500/10 text-amber-400";
+  return (
+    <div className={`rounded-lg border px-3 py-2.5 text-center text-xs font-semibold leading-relaxed ${toneClass}`}>
+      {children}
+    </div>
+  );
+}
 
-      {/* buy -> bracket order */}
-      <line x1="590" y1="480" x2="590" y2="498" stroke="#8592a8" strokeWidth="1.5" markerEnd="url(#arrow)" />
+export default function StrategyFlowDiagram() {
+  return (
+    <div className="w-full" role="img" aria-label="Flow diagram of how the bot evaluates a buy signal along its two paths">
+      {/* shared intake */}
+      <div className="mx-auto max-w-md rounded-xl border border-bg-border bg-bg-panel2 px-4 py-3 text-center text-sm text-white">
+        Every 30 minutes during market hours — for each stock on the watch-list, after confirming the overall
+        market isn&apos;t down sharply or in a downtrend
+      </div>
+      <Connector />
 
-      {/* converge to wait node */}
-      <path d="M110,480 L110,590 L340,590" fill="none" stroke="#8592a8" strokeWidth="1.5" />
-      <path d="M350,480 L350,600" fill="none" stroke="#8592a8" strokeWidth="1.5" markerEnd="url(#arrow)" />
-      <path d="M590,555 L590,590 L360,590" fill="none" stroke="#8592a8" strokeWidth="1.5" markerEnd="url(#arrow)" />
+      {/* two paths side by side */}
+      <div className="grid gap-4 md:grid-cols-2">
+        {/* Path A */}
+        <div className="rounded-xl border border-accent/40 bg-accent/5 p-3">
+          <div className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-accent">
+            <TrendingUp size={13} /> Path A — News-driven momentum
+          </div>
+          <Step>Read today&apos;s headlines, score sentiment -10 to +10</Step>
+          <Connector />
+          <Step>
+            Weighted score: 50% sentiment quality + 20% headline coverage + 30% volume confirmation — partial
+            credit on each, no single weak leg auto-fails it
+          </Step>
+          <Connector />
+          <Step>Still hard gates: price above its 20-day average, hasn&apos;t already jumped &gt;8% today</Step>
+          <Connector />
+          <Outcome tone="gain">Composite score ≥ 0.60 → BUY signal</Outcome>
+        </div>
 
-      {/* loop back */}
-      <path
-        d="M475,625 C 640,625 640,45 475,45"
-        fill="none"
-        stroke="#8592a8"
-        strokeWidth="1.5"
-        strokeDasharray="4 3"
-        markerEnd="url(#arrow)"
-      />
-      <text x="600" y="335" fontSize="10" fill="#8592a8" textAnchor="middle">loops back</text>
+        {/* Path B */}
+        <div className="rounded-xl border border-amber-500/40 bg-amber-500/5 p-3">
+          <div className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-amber-400">
+            <FlaskConical size={13} /> Path B — Technical mean-reversion
+            <span className="ml-auto rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-400">
+              SHADOW MODE
+            </span>
+          </div>
+          <Step>Price above its 200-day average? (confirms a genuine long-term uptrend, not a stock in decline)</Step>
+          <Connector />
+          <Step>2-day RSI at or below 10? (sharply, briefly oversold)</Step>
+          <Connector />
+          <Step>Volume ≥1.3x normal, and news sentiment isn&apos;t actively bearish (above -5)</Step>
+          <Connector />
+          <Outcome tone="amber">All yes → WOULD buy — logged only, no order is placed</Outcome>
+        </div>
+      </div>
 
-      {/* node 1 */}
-      <rect x="200" y="20" width="300" height="50" rx="10" className={box} />
-      <text x="350" y="40" textAnchor="middle" fontSize="13" fill="#e6e9ef">Every 30 minutes</text>
-      <text x="350" y="58" textAnchor="middle" fontSize="13" fill="#e6e9ef">during market hours</text>
+      <Connector />
+      <div className="mx-auto max-w-md rounded-xl border border-bg-border bg-bg-panel2 px-4 py-3 text-center text-sm text-white">
+        Every real buy signal still has to clear the risk rules — position size, sector cap, available cash —
+        before anything is acted on
+      </div>
+      <Connector />
 
-      {/* node 2 */}
-      <rect x="150" y="100" width="400" height="50" rx="10" className={box} />
-      <text x="350" y="120" textAnchor="middle" fontSize="13" fill="#e6e9ef">Read today's news</text>
-      <text x="350" y="138" textAnchor="middle" fontSize="13" fill="#e6e9ef">for each stock it watches</text>
-
-      {/* node 3 */}
-      <rect x="150" y="180" width="400" height="50" rx="10" className={box} />
-      <text x="350" y="200" textAnchor="middle" fontSize="13" fill="#e6e9ef">Score the sentiment</text>
-      <text x="350" y="218" textAnchor="middle" fontSize="13" fill="#e6e9ef">-10 (very bad) to +10 (very good)</text>
-
-      {/* node 4 */}
-      <rect x="150" y="260" width="400" height="50" rx="10" className={box} />
-      <text x="350" y="280" textAnchor="middle" fontSize="13" fill="#e6e9ef">Double-check with</text>
-      <text x="350" y="298" textAnchor="middle" fontSize="13" fill="#e6e9ef">price trend & trading volume</text>
-
-      {/* node 5 */}
-      <rect x="150" y="340" width="400" height="50" rx="10" className={box} />
-      <text x="350" y="360" textAnchor="middle" fontSize="13" fill="#e6e9ef">Apply risk rules:</text>
-      <text x="350" y="378" textAnchor="middle" fontSize="13" fill="#e6e9ef">position size, sector & cash limits</text>
-
-      {/* outcome: sell */}
-      <rect x="35" y="418" width="150" height="62" rx="10" className={outcomeBoxClass("loss")} />
-      <text x="110" y="438" textAnchor="middle" fontSize="12" fill="#e6e9ef">Held it, and</text>
-      <text x="110" y="454" textAnchor="middle" fontSize="12" fill="#e6e9ef">news turned bad</text>
-      <text x="110" y="472" textAnchor="middle" fontSize="13" fontWeight="600" fill="#ef4444">→ SELL</text>
-
-      {/* outcome: hold */}
-      <rect x="275" y="418" width="150" height="62" rx="10" className={outcomeBoxClass("neutral")} />
-      <text x="350" y="438" textAnchor="middle" fontSize="12" fill="#e6e9ef">Mixed evidence, or</text>
-      <text x="350" y="454" textAnchor="middle" fontSize="12" fill="#e6e9ef">a rule blocks it</text>
-      <text x="350" y="472" textAnchor="middle" fontSize="13" fontWeight="600" fill="#8592a8">→ HOLD</text>
-
-      {/* outcome: buy */}
-      <rect x="515" y="418" width="150" height="62" rx="10" className={outcomeBoxClass("gain")} />
-      <text x="590" y="438" textAnchor="middle" fontSize="12" fill="#e6e9ef">Strongly positive</text>
-      <text x="590" y="454" textAnchor="middle" fontSize="12" fill="#e6e9ef">& confirmed</text>
-      <text x="590" y="472" textAnchor="middle" fontSize="13" fontWeight="600" fill="#22c55e">→ BUY</text>
-
-      {/* bracket order box, under buy */}
-      <rect x="490" y="498" width="200" height="57" rx="10" className={box} />
-      <text x="590" y="518" textAnchor="middle" fontSize="12" fill="#e6e9ef">Auto stop-loss -10%</text>
-      <text x="590" y="536" textAnchor="middle" fontSize="12" fill="#e6e9ef">take-profit +20%</text>
-
-      {/* wait node */}
-      <rect x="225" y="600" width="250" height="50" rx="10" className={box} />
-      <text x="350" y="620" textAnchor="middle" fontSize="13" fill="#e6e9ef">Wait for the next cycle</text>
-      <text x="350" y="638" textAnchor="middle" fontSize="13" fill="#e6e9ef">(~30 minutes)</text>
-    </svg>
+      <div className="grid grid-cols-3 gap-3">
+        <div className="flex flex-col items-center gap-1 rounded-lg border border-loss/40 bg-loss/10 px-2 py-2.5 text-xs font-semibold text-loss">
+          <TrendingDown size={14} /> SELL
+        </div>
+        <div className="flex flex-col items-center gap-1 rounded-lg border border-bg-border bg-bg-panel2 px-2 py-2.5 text-xs font-semibold text-muted">
+          <Minus size={14} /> HOLD
+        </div>
+        <div className="flex flex-col items-center gap-1 rounded-lg border border-gain/40 bg-gain/10 px-2 py-2.5 text-xs font-semibold text-gain">
+          <TrendingUp size={14} /> BUY
+        </div>
+      </div>
+      <p className="mt-2 text-center text-[11px] text-muted">
+        Then it waits for the next cycle (~30 minutes) and repeats — nothing carries over except its actual open
+        positions.
+      </p>
+    </div>
   );
 }

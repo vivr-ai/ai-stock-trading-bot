@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     id                  BIGSERIAL PRIMARY KEY,
     ts                  TIMESTAMPTZ NOT NULL DEFAULT now(),
     symbol              TEXT NOT NULL,
-    decision            TEXT NOT NULL,           -- 'buy' | 'sell' | 'hold' | 'buy_skipped' | 'buy_blocked' | 'sell_skipped' | 'scan' | 'block_new_entries' | 'error' | 'reversion_skipped' | 'reversion_shadow_buy'
+    decision            TEXT NOT NULL,           -- 'buy' | 'sell' | 'hold' | 'buy_skipped' | 'buy_blocked' | 'sell_skipped' | 'scan' | 'block_new_entries' | 'error' | 'reversion_skipped' | 'reversion_shadow_buy' | 'reversion_shadow_exit'
     reason              TEXT,                    -- machine reason code, e.g. 'below_sma', 'cooldown'
     sentiment_score     NUMERIC,
     sentiment_label     TEXT,
@@ -72,7 +72,10 @@ CREATE TABLE IF NOT EXISTS decisions (
     sma                 NUMERIC,
     change_pct          NUMERIC,
     volume_ratio        NUMERIC,
-    extra               JSONB,                    -- anything else (sector, dry_run, etc.)
+    extra               JSONB,                    -- anything else (sector, dry_run, etc.); for
+                                                    -- decision='reversion_shadow_exit' holds
+                                                    -- {entry_price, exit_price, pnl_pct, held_days} -
+                                                    -- see SentimentStrategy._maybe_resolve_shadow_position
     entry_path          TEXT                      -- 'sentiment_momentum' | 'mean_reversion' (Strategy v2), null for non-buy/sell decisions
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions (ts DESC);
@@ -421,7 +424,8 @@ INSERT INTO notification_settings (type, channel, enabled, label, description) V
     ('strategy_recommendation', 'daily_summary', true, 'New strategy recommendation', 'Fires when Pattern Discovery or the AI Research Assistant produces a new recommendation for your review - advisory only, never applied automatically.'),
     ('monthly_research_report', 'immediate', true, 'Monthly research report', 'Fires once a month (or whenever you generate one on-demand) with a short performance/pattern-health summary - full detail lives on the Monthly Report dashboard page.'),
     ('bot_paused', 'immediate', true, 'Trading paused', 'Fires when new trading activity is paused (or Emergency Stop is used) from the dashboard. Existing positions keep being managed.'),
-    ('bot_resumed', 'immediate', true, 'Trading resumed', 'Fires when trading is resumed from the dashboard after a pause.')
+    ('bot_resumed', 'immediate', true, 'Trading resumed', 'Fires when trading is resumed from the dashboard after a pause.'),
+    ('shadow_verdict_ready', 'immediate', true, 'Path B shadow data ready for a verdict', 'Fires once, ever, the moment Path B''s shadow round-trip sample crosses the Shadow vs Live page''s rule-of-thumb readiness bar (20+ closed round-trips, 4+ weeks observed).')
 ON CONFLICT (type) DO NOTHING;
 
 -- ---------------------------------------------------------------------

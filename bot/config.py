@@ -505,9 +505,16 @@ def _validate(cfg: Config) -> None:
             f"{weight_sum:.3f}). Adjust STRATEGY_SENTIMENT_WEIGHT / "
             "STRATEGY_HEADLINE_WEIGHT / STRATEGY_VOLUME_WEIGHT."
         )
-    if not (0.0 < cfg.strategy.momentum_buy_score <= 1.5):
+    # The composite score itself can never exceed 1.0 (three components each
+    # capped at 1.0, weights enforced to sum to 1.0 above) - a threshold
+    # above that would validate cleanly but make Path A silently unbuyable
+    # forever, with no error anywhere. Cap the allowed range at the score's
+    # actual ceiling instead of a number that looks plausible but isn't
+    # reachable.
+    if not (0.0 < cfg.strategy.momentum_buy_score <= 1.0):
         raise ValueError(
-            "strategy.momentum_buy_score / STRATEGY_MOMENTUM_BUY_SCORE must be in (0, 1.5]"
+            "strategy.momentum_buy_score / STRATEGY_MOMENTUM_BUY_SCORE must be in (0, 1.0] - "
+            "the weighted composite score it's compared against can never exceed 1.0."
         )
 
     # ---- Strategy v2: Path B mean-reversion ------------------------------

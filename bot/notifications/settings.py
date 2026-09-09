@@ -45,6 +45,7 @@ DEFAULT_CHANNELS: Dict[str, str] = {
     "database_failure": "immediate",
     "scheduler_failure": "immediate",
     "error": "immediate",
+    "shadow_verdict_ready": "immediate",
 }
 
 

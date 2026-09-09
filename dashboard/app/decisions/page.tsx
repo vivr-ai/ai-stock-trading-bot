@@ -3,8 +3,8 @@
 import { useEffect, useMemo, useState } from "react";
 import LoadingSkeleton from "@/components/LoadingSkeleton";
 import ErrorState from "@/components/ErrorState";
-import { explainReason, decisionLabel } from "@/lib/explain";
-import { Search, TrendingUp, TrendingDown, Minus } from "lucide-react";
+import { explainReason, decisionLabel, isShadowDecision } from "@/lib/explain";
+import { Search, TrendingUp, TrendingDown, Minus, FlaskConical } from "lucide-react";
 
 type DecisionRow = {
   id: number;
@@ -17,6 +17,7 @@ type DecisionRow = {
   headline_count: number | null;
   rationale: string | null;
   price: number | null;
+  entry_path: string | null;
   outcome: string | null;
 };
 
@@ -38,6 +39,23 @@ function DecisionBadge({ decision }: { decision: string }) {
     return (
       <span className="inline-flex items-center gap-1 rounded-full bg-loss/15 px-2.5 py-1 text-xs font-medium text-loss">
         <TrendingDown size={12} /> Sell
+      </span>
+    );
+  }
+  // Strategy v2, Path B shadow mode: distinct amber treatment so a "would
+  // have bought/closed" signal never reads as an ordinary Hold - no real
+  // order was placed either way, see the Shadow vs Live page for context.
+  if (label === "Shadow Buy") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-2.5 py-1 text-xs font-medium text-amber-400">
+        <FlaskConical size={12} /> Shadow Buy
+      </span>
+    );
+  }
+  if (label === "Shadow Close") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-2.5 py-1 text-xs font-medium text-amber-400">
+        <FlaskConical size={12} /> Shadow Close
       </span>
     );
   }
@@ -160,7 +178,9 @@ export default function DecisionLogPage() {
                   {d.outcome && (
                     <span
                       className={
-                        d.outcome.startsWith("Closed +")
+                        isShadowDecision(d.decision)
+                          ? "text-amber-400"
+                          : d.outcome.startsWith("Closed +")
                           ? "text-gain"
                           : d.outcome.startsWith("Closed -")
                           ? "text-loss"

@@ -61,3 +61,25 @@ def test_new_confirmation_filter_defaults(monkeypatch, tmp_path):
     assert cfg.strategy.min_volume_ratio == 1.5
     assert cfg.strategy.market_regime_filter_enabled is True
     assert cfg.strategy.market_regime_ma_period == 50
+
+
+def test_momentum_buy_score_above_one_is_rejected(monkeypatch, tmp_path):
+    """Strategy v2's composite score (bot/trading/strategy.py's
+    _evaluate_momentum_path) can never exceed 1.0 - three components each
+    capped at 1.0, weights enforced to sum to 1.0. A threshold above that
+    used to validate cleanly (old bound was <= 1.5) while making Path A
+    silently unbuyable forever, with no error anywhere. Confirms the bound
+    now matches the score's actual ceiling."""
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("STRATEGY_MOMENTUM_BUY_SCORE", "1.2")
+    with pytest.raises(ValueError, match="momentum_buy_score"):
+        load_config(str(tmp_path / "nope.ini"))
+
+
+def test_momentum_buy_score_of_exactly_one_is_allowed(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("STRATEGY_MOMENTUM_BUY_SCORE", "1.0")
+    cfg = load_config(str(tmp_path / "nope.ini"))
+    assert cfg.strategy.momentum_buy_score == 1.0

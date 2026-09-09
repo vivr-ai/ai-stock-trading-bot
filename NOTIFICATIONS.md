@@ -62,6 +62,7 @@ To temporarily silence Telegram without deleting the credentials, set
 | Database failure | `database_failure` | Immediate |
 | Scheduler failure | `scheduler_failure` | Immediate |
 | Critical application errors | `error` | Immediate |
+| Path B shadow data ready for a verdict | `shadow_verdict_ready` | Immediate (fires once, ever) |
 
 "Immediate" means sent to Telegram the moment it happens. Any type can
 instead be set to **daily summary only**, **weekly summary only**, or

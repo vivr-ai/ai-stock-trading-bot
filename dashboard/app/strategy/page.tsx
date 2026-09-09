@@ -1,7 +1,8 @@
+import Link from "next/link";
 import Term from "@/components/Term";
 import ExampleCard from "@/components/ExampleCard";
 import StrategyFlowDiagram from "@/components/StrategyFlowDiagram";
-import { ShieldCheck, Layers, Ban } from "lucide-react";
+import { ShieldCheck, Layers, Ban, FlaskConical, ArrowRight } from "lucide-react";
 
 export const metadata = {
   title: "Trading Strategy",
@@ -32,20 +33,43 @@ export default function StrategyPage() {
           <Term definition="A simulated brokerage account. Orders are real in every way except no real money changes hands, which makes it safe for testing a strategy.">
             paper trading
           </Term>{" "}
-          on Alpaca — meaning every trade you see is simulated, not real money. Its only input is recent news:
-          it reads headlines about a stock, judges whether the news is good or bad, and decides whether to buy,
-          sell, or do nothing. It runs on a fixed schedule, follows the same rules every time, and never trades
-          on emotion, hunches, or headlines it hasn&apos;t actually read.
+          on Alpaca — meaning every trade you see is simulated, not real money. It runs on a fixed schedule,
+          follows the same rules every time, and never trades on emotion, hunches, or headlines it hasn&apos;t
+          actually read.
         </p>
         <p>
+          It looks for two different, independent kinds of opportunity, described in detail below:
+        </p>
+        <ul className="list-disc space-y-2 pl-5">
+          <li>
+            <span className="text-white">Path A — news-driven momentum.</span> React to genuinely good or bad
+            news faster and more consistently than a human could. This is the bot&apos;s original strategy, and
+            the only one currently allowed to place real orders.
+          </li>
+          <li>
+            <span className="text-white">Path B — technical mean-reversion.</span> A newer, second signal that
+            looks for healthy stocks that have dipped sharply in the very short term, independent of the news.
+            It&apos;s currently running in <span className="text-white">shadow mode</span> — see below.
+          </li>
+        </ul>
+        <p>
           The goal isn&apos;t to predict the market perfectly. It&apos;s to react faster and more consistently
-          than a human could to news that moves a stock&apos;s price, while a set of hard risk limits keeps any
-          single bad call from doing much damage.
+          than a human could to genuine signals, while a set of hard risk limits keeps any single bad call from
+          doing much damage.
         </p>
       </Section>
 
       <Section title="How a decision gets made, step by step">
-        <p>Every cycle (roughly every 30 minutes while the US market is open) the bot repeats the same routine:</p>
+        <p>
+          Every cycle (roughly every 30 minutes while the US market is open), for every stock on the watch-list,
+          the bot runs both paths below and combines the result with its risk rules.
+        </p>
+        <div className="pt-1">
+          <StrategyFlowDiagram />
+        </div>
+      </Section>
+
+      <Section title="Path A — news-driven momentum">
         <ol className="list-decimal space-y-2 pl-5">
           <li>
             <span className="text-white">Check overall market health.</span> It looks at a broad market index
@@ -53,53 +77,110 @@ export default function StrategyPage() {
             <Term definition="The average closing price over a recent period (e.g. the last 50 days). Used to judge whether a stock or the market is in a longer-term uptrend or downtrend.">
               moving average
             </Term>
-            , the bot pauses new buys — it will still watch and sell existing positions, but won&apos;t open new
-            ones into a falling market.
+            , the bot pauses new buys on both paths — it will still watch and sell existing positions, but
+            won&apos;t open new ones into a falling market.
           </li>
           <li>
-            <span className="text-white">Read the news.</span> For each stock on the watch-list, it pulls recent
-            headlines. If there aren&apos;t at least a handful of headlines to go on (5 to consider buying, 3 to
-            consider selling), it treats the evidence as too thin and holds off.
-          </li>
-          <li>
-            <span className="text-white">Score the sentiment.</span> The headlines are scored on a scale from
-            -10 (very negative) to +10 (very positive) — this is the bot&apos;s{" "}
+            <span className="text-white">Read the news, score the sentiment.</span> For each stock, it pulls
+            recent headlines and scores them from -10 (very negative) to +10 (very positive) — the bot&apos;s{" "}
             <Term definition="A number from -10 to +10 summarizing how positive or negative the recent news coverage is for a stock. Positive scores lean toward buying, negative scores lean toward selling.">
               sentiment score
             </Term>
             .
           </li>
           <li>
-            <span className="text-white">Confirm with price and volume.</span> A good news score alone isn&apos;t
-            enough. The bot also checks the stock is trading above its own 20-day moving average (confirming the
-            trend agrees) and that today&apos;s trading{" "}
-            <Term definition="Today's trading volume compared to the recent 20-day average. A ratio above 1.0 means more shares are trading hands than usual - a sign the market has genuinely noticed the news.">
-              volume ratio
-            </Term>{" "}
-            is at least 1.5x the recent average, meaning real trading interest backs up the news, not just a
-            quiet, thinly-traded blip. It also avoids chasing a stock that has already jumped more than 8% today.
+            <span className="text-white">Combine three signals into one weighted score</span> — this is the
+            main change from the bot&apos;s original rules. Instead of requiring every box to be ticked before
+            it would even consider buying, three things each earn partial credit toward one composite score out
+            of 1.0:
+            <ul className="mt-2 list-disc space-y-1.5 pl-5">
+              <li><span className="text-white">Sentiment quality (50% of the score).</span> How strongly positive the news is.</li>
+              <li>
+                <span className="text-white">Headline coverage (20% of the score).</span> How many articles back
+                it up, up to 5 headlines for full credit.
+              </li>
+              <li>
+                <span className="text-white">Volume confirmation (30% of the score).</span> Today&apos;s{" "}
+                <Term definition="Today's trading volume compared to how much volume is normally expected by this point in the trading session, based on the recent 20-day average. Above 1.0x means more shares are trading hands than usual for this time of day - a sign the market has genuinely noticed the news.">
+                  volume ratio
+                </Term>
+                , up to 1.5x normal for full credit.
+              </li>
+            </ul>
+            A stock needs a combined score of at least 0.60 to buy — so a strong, well-covered story with only
+            so-so volume can still clear the bar, where the old all-or-nothing rule would have blocked it on
+            that one weak leg alone.
           </li>
           <li>
-            <span className="text-white">Apply the risk rules.</span> Even a strong buy signal can be blocked —
-            by position size limits, sector limits, available cash, or a cooldown on a stock recently traded (see
-            below).
+            <span className="text-white">Two checks still can&apos;t be bought around.</span> No matter how high
+            the score, the bot won&apos;t buy a stock that&apos;s already up more than 8% today (the good news is
+            probably priced in already), or one trading below its own 20-day moving average (the price hasn&apos;t
+            confirmed the story yet).
           </li>
           <li>
-            <span className="text-white">Act.</span> If everything lines up, the bot places a real (paper) order.
-            A buy automatically comes with a stop-loss and take-profit already attached. Otherwise it holds.
-          </li>
-          <li>
-            <span className="text-white">Wait, then repeat.</span> The whole routine runs again next cycle,
-            independently — nothing carries over except its actual open positions.
+            <span className="text-white">Apply the risk rules, then act.</span> Even a strong buy signal can
+            still be blocked — by position size limits, sector limits, available cash, or a cooldown on a stock
+            recently traded (see below). If everything lines up, the bot places a real (paper) order with a
+            stop-loss and take-profit attached immediately.
           </li>
         </ol>
-        <div className="pt-2">
-          <StrategyFlowDiagram />
+      </Section>
+
+      <Section title="Path B — technical mean-reversion (RSI-2)">
+        <div className="mb-3 flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-amber-200">
+          <FlaskConical size={16} className="mt-0.5 shrink-0 text-amber-400" />
+          <p className="text-xs leading-relaxed">
+            <span className="font-semibold text-amber-400">Currently in shadow mode.</span> The bot evaluates
+            this signal every cycle and logs exactly what it would have bought and why, but it does not place
+            any order. No paper money is on the line for Path B yet — it&apos;s being observed first. Flipping
+            it on to trade for real is a deliberate, separate configuration change.
+          </p>
         </div>
+        <p>
+          This is a different idea from Path A: rather than reacting to news, it looks for a stock that&apos;s
+          genuinely healthy on a long time horizon but has dropped sharply in the very short term — a classic
+          oversold bounce setup (the style popularised by trader Larry Connors&apos; RSI-2 system). All of the
+          following have to be true at once:
+        </p>
+        <ul className="list-disc space-y-2 pl-5">
+          <li>
+            <span className="text-white">Long-term uptrend confirmed.</span> The price is above its own 200-day
+            moving average — this filters out stocks that are simply in genuine decline.
+          </li>
+          <li>
+            <span className="text-white">Sharply, briefly oversold.</span> Its{" "}
+            <Term definition="Relative Strength Index over a 2-day window: a 0-100 reading of how fast and how far a stock has fallen in the very short term. Below 10 is an extreme, short-lived oversold reading; above 65 suggests the bounce has largely played out.">
+              2-day RSI
+            </Term>{" "}
+            reads 10 or below.
+          </li>
+          <li>
+            <span className="text-white">Volume-confirmed.</span> Today&apos;s trading volume is at least 1.3x
+            the normal amount expected by this point in the session — a sign of real capitulation buying, not a
+            quiet drift lower on thin volume.
+          </li>
+          <li>
+            <span className="text-white">Not vetoed by bad news.</span> If the sentiment score is -5 or worse,
+            the dip is skipped — that&apos;s more likely a real bad-news story than a technical bounce worth
+            buying.
+          </li>
+        </ul>
+        <p>
+          If it ever goes live, a Path B position would exit on its own rule too — once RSI climbs back above
+          65 (the bounce has largely played out) or after 5 days if it hasn&apos;t reverted by then — rather than
+          the sentiment-exit rule below, though the same stop-loss and take-profit safety net would still apply
+          underneath it.
+        </p>
+        <Link
+          href="/shadow-comparison"
+          className="inline-flex items-center gap-1.5 text-sm font-medium text-amber-400 hover:text-amber-300"
+        >
+          See how Path B&apos;s shadow signals compare to what actually traded <ArrowRight size={14} />
+        </Link>
       </Section>
 
       <Section title="Risk management rules">
-        <p>These limits exist to make sure no single stock, sector, or bad day can do outsized damage:</p>
+        <p>These limits exist to make sure no single stock, sector, or bad day can do outsized damage — they apply to every position, regardless of which path opened it:</p>
         <ul className="list-disc space-y-2 pl-5">
           <li>
             <span className="text-white">Stop-loss at -10%.</span> Every position automatically sells if it
@@ -110,9 +191,9 @@ export default function StrategyPage() {
             gains 20%, locking in the win rather than hoping for more.
           </li>
           <li>
-            <span className="text-white">Sentiment-driven exit at -5.</span> Independent of price, if the news
-            sentiment on a stock the bot holds turns sharply negative (score of -5 or worse), it can sell early —
-            it doesn&apos;t need to wait for the stop-loss to be hit.
+            <span className="text-white">Sentiment-driven exit at -5 (Path A positions).</span> Independent of
+            price, if the news sentiment on a stock the bot holds turns sharply negative (score of -5 or worse),
+            it can sell early — it doesn&apos;t need to wait for the stop-loss to be hit.
           </li>
           <li>
             <span className="text-white">Daily loss limit of 4%.</span> If the whole portfolio drops 4% in a
@@ -129,8 +210,9 @@ export default function StrategyPage() {
             After selling a stock, the bot won&apos;t buy it back for 24 hours, avoiding rapid flip-flopping.
           </li>
           <li>
-            <span className="text-white">Market regime filter.</span> New buys pause when the broader market
-            (SPY) is down more than 2% on the day or below its 50-day average — described in step 1 above.
+            <span className="text-white">Market regime filter.</span> New buys pause on both paths when the
+            broader market (SPY) is down more than 2% on the day or below its 50-day average — described in
+            step 1 of Path A above.
           </li>
         </ul>
       </Section>
@@ -183,22 +265,31 @@ export default function StrategyPage() {
       </Section>
 
       <Section title="Worked examples">
-        <div className="grid gap-3 md:grid-cols-3">
-          <ExampleCard type="buy" title="Positive earnings coverage">
-            A stock has 9 fresh headlines about a strong earnings beat. Sentiment scores +8.2. It&apos;s trading
-            above its 20-day average with 1.8x normal volume. Cash is available, the sector isn&apos;t already at
-            its limit, and the market overall is calm. The bot buys, and a -10% stop-loss and +20% take-profit
-            are attached immediately.
+        <div className="grid gap-3 md:grid-cols-2">
+          <ExampleCard type="buy" title="Path A: good-enough beats perfect">
+            A stock has 9 fresh headlines about a strong earnings beat (sentiment +6.0) — solid, but below the
+            old hard cutoff of +8. Volume is a modest 1.4x. Under the old all-or-nothing rule, this sentiment
+            score alone would have blocked the trade outright. Under the composite score, sentiment contributes
+            0.30 (60% credit at 50% weight), headlines contribute the full 0.20 (9 headlines clears the 5-headline
+            bar), and volume contributes 0.28 (93% credit at 30% weight) — a total of about 0.78, comfortably
+            above the 0.60 bar. The bot buys, with a -10% stop-loss and +20% take-profit attached immediately.
           </ExampleCard>
-          <ExampleCard type="sell" title="Sentiment sours on a held position">
-            The bot holds a stock bought two weeks ago. New headlines about a product recall push sentiment to
-            -6.5. The price hasn&apos;t yet dropped 10%, but because the sentiment rule (-5 threshold) is
-            triggered independently, the bot sells early rather than waiting for the stop-loss.
+          <ExampleCard type="sell" title="Path A: sentiment sours on a held position">
+            The bot holds a stock bought two weeks ago on a momentum signal. New headlines about a product
+            recall push sentiment to -6.5. The price hasn&apos;t yet dropped 10%, but because the sentiment rule
+            (-5 threshold) is triggered independently, the bot sells early rather than waiting for the stop-loss.
+          </ExampleCard>
+          <ExampleCard type="hold" title="Path B: an oversold dip, logged not bought">
+            A stock trading well above its 200-day average drops sharply over two days — RSI(2) reads 4.1, deep
+            oversold territory — on 1.8x normal volume, with no particularly bad news behind it (sentiment
+            -1.5, above the -5 veto). Every Path B condition is met. Because Path B is in shadow mode, the bot
+            logs &quot;would BUY (reversion)&quot; with its full reasoning, but places no order — it&apos;s
+            recorded for later review, not traded.
           </ExampleCard>
           <ExampleCard type="hold" title="Not enough to go on">
             A stock has only 2 headlines today, and they&apos;re mildly positive. That&apos;s below the minimum
-            of 5 headlines the bot requires before acting on a buy signal. Evidence is too thin, so the bot holds
-            and waits for the next cycle.
+            of 5 headlines needed for full credit, and its price is flat, so its composite score falls well
+            short of 0.60. Evidence is too thin either way, so the bot holds and waits for the next cycle.
           </ExampleCard>
         </div>
       </Section>

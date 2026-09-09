@@ -51,6 +51,14 @@ from ..universe.static_universe import sector_of
 
 logger = logging.getLogger(__name__)
 
+# Rule-of-thumb bar for "enough shadow data to form a view on Path B" - kept
+# in sync BY HAND with the dashboard's own copy of these same two numbers
+# (dashboard/app/shadow-comparison/page.tsx's MIN_CLOSED_FOR_A_READ /
+# MIN_WEEKS_FOR_A_READ). There's no shared config surface between the Python
+# bot and the TypeScript dashboard, so if one changes, change the other too.
+SHADOW_VERDICT_MIN_CLOSED = 20
+SHADOW_VERDICT_MIN_WEEKS = 4.0
+
 
 @dataclass
 class CycleStats:
@@ -292,6 +300,8 @@ class SentimentStrategy:
             except Exception as exc:  # noqa: BLE001 - isolate per-symbol failures
                 logger.exception("Error processing %s: %s", symbol, exc,
                                  extra={"symbol": symbol, "decision": "error"})
+
+        self._maybe_notify_shadow_verdict_ready()
 
         self.summary_logger.log_cycle(
             portfolio_value=acct["portfolio_value"],
@@ -681,6 +691,19 @@ class SentimentStrategy:
             rationale=sentiment.rationale,
         )
 
+        # Strategy v2, Path B shadow-position lifecycle: resolve an open
+        # shadow signal (if any) BEFORE the holding/not-holding branch below,
+        # and regardless of new_entries_allowed/pause - a hypothetical
+        # position that's already "open" needs its exit checked every cycle
+        # the same way a real mean-reversion holding does, whether or not
+        # this cycle would otherwise allow a new entry. Runs whether or not
+        # this bot also holds `symbol` for real via Path A; the two are
+        # tracked independently. Cheap no-op (one has_open check, no market
+        # data call) for the overwhelming majority of symbols that have no
+        # open shadow position.
+        if self.cfg.strategy.reversion_enabled and not self.cfg.strategy.reversion_live:
+            self._maybe_resolve_shadow_position(symbol)
+
         holding = symbol in open_positions and open_positions[symbol] != 0
 
         # ---- SELL / holding management ----
@@ -796,7 +819,14 @@ class SentimentStrategy:
                                         sector_counts, stats, market_regime,
                                         entry_path="mean_reversion", reason=reversion_reason)
                 # Shadow mode (default): log what Path B WOULD have bought,
-                # place no order. See StrategyConfig.reversion_live.
+                # place no order. See StrategyConfig.reversion_live. Don't
+                # log a second shadow "open" while one is already tracked
+                # for this symbol (_maybe_resolve_shadow_position, called
+                # earlier this cycle, already re-checked the existing one's
+                # exit condition) - otherwise the Shadow vs Live view would
+                # see two overlapping open positions for the same symbol.
+                if self.recorder.get_open_shadow_position(symbol) is not None:
+                    return exposure
                 logger.info(
                     "[SHADOW] BUY %s (reversion) would fire: %s - reversion_live=False, "
                     "no order placed", symbol, reversion_reason,
@@ -987,6 +1017,120 @@ class SentimentStrategy:
             if held_days >= cfg.reversion_max_hold_days:
                 return f"max hold of {cfg.reversion_max_hold_days} day(s) reached ({held_days:.1f}d)"
         return None
+
+    def _maybe_resolve_shadow_position(self, symbol: str) -> None:
+        """Strategy v2, Path B, shadow mode: if a hypothetical reversion
+        position is currently "open" for `symbol` (a 'reversion_shadow_buy'
+        decision with no later 'reversion_shadow_exit' - see
+        Recorder.get_open_shadow_position), re-check the same RSI-recovery/
+        max-hold exit rule a REAL mean-reversion holding uses, and log a
+        'reversion_shadow_exit' decision with the simulated P/L if it would
+        have fired.
+
+        This is what gives the dashboard's Shadow vs Live comparison durable,
+        resolved round-trips to analyze instead of an ever-growing pile of
+        re-firing 'would buy' signals for positions that, in reality, would
+        eventually have been closed one way or another. Entirely
+        observational: never touches open_positions, exposure, risk, or any
+        real order - a failure here (DB unreachable, snapshot fetch fails)
+        just means this symbol's shadow exit gets re-checked next cycle,
+        same fail-open posture as every other best-effort recorder path in
+        this module."""
+        try:
+            open_shadow = self.recorder.get_open_shadow_position(symbol)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Shadow-position lookup failed for %s: %s", symbol, exc)
+            return
+        if open_shadow is None:
+            return
+
+        snap = self.broker.market_snapshot(
+            symbol, sma_period=self.cfg.strategy.sma_period,
+            volume_lookback_days=self.cfg.strategy.volume_lookback_days,
+            session_tz=self.cfg.schedule.market_timezone,
+            rsi_period=self.cfg.strategy.rsi_period,
+        )
+        entry_ts = open_shadow.get("ts")
+        entry_epoch = entry_ts.timestamp() if entry_ts is not None else None
+        lot = {"entry_time": entry_epoch}
+        exit_reason = self._reversion_exit_reason(snap, lot)
+        if not exit_reason:
+            return
+
+        entry_price = open_shadow.get("price")
+        exit_price = snap.last if snap is not None else None
+        if entry_price is None or exit_price is None:
+            logger.warning(
+                "Shadow exit for %s fired (%s) but entry or exit price is missing "
+                "(entry=%s, exit=%s); leaving the position open for a later cycle "
+                "rather than logging an exit with no P/L.",
+                symbol, exit_reason, entry_price, exit_price,
+            )
+            return
+        entry_price = float(entry_price)
+        held_days = (time.time() - entry_epoch) / 86400.0 if entry_epoch else None
+        pnl_pct = (exit_price - entry_price) / entry_price * 100.0 if entry_price else 0.0
+
+        logger.info(
+            "[SHADOW] CLOSE %s (reversion): %s - entry=%.2f exit=%.2f pnl_pct=%.2f%%",
+            symbol, exit_reason, entry_price, exit_price, pnl_pct,
+            extra={"symbol": symbol, "decision": "reversion_shadow_exit", "reason": exit_reason,
+                   "entry_price": entry_price, "exit_price": exit_price, "pnl_pct": pnl_pct},
+        )
+        self.recorder.record_decision(
+            symbol=symbol, decision="reversion_shadow_exit", reason=exit_reason,
+            price=exit_price, entry_path="mean_reversion",
+            extra={
+                "entry_price": entry_price, "exit_price": exit_price, "pnl_pct": pnl_pct,
+                "held_days": held_days,
+            },
+        )
+
+    def _maybe_notify_shadow_verdict_ready(self) -> None:
+        """One-time alert the moment Path B's shadow sample crosses the same
+        rule-of-thumb readiness bar the dashboard's Shadow vs Live page shows
+        (SHADOW_VERDICT_MIN_CLOSED closed round-trips and
+        SHADOW_VERDICT_MIN_WEEKS weeks observed, module-level above) - so
+        there's no need to remember to go check that page; the news comes to
+        you (Telegram, if configured - see bot/notifications/, or the
+        dashboard's Notifications Centre either way).
+
+        Only meaningful while Path B is still shadow-only; skipped entirely
+        once it's live. Fires at most once ever, via Recorder.has_ever_notified's
+        durable DB-backed guard - deliberately NOT the in-memory
+        one-per-day-style guards this class uses elsewhere
+        (_daily_loss_notified_date etc.), since those reset on every Railway
+        redeploy and would re-announce "ready" indefinitely once the
+        threshold is first crossed. Fails silent on any lookup error, same
+        posture as every other best-effort Recorder integration point in
+        this module - the next cycle just tries again."""
+        if not (self.cfg.strategy.reversion_enabled and not self.cfg.strategy.reversion_live):
+            return
+        try:
+            if self.recorder.has_ever_notified("shadow_verdict_ready"):
+                return
+            progress = self.recorder.get_shadow_verdict_progress()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Shadow-verdict-readiness check failed: %s", exc)
+            return
+        if not progress or not progress.get("since_ts"):
+            return
+        closed_count = progress["closed_count"]
+        weeks_observed = (
+            (datetime.now(timezone.utc) - progress["since_ts"]).total_seconds() / (7 * 86400.0)
+        )
+        if closed_count < SHADOW_VERDICT_MIN_CLOSED or weeks_observed < SHADOW_VERDICT_MIN_WEEKS:
+            return
+        self.recorder.record_notification(
+            type_="shadow_verdict_ready", severity="info",
+            title="Path B shadow data ready for a verdict",
+            message=(
+                f"{closed_count} closed shadow round-trips over {weeks_observed:.1f} weeks - "
+                "enough to start forming a view on Path B (mean-reversion). "
+                "Check the Shadow vs Live page on the dashboard for the full breakdown."
+            ),
+            metadata={"closed_count": closed_count, "weeks_observed": round(weeks_observed, 1)},
+        )
 
     def _do_buy(self, symbol, sentiment, price, acct, exposure, open_positions,
                 sector_counts, stats, market_regime=None,
