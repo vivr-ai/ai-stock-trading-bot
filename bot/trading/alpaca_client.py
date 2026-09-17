@@ -2,11 +2,14 @@
 
 Every call that hits the network goes through bot.utils.retry.call_with_retry
 (exponential backoff + jitter, configurable attempts). Read-path methods
-(is_market_open, latest_price, market_snapshot, etc.) degrade to a safe value
-(None / False / empty) when retries are exhausted rather than raising, so one
-flaky call slows a cycle but never crashes it. Methods that place or cancel
-orders re-raise after exhausting retries, since silently swallowing an order
-failure is worse than surfacing it.
+(latest_price, market_snapshot, etc.) degrade to a safe value (None / empty)
+when retries are exhausted rather than raising, so one flaky call slows a
+cycle but never crashes it. is_market_open is the one exception: instead of
+degrading to a hardcoded value, it falls back to a local weekday/hours check
+(_local_market_open_fallback) so an Alpaca clock-endpoint outage doesn't get
+mistaken for a closed market - see is_market_open's docstring/comments.
+Methods that place or cancel orders re-raise after exhausting retries, since
+silently swallowing an order failure is worse than surfacing it.
 
 Docs: https://alpaca.markets/sdks/python/
 """
@@ -14,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set
 
 from ..utils.retry import call_with_retry
@@ -37,6 +40,56 @@ _SESSION_CLOSE_HOUR, _SESSION_CLOSE_MINUTE = 16, 0
 # enough that "confirmed" shouldn't be easy to claim in the first few
 # minutes anyway.
 _MIN_SESSION_FRACTION = 0.05
+
+# Static NYSE/Nasdaq full-market-holiday list, used ONLY by
+# _local_market_open_fallback below (i.e. only when Alpaca's own /v2/clock
+# endpoint is unreachable after retries - see is_market_open). Best-effort
+# and hand-maintained on purpose, same simplicity trade-off as
+# _SESSION_OPEN_HOUR/_SESSION_CLOSE_HOUR above: a missing/wrong entry only
+# matters in the narrow window where BOTH this list is stale/wrong AND
+# Alpaca's clock endpoint is simultaneously down, which the fallback would
+# then misjudge as a normal trading day. That's still strictly better than
+# the old behaviour of unconditionally treating every clock-endpoint error as
+# "market closed", which silently cost real scan cycles during ordinary
+# trading hours (e.g. 2026-09-11: two cycles skipped over a transient Alpaca
+# 500 on /v2/clock, even though the market was open both times).
+# Update this list once a year; https://www.nyse.com/markets/hours-calendars
+_NYSE_HOLIDAYS_ET: Set[date] = {
+    date(2026, 1, 1),    # New Year's Day
+    date(2026, 1, 19),   # Martin Luther King Jr. Day
+    date(2026, 2, 16),   # Washington's Birthday (Presidents' Day)
+    date(2026, 4, 3),    # Good Friday
+    date(2026, 5, 25),   # Memorial Day
+    date(2026, 6, 19),   # Juneteenth
+    date(2026, 7, 3),    # Independence Day (observed - Jul 4 is a Saturday)
+    date(2026, 9, 7),    # Labor Day
+    date(2026, 11, 26),  # Thanksgiving
+    date(2026, 12, 25),  # Christmas
+}
+
+
+def _local_market_open_fallback(tz_name: str = "America/New_York") -> bool:
+    """Best-effort "is it regular trading hours right now" check with no
+    network dependency at all - used ONLY as a fallback inside
+    is_market_open() when Alpaca's own clock endpoint can't be reached after
+    retries. Weekday + 9:30am-4:00pm ET + not in _NYSE_HOLIDAYS_ET; ignores
+    early-close days, same as _session_elapsed_fraction above. Deliberately
+    NOT the default path - real market data used everywhere else in this
+    module still goes through Alpaca; this only exists so one flaky Alpaca
+    endpoint doesn't make the bot blind to genuinely open trading hours.
+    """
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(tz_name))
+    if now.weekday() >= 5:  # Saturday/Sunday
+        return False
+    if now.date() in _NYSE_HOLIDAYS_ET:
+        return False
+    session_open = now.replace(hour=_SESSION_OPEN_HOUR, minute=_SESSION_OPEN_MINUTE,
+                               second=0, microsecond=0)
+    session_close = now.replace(hour=_SESSION_CLOSE_HOUR, minute=_SESSION_CLOSE_MINUTE,
+                                second=0, microsecond=0)
+    return session_open <= now <= session_close
 
 
 def _compute_rsi(closes: List[float], period: int) -> Optional[float]:
@@ -196,6 +249,13 @@ class AlpacaBroker:
         self._data = StockHistoricalDataClient(api_key, secret_key)
         self._retry_attempts = retry_attempts
         self._retry_base_delay = retry_base_delay
+        # Set by is_market_open() on every call: True when the last call had
+        # to fall back to _local_market_open_fallback because Alpaca's clock
+        # endpoint was unreachable. Callers (see SentimentStrategy.run_cycle)
+        # use this to fire a one-time "broker_issue" alert on the transition
+        # into/out of degraded mode, rather than trusting logs alone to
+        # surface it.
+        self.last_clock_degraded: bool = False
         logger.info(
             "AlpacaBroker initialized: mode=%s (%s account), order submission %s",
             mode, "paper" if self.connects_to_paper else "LIVE",
@@ -211,10 +271,31 @@ class AlpacaBroker:
     # ---- account / market state (retried; degrade to a safe default) -------
     def is_market_open(self) -> bool:
         try:
-            return bool(self._retry(self._trading.get_clock, "get_clock").is_open)
+            is_open = bool(self._retry(self._trading.get_clock, "get_clock").is_open)
+            self.last_clock_degraded = False
+            return is_open
         except Exception as exc:  # noqa: BLE001
             logger.error("Could not fetch market clock: %s", exc)
-            return False  # fail-safe: treat as closed, do nothing
+            self.last_clock_degraded = True
+            # Previously this unconditionally returned False here ("fail-safe:
+            # treat as closed, do nothing"), which sounds conservative but
+            # actually means a transient Alpaca clock-endpoint outage silently
+            # cancels real scan cycles during normal trading hours - see
+            # 2026-09-11, where two 30-min cycles were skipped over a
+            # passing Alpaca 500 even though the market was open both times.
+            # A local weekday/hours check (no network call, so it can't be
+            # affected by the same outage) is strictly more accurate than
+            # always assuming "closed", so use that instead; it only defers
+            # to "closed" itself on weekends/known holidays or outside
+            # 9:30-4:00 ET.
+            fallback_open = _local_market_open_fallback()
+            logger.warning(
+                "Alpaca clock unreachable; falling back to local weekday/hours "
+                "check (America/New_York, static holiday list) instead of "
+                "assuming closed: market_open=%s",
+                fallback_open,
+            )
+            return fallback_open
 
     def account_snapshot(self) -> Dict[str, float]:
         """One call returns everything the cycle needs, with retries.

@@ -120,9 +120,17 @@ class SentimentStrategy:
         # notification fires once per state CHANGE, not every cycle while
         # paused (or every cycle once resumed).
         self._last_known_paused: bool = False
+        # Same one-per-CHANGE pattern for AlpacaBroker.last_clock_degraded
+        # (see alpaca_client.py's is_market_open): fires a "broker_issue"
+        # alert once when Alpaca's clock endpoint starts failing over to the
+        # local fallback, and a recovery note once it stops, instead of
+        # spamming Telegram every 30 min while degraded.
+        self._last_clock_degraded: bool = False
 
     def run_cycle(self, force: bool = False, scheduler_status: str = "scheduled") -> None:
-        if not force and not self.broker.is_market_open():
+        market_open = self.broker.is_market_open()
+        self._maybe_notify_clock_degraded()
+        if not force and not market_open:
             logger.info("Market closed; skipping cycle.")
             self.recorder.record_heartbeat(
                 status="running", scheduler_status=scheduler_status, market_open=False,
@@ -393,6 +401,37 @@ class SentimentStrategy:
             type_="pdt_warning", severity=severity, title=title,
             message=f"{detail} mode={self.cfg.trading.mode} equity={equity}",
         )
+
+    def _maybe_notify_clock_degraded(self) -> None:
+        """Alert once when AlpacaBroker.is_market_open() has to fall back to
+        the local weekday/hours check because Alpaca's own /v2/clock
+        endpoint is unreachable (see alpaca_client.py), and once more when it
+        recovers - same one-per-state-CHANGE pattern as
+        bot_paused/bot_resumed below, so this doesn't spam Telegram every
+        30-min cycle for as long as the outage lasts. Uses the existing
+        "broker_issue" notification type (see bot/notifications/settings.py)
+        so it's grouped with other broker-connectivity alerts and honors
+        whatever channel the dashboard has configured for that type."""
+        degraded = getattr(self.broker, "last_clock_degraded", False)
+        if degraded and not self._last_clock_degraded:
+            self._last_clock_degraded = True
+            self.recorder.record_notification(
+                type_="broker_issue", severity="warning",
+                title="Alpaca market-clock check failing",
+                message=(
+                    "Could not fetch the market clock from Alpaca after retries; "
+                    "falling back to a local weekday/hours check instead of "
+                    "assuming the market is closed, so scan cycles continue "
+                    "during real trading hours. See deploy logs for the "
+                    "underlying Alpaca error."
+                ),
+            )
+        elif not degraded and self._last_clock_degraded:
+            self._last_clock_degraded = False
+            self.recorder.record_notification(
+                type_="broker_issue", severity="info",
+                title="Alpaca market-clock check recovered",
+            )
 
     def _sync_open_positions_snapshot(self, portfolio_value) -> None:
         """Push the full current book (with unrealized P/L straight from
