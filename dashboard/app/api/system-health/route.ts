@@ -44,6 +44,136 @@ function minutesAgo(ts: string | null): number | null {
   return (Date.now() - new Date(ts).getTime()) / 60000;
 }
 
+const RAILWAY_API_URL = "https://backboard.railway.com/graphql/v2";
+const RAILWAY_REQUEST_TIMEOUT_MS = 8000;
+
+type RailwayServiceStatus = {
+  id: string;
+  name: string;
+  status: string | null; // raw Railway DeploymentStatus enum value, e.g. "SUCCESS", "BUILDING"
+  deploymentId: string | null;
+  updatedAt: string | null;
+};
+
+type RailwaySnapshot =
+  | { configured: false; error?: undefined; services?: undefined }
+  | { configured: true; error: string; services?: undefined }
+  | { configured: true; error?: undefined; services: RailwayServiceStatus[] };
+
+// Live per-service deploy/build status straight from Railway's public
+// GraphQL API. RAILWAY_PROJECT_ID and RAILWAY_ENVIRONMENT_ID are injected
+// automatically into this service's own runtime by Railway - the only
+// manual setup is generating a token (railway.com/account/tokens, an
+// "Account" or "Workspace" token both work) and setting it as
+// RAILWAY_API_TOKEN on this dashboard service. Walking the whole project's
+// services (rather than hardcoding this bot's two service IDs) means it
+// keeps working unchanged if a service is renamed or a new one is added.
+async function getRailwayStatus(): Promise<RailwaySnapshot> {
+  const token = process.env.RAILWAY_API_TOKEN;
+  const projectId = process.env.RAILWAY_PROJECT_ID;
+  const environmentId = process.env.RAILWAY_ENVIRONMENT_ID;
+
+  if (!token || !projectId || !environmentId) {
+    // Deliberately not an error: this is an intentionally-optional feature.
+    // projectId/environmentId missing almost always just means we're
+    // running outside Railway (e.g. local dev), not a misconfiguration.
+    return { configured: false };
+  }
+
+  const query = `
+    query railwaySnapshot($projectId: String!) {
+      project(id: $projectId) {
+        services {
+          edges {
+            node {
+              id
+              name
+              serviceInstances {
+                edges {
+                  node {
+                    environmentId
+                    latestDeployment {
+                      id
+                      status
+                      updatedAt
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), RAILWAY_REQUEST_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(RAILWAY_API_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ query, variables: { projectId } }),
+      signal: controller.signal,
+      cache: "no-store",
+    });
+
+    const json = await res.json();
+
+    if (json?.errors?.length) {
+      const message = json.errors[0]?.message ?? "Railway API request failed";
+      // A denied/expired token surfaces here as a normal 200 + errors array
+      // (see Railway's GraphQL error convention), not an HTTP error status.
+      return { configured: true, error: message };
+    }
+
+    type ServiceEdge = {
+      node: {
+        id: string;
+        name: string;
+        serviceInstances?: {
+          edges?: Array<{
+            node?: {
+              environmentId?: string | null;
+              latestDeployment?: { id?: string; status?: string; updatedAt?: string } | null;
+            };
+          }>;
+        };
+      };
+    };
+    const edges: ServiceEdge[] = json?.data?.project?.services?.edges ?? [];
+
+    const services: RailwayServiceStatus[] = edges.map(({ node }) => {
+      const instance = (node.serviceInstances?.edges ?? []).find(
+        (e) => e.node?.environmentId === environmentId
+      )?.node;
+      return {
+        id: node.id,
+        name: node.name,
+        status: instance?.latestDeployment?.status ?? null,
+        deploymentId: instance?.latestDeployment?.id ?? null,
+        updatedAt: instance?.latestDeployment?.updatedAt ?? null,
+      };
+    });
+
+    return { configured: true, services };
+  } catch (err) {
+    const message =
+      err instanceof Error
+        ? err.name === "AbortError"
+          ? "Railway API request timed out"
+          : err.message
+        : "Railway API request failed";
+    return { configured: true, error: message };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export async function GET() {
   const session = await getServerSession(authOptions);
   if (!session) {
@@ -52,6 +182,11 @@ export async function GET() {
 
   const dbCallStarted = Date.now();
   try {
+    // Kicked off alongside the DB batch below (not awaited until the very
+    // end) so a slow Railway API response doesn't add its full latency on
+    // top of the DB round-trip - the two happen concurrently.
+    const railwayPromise = getRailwayStatus();
+
     const [heartbeat, lastFullHeartbeat, lastScan, lastDeploy, lastBrokerIssue, lastSchedulerFailure, lastDbFailure] =
       await Promise.all([
         queryOne<Heartbeat>(
@@ -93,6 +228,7 @@ export async function GET() {
         ),
       ]);
     const dbLatencyMs = Date.now() - dbCallStarted;
+    const railway = await railwayPromise;
 
     const heartbeatAgeMinutes = minutesAgo(heartbeat?.ts ?? null);
     const heartbeatStale =
@@ -174,13 +310,7 @@ export async function GET() {
         deployedAt: lastDeploy?.metadata?.deployed_at ?? lastDeploy?.ts ?? null,
         appVersion: lastDeploy?.metadata?.commit_short ?? null,
       },
-      railway: {
-        // Requires a Railway API token, which isn't configured yet - see
-        // NOTIFICATIONS.md / dashboard README for how to add it later.
-        // Deliberately not an error: this is an intentionally-unconfigured
-        // optional feature, not a failure.
-        configured: false,
-      },
+      railway,
     });
   } catch (err) {
     console.error("GET /api/system-health failed", err);

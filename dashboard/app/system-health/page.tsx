@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import StatCard from "@/components/StatCard";
-import StatusBadge from "@/components/StatusBadge";
+import StatusBadge, { Status } from "@/components/StatusBadge";
 import LoadingSkeleton from "@/components/LoadingSkeleton";
 import ErrorState from "@/components/ErrorState";
 import { timeAgo } from "@/lib/format";
@@ -56,8 +56,51 @@ type SystemHealthResponse = {
     deployedAt: string | null;
     appVersion: string | null;
   };
-  railway: { configured: boolean };
+  railway:
+    | { configured: false }
+    | { configured: true; error: string; services?: undefined }
+    | {
+        configured: true;
+        error?: undefined;
+        services: Array<{
+          id: string;
+          name: string;
+          status: string | null;
+          deploymentId: string | null;
+          updatedAt: string | null;
+        }>;
+      };
 };
+
+// Maps Railway's DeploymentStatus enum to this dashboard's own badge tones.
+// See https://docs.railway.com/integrations/api/manage-deployments#deployment-statuses
+function railwayStatusBadge(status: string | null): Status {
+  switch (status) {
+    case "SUCCESS":
+      return "running";
+    case "BUILDING":
+    case "DEPLOYING":
+    case "QUEUED":
+    case "WAITING":
+      return "building";
+    case "FAILED":
+    case "CRASHED":
+      return "error";
+    case "SLEEPING":
+      return "paused";
+    case "REMOVED":
+    case "SKIPPED":
+      return "stopped";
+    default:
+      return "unknown";
+  }
+}
+
+function railwayStatusLabel(status: string | null): string {
+  if (!status) return "Unknown";
+  // "BUILDING" -> "Building", "CRASHED" -> "Crashed", etc.
+  return status.charAt(0) + status.slice(1).toLowerCase();
+}
 
 export default function SystemHealthPage() {
   const [data, setData] = useState<SystemHealthResponse | null>(null);
@@ -112,12 +155,39 @@ export default function SystemHealthPage() {
               }
               icon={<HeartPulse size={15} />}
             />
-            <StatCard
-              label="Railway Service Status"
-              value={<StatusBadge status="not_configured" />}
-              sublabel="Needs a Railway API token - not set up yet"
-              icon={<Server size={15} />}
-            />
+            {data.railway.configured && data.railway.services ? (
+              data.railway.services.map((svc) => (
+                <StatCard
+                  key={svc.id}
+                  label={`Railway: ${svc.name}`}
+                  value={
+                    <StatusBadge
+                      status={railwayStatusBadge(svc.status)}
+                      label={railwayStatusLabel(svc.status)}
+                    />
+                  }
+                  sublabel={svc.updatedAt ? `Deployed ${timeAgo(svc.updatedAt)}` : "No deployment recorded"}
+                  icon={<Server size={15} />}
+                />
+              ))
+            ) : (
+              <StatCard
+                label="Railway Service Status"
+                value={
+                  data.railway.configured ? (
+                    <StatusBadge status="error" label="API error" />
+                  ) : (
+                    <StatusBadge status="not_configured" />
+                  )
+                }
+                sublabel={
+                  data.railway.configured
+                    ? data.railway.error ?? "Railway API request failed"
+                    : "Needs a Railway API token - not set up yet"
+                }
+                icon={<Server size={15} />}
+              />
+            )}
             <StatCard
               label="Database Connectivity"
               value={<StatusBadge status={data.database.status} />}
@@ -263,6 +333,12 @@ export default function SystemHealthPage() {
               Railway service status isn&apos;t connected yet - it needs a Railway API token, which
               you haven&apos;t set up. Once you have one, this can show live deploy/build status
               per service directly from Railway.
+            </div>
+          )}
+
+          {data.railway.configured && data.railway.error && (
+            <div className="rounded-lg border border-loss/40 bg-loss/10 p-3 text-sm text-loss">
+              Railway: {data.railway.error}
             </div>
           )}
         </div>
