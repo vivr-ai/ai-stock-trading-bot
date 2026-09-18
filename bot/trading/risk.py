@@ -90,6 +90,18 @@ class RiskManager:
             return RiskDecision(False, "position size rounds to 0 shares")
 
         notional = qty * price
+        # When the software trailing-stop layer is on (SentimentStrategy
+        # ._maybe_trailing_stop_exit), the broker bracket's take-profit leg
+        # widens to a distant backstop instead of the everyday cap - the
+        # trailing check becomes the real profit-taking mechanism, and this
+        # leg only matters if the bot itself is down when a huge gap-up
+        # happens. Off (the default), behavior is exactly what it was
+        # before trailing stops existed.
+        effective_take_profit_pct = (
+            self.cfg.trailing_stop_backstop_take_profit_pct
+            if self.cfg.trailing_stop_enabled
+            else self.cfg.take_profit_pct
+        )
         return RiskDecision(
             True,
             "approved",
@@ -99,6 +111,6 @@ class RiskManager:
                 price=price,
                 notional=round(notional, 2),
                 stop_price=round(price * (1.0 - self.cfg.stop_loss_pct / 100.0), 2),
-                take_profit_price=round(price * (1.0 + self.cfg.take_profit_pct / 100.0), 2),
+                take_profit_price=round(price * (1.0 + effective_take_profit_pct / 100.0), 2),
             ),
         )

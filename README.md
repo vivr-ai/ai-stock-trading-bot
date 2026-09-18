@@ -199,6 +199,20 @@ exits ride along as a GTC bracket on every entry regardless of sentiment.
 (10), `RISK_MAX_TOTAL_EXPOSURE_PCT` (50%), `RISK_MAX_NEW_POSITIONS_PER_CYCLE` (3),
 plus `RISK_DAILY_LOSS_LIMIT_PCT` (4%) kill switch.
 
+**Optional software trailing stop** (`RISK_TRAILING_STOP_ENABLED`, off by
+default): lets a winner run past the hard `RISK_TAKE_PROFIT_PCT` cap instead
+of selling at it. Alpaca doesn't support combining a trailing stop with a
+take-profit leg in one bracket order, so this is a durable software layer
+instead — the broker bracket's take-profit leg widens to a distant backstop
+(`RISK_TRAILING_STOP_BACKSTOP_TAKE_PROFIT_PCT`, 50%) and every cycle checks,
+for each held position, whether price is up at least
+`RISK_TRAILING_STOP_ACTIVATION_PCT` (3%) from entry and has pulled back at
+least `RISK_TRAILING_STOP_PCT` (7%) from its tracked peak — selling if so.
+The peak is stored per-symbol in Postgres (`position_peaks`), not the
+ephemeral state file, so it survives a Railway redeploy mid-hold. Runs ahead
+of both entry paths' own sell rules; the existing stop-loss and (widened)
+take-profit bracket stay in place underneath it as the ultimate backstop.
+
 ## Daily performance report
 
 `python main.py --eod` (or the automatic 16:05 ET job) writes

@@ -23,6 +23,10 @@ class _RiskCfg:
     take_profit_pct: float = 20.0
     max_order_notional: float = 0.0
     daily_loss_limit_pct: float = 4.0
+    trailing_stop_enabled: bool = False
+    trailing_stop_pct: float = 7.0
+    trailing_stop_activation_pct: float = 3.0
+    trailing_stop_backstop_take_profit_pct: float = 50.0
 
 
 def test_position_sizing_is_five_percent():
@@ -51,3 +55,22 @@ def test_blocks_at_max_open_positions():
                              buying_power=100_000, current_exposure=0, open_positions=positions)
     assert not decision.approved
     assert "max_open_positions" in decision.reason
+
+
+def test_take_profit_uses_backstop_pct_when_trailing_stop_enabled():
+    # Off (the default): unchanged behavior, static take_profit_pct cap.
+    risk_off = RiskManager(_RiskCfg())
+    decision_off = risk_off.evaluate("AAPL", price=100.0, portfolio_value=100_000,
+                                      buying_power=100_000, current_exposure=0, open_positions={})
+    assert decision_off.plan.take_profit_price == 120.0
+
+    # On: the broker bracket's take-profit leg widens to the distant
+    # backstop instead, so the software trailing check (not this leg) is
+    # what normally takes profit.
+    risk_on = RiskManager(_RiskCfg(trailing_stop_enabled=True,
+                                    trailing_stop_backstop_take_profit_pct=50.0))
+    decision_on = risk_on.evaluate("AAPL", price=100.0, portfolio_value=100_000,
+                                    buying_power=100_000, current_exposure=0, open_positions={})
+    assert decision_on.plan.take_profit_price == 150.0
+    # Stop-loss is untouched either way - only the take-profit leg changes.
+    assert decision_on.plan.stop_price == 90.0

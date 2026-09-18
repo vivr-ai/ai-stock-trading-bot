@@ -679,6 +679,135 @@ class Recorder:
             except Exception:  # noqa: BLE001
                 pass
 
+    def get_position_peak(self, symbol: str) -> Optional[float]:
+        """Durable high-water mark for the software trailing-stop layer
+        (risk.trailing_stop_enabled - see SentimentStrategy
+        ._maybe_trailing_stop_exit). None if never recorded (a brand-new
+        position, or a DB problem) - the caller treats that as "peak is
+        just the entry price so far", never as an error."""
+        if not self.enabled:
+            return None
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB connect failed (peak lookup skipped for %s): %s", symbol, exc)
+            return None
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT peak_price FROM position_peaks WHERE symbol = %(symbol)s",
+                        dict(symbol=symbol),
+                    )
+                    row = cur.fetchone()
+                    return float(row[0]) if row else None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB peak lookup failed for %s: %s", symbol, exc)
+            return None
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def update_position_peak(self, symbol: str, price: float) -> None:
+        """Ratchet the stored peak up to `price` if it's higher - never
+        down. Called every cycle from the trailing-stop check with
+        whatever the live price is; GREATEST in the upsert makes this
+        safe to call with a lower price too (a no-op) rather than
+        requiring the caller to compare first. Best-effort: a failure
+        here just means next cycle re-derives the same peak from
+        entry_price/current_price again (see the caller's fallback),
+        never something that should interrupt a trading decision."""
+        if not self.enabled:
+            return
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB connect failed (peak update dropped for %s): %s", symbol, exc)
+            return
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO position_peaks (symbol, peak_price, updated_at)
+                        VALUES (%(symbol)s, %(price)s, now())
+                        ON CONFLICT (symbol) DO UPDATE SET
+                            peak_price = GREATEST(position_peaks.peak_price, EXCLUDED.peak_price),
+                            updated_at = now()
+                        """,
+                        dict(symbol=symbol, price=price),
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB peak update failed for %s: %s", symbol, exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def reset_position_peak(self, symbol: str, price: float) -> None:
+        """Hard-overwrite (not ratchet) the stored peak to `price` - unlike
+        update_position_peak, this is used exactly once, at buy time
+        (_do_buy), specifically so a stale peak left over from this
+        symbol's PRIOR holding period (if any) can never falsely trigger
+        an immediate trailing-stop sell moments after a fresh re-entry.
+        Best-effort, same posture as every other write here: a failure
+        just means the first cycle or two rebuilds the peak from
+        entry_price/current_price via the caller's fallback instead."""
+        if not self.enabled:
+            return
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB connect failed (peak reset dropped for %s): %s", symbol, exc)
+            return
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO position_peaks (symbol, peak_price, updated_at)
+                        VALUES (%(symbol)s, %(price)s, now())
+                        ON CONFLICT (symbol) DO UPDATE SET
+                            peak_price = EXCLUDED.peak_price, updated_at = now()
+                        """,
+                        dict(symbol=symbol, price=price),
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB peak reset failed for %s: %s", symbol, exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def clear_position_peak(self, symbol: str) -> None:
+        """Remove the stored peak once a position closes - tidy-up, not
+        strictly required for correctness (reset_position_peak at the next
+        buy would fix a stale row anyway), but keeps this table free of
+        rows for positions that no longer exist, same housekeeping as
+        open_positions' own delete-on-close behavior."""
+        if not self.enabled:
+            return
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB connect failed (peak clear dropped for %s): %s", symbol, exc)
+            return
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM position_peaks WHERE symbol = %(symbol)s", dict(symbol=symbol))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB peak clear failed for %s: %s", symbol, exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
     def has_logged_closed_trade_since(self, symbol: str, since_ts) -> bool:
         """True if a closed_trades row already exists for `symbol` with an
         exit time at or after `since_ts`. Paired with get_last_buy_trade()

@@ -130,6 +130,10 @@ class RiskConfig:
     take_profit_pct: float
     max_order_notional: float
     daily_loss_limit_pct: float
+    trailing_stop_enabled: bool
+    trailing_stop_pct: float
+    trailing_stop_activation_pct: float
+    trailing_stop_backstop_take_profit_pct: float
 
 
 @dataclass
@@ -377,6 +381,35 @@ def load_config(path: str = "config.ini") -> Config:
             daily_loss_limit_pct=_get(
                 parser, "risk", "daily_loss_limit_pct", "RISK_DAILY_LOSS_LIMIT_PCT", 4.0, float
             ),
+            # Software trailing-stop layer (SentimentStrategy
+            # ._maybe_trailing_stop_exit) - off by default, a behavior
+            # change to live trading logic like reversion_live. When on,
+            # the broker bracket's take-profit leg widens to
+            # trailing_stop_backstop_take_profit_pct instead of
+            # take_profit_pct (see RiskManager.evaluate) - a distant
+            # backstop rather than the real profit-taking mechanism, so
+            # the trailing check (not the fixed +20% cap) decides when a
+            # winner actually gets sold.
+            trailing_stop_enabled=_get(
+                parser, "risk", "trailing_stop_enabled", "RISK_TRAILING_STOP_ENABLED", False, bool
+            ),
+            trailing_stop_pct=_get(
+                parser, "risk", "trailing_stop_pct", "RISK_TRAILING_STOP_PCT", 7.0, float
+            ),
+            # Minimum profit above entry before the trail arms - below
+            # this, only the original fixed stop-loss protects the
+            # position. Without an activation floor, a trail this tight
+            # would also apply to a position sitting barely above entry,
+            # selling it on ordinary noise for close to a wash instead of
+            # protecting a genuine gain.
+            trailing_stop_activation_pct=_get(
+                parser, "risk", "trailing_stop_activation_pct",
+                "RISK_TRAILING_STOP_ACTIVATION_PCT", 3.0, float
+            ),
+            trailing_stop_backstop_take_profit_pct=_get(
+                parser, "risk", "trailing_stop_backstop_take_profit_pct",
+                "RISK_TRAILING_STOP_BACKSTOP_TAKE_PROFIT_PCT", 50.0, float
+            ),
         ),
         schedule=ScheduleConfig(
             run_minutes=[
@@ -540,3 +573,28 @@ def _validate(cfg: Config) -> None:
             raise ValueError(
                 "strategy.reversion_max_hold_days / STRATEGY_REVERSION_MAX_HOLD_DAYS must be >= 1"
             )
+
+    # ---- Software trailing-stop layer ------------------------------------
+    if not (0.0 < cfg.risk.trailing_stop_pct < 100.0):
+        raise ValueError(
+            "risk.trailing_stop_pct / RISK_TRAILING_STOP_PCT must be in (0, 100)."
+        )
+    if cfg.risk.trailing_stop_activation_pct < 0.0:
+        raise ValueError(
+            "risk.trailing_stop_activation_pct / RISK_TRAILING_STOP_ACTIVATION_PCT must be >= 0."
+        )
+    if cfg.risk.trailing_stop_enabled and (
+        cfg.risk.trailing_stop_backstop_take_profit_pct <= cfg.risk.trailing_stop_activation_pct
+    ):
+        # If the backstop take-profit sits at or below the activation
+        # floor, the broker's own bracket would sell at the backstop
+        # before the trail ever has a chance to arm - silently defeating
+        # the entire point of turning this on (same class of footgun as
+        # the momentum_buy_score bound above: a config that validates
+        # cleanly but makes the feature it names do nothing).
+        raise ValueError(
+            "risk.trailing_stop_backstop_take_profit_pct / "
+            "RISK_TRAILING_STOP_BACKSTOP_TAKE_PROFIT_PCT must be greater than "
+            "trailing_stop_activation_pct, or the broker's own take-profit leg fires "
+            "before the trailing stop ever arms."
+        )

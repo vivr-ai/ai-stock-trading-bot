@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bot.sentiment.base import SentimentResult
 from bot.trading.strategy import (
     SentimentStrategy,
+    CycleStats,
     SHADOW_VERDICT_MIN_CLOSED,
     SHADOW_VERDICT_MIN_WEEKS,
 )
@@ -55,9 +56,18 @@ class _StrategyCfg:
 
 
 @dataclass
+class _RiskCfg:
+    trailing_stop_enabled: bool = False
+    trailing_stop_pct: float = 7.0
+    trailing_stop_activation_pct: float = 3.0
+    trailing_stop_backstop_take_profit_pct: float = 50.0
+
+
+@dataclass
 class _Cfg:
     strategy: _StrategyCfg = field(default_factory=_StrategyCfg)
     schedule: _ScheduleCfg = field(default_factory=_ScheduleCfg)
+    risk: _RiskCfg = field(default_factory=_RiskCfg)
 
 
 @dataclass
@@ -416,3 +426,191 @@ def test_shadow_verdict_notify_progress_lookup_error_fails_silent():
 
     fake = _FakeShadowStrategy(cfg=_verdict_cfg(), recorder=_BrokenRecorder())
     SentimentStrategy._maybe_notify_shadow_verdict_ready(fake)  # must not raise
+
+
+# ---- _maybe_trailing_stop_exit -----------------------------------------
+# Software trailing-stop layer (risk.trailing_stop_enabled) - runs ahead of
+# either entry path's own sell rule in _process_symbol. _do_sell itself
+# needs a broker/trade_logger/closed_trade_logger too heavy for this fake
+# (same reasoning as _FakeShadowStrategy above), so it's stubbed here -
+# these tests are only about the peak-tracking/activation/pullback
+# arithmetic and the fail-open conditions, not _do_sell's own
+# already-tested behavior.
+
+class _FakeTrailingRecorder:
+    def __init__(self, last_buy=None, peak=None):
+        self._last_buy = last_buy
+        self._peak = peak
+        self.peak_updates = []
+
+    def get_last_buy_trade(self, symbol):
+        return self._last_buy
+
+    def get_position_peak(self, symbol):
+        return self._peak
+
+    def update_position_peak(self, symbol, price):
+        self.peak_updates.append((symbol, price))
+
+    def __getattr__(self, _name):
+        return lambda *a, **k: None
+
+
+class _FakeTrailingBroker:
+    def __init__(self, price="unset"):
+        self._price = price
+
+    def latest_price(self, symbol):
+        if self._price == "unset":
+            raise AssertionError("latest_price should not have been called")
+        return self._price
+
+
+class _FakeTrailingState:
+    def __init__(self):
+        self.exits = []
+
+    def mark_exit(self, symbol):
+        self.exits.append(symbol)
+
+
+class _FakeTrailingStrategy:
+    def __init__(self, cfg=None, recorder=None, broker=None):
+        self.cfg = cfg or _Cfg()
+        self.recorder = recorder
+        self.broker = broker
+        self.state = _FakeTrailingState()
+        self.sells = []
+
+    def _do_sell(self, symbol, sentiment, reason, entry_path="sentiment_momentum"):
+        self.sells.append({"symbol": symbol, "reason": reason, "entry_path": entry_path})
+
+
+def _trailing_cfg(**risk_kwargs):
+    return _Cfg(risk=_RiskCfg(**risk_kwargs))
+
+
+def test_trailing_stop_noop_when_disabled():
+    """Off (the default) - never even looks at price/DB, matching the
+    method's early-return before any recorder/broker call."""
+    fake = _FakeTrailingStrategy(cfg=_trailing_cfg(trailing_stop_enabled=False),
+                                  recorder=_FakeTrailingRecorder(),
+                                  broker=_FakeTrailingBroker())  # unset -> raises if hit
+    fired = SentimentStrategy._maybe_trailing_stop_exit(
+        fake, "AAPL", _sentiment(5.0, 4), "sentiment_momentum", {}, CycleStats())
+    assert fired is False
+    assert fake.sells == []
+
+
+def test_trailing_stop_fails_open_when_price_unavailable():
+    class _NoPriceBroker(_FakeTrailingBroker):
+        def latest_price(self, symbol):
+            return None
+
+    fake = _FakeTrailingStrategy(cfg=_trailing_cfg(trailing_stop_enabled=True),
+                                  recorder=_FakeTrailingRecorder(), broker=_NoPriceBroker())
+    fired = SentimentStrategy._maybe_trailing_stop_exit(
+        fake, "AAPL", _sentiment(5.0, 4), "sentiment_momentum", {}, CycleStats())
+    assert fired is False
+    assert fake.sells == []
+
+
+def test_trailing_stop_fails_open_when_no_durable_buy_row():
+    """No trades-table row for this symbol (e.g. a manually-adopted
+    position with no history) - must not fall back to any other price
+    source or raise, just skip this cycle's check."""
+    fake = _FakeTrailingStrategy(cfg=_trailing_cfg(trailing_stop_enabled=True),
+                                  recorder=_FakeTrailingRecorder(last_buy=None),
+                                  broker=_FakeTrailingBroker(110.0))
+    fired = SentimentStrategy._maybe_trailing_stop_exit(
+        fake, "AAPL", _sentiment(5.0, 4), "sentiment_momentum", {}, CycleStats())
+    assert fired is False
+    assert fake.sells == []
+
+
+def test_trailing_stop_not_armed_below_activation_but_still_tracks_peak():
+    """Up only 2% from entry, activation threshold is 3% - too early to
+    arm, but the peak should still ratchet so it's ready the moment
+    activation is crossed."""
+    recorder = _FakeTrailingRecorder(last_buy={"price": 100.0}, peak=None)
+    fake = _FakeTrailingStrategy(
+        cfg=_trailing_cfg(trailing_stop_enabled=True, trailing_stop_activation_pct=3.0,
+                           trailing_stop_pct=7.0),
+        recorder=recorder, broker=_FakeTrailingBroker(102.0))
+    fired = SentimentStrategy._maybe_trailing_stop_exit(
+        fake, "AAPL", _sentiment(5.0, 4), "sentiment_momentum", {}, CycleStats())
+    assert fired is False
+    assert fake.sells == []
+    assert recorder.peak_updates == [("AAPL", 102.0)]
+
+
+def test_trailing_stop_armed_but_no_pullback_yet_is_noop():
+    """Up 10% from entry (armed), price is exactly the peak - 0% pullback,
+    nowhere near the 7% trailing_stop_pct trigger."""
+    recorder = _FakeTrailingRecorder(last_buy={"price": 100.0}, peak=108.0)
+    fake = _FakeTrailingStrategy(
+        cfg=_trailing_cfg(trailing_stop_enabled=True, trailing_stop_activation_pct=3.0,
+                           trailing_stop_pct=7.0),
+        recorder=recorder, broker=_FakeTrailingBroker(110.0))
+    fired = SentimentStrategy._maybe_trailing_stop_exit(
+        fake, "AAPL", _sentiment(5.0, 4), "sentiment_momentum", {}, CycleStats())
+    assert fired is False
+    assert fake.sells == []
+
+
+def test_trailing_stop_fires_on_pullback_from_peak():
+    """Peaked at 120 (up 20% from entry), now back to 110 - a 8.3% pullback
+    from peak, over the 7% trigger, while still +10% above entry."""
+    recorder = _FakeTrailingRecorder(last_buy={"price": 100.0}, peak=120.0)
+    fake = _FakeTrailingStrategy(
+        cfg=_trailing_cfg(trailing_stop_enabled=True, trailing_stop_activation_pct=3.0,
+                           trailing_stop_pct=7.0),
+        recorder=recorder, broker=_FakeTrailingBroker(110.0))
+    stats = CycleStats()
+    sector_counts = {"tech": 1}
+
+    fired = SentimentStrategy._maybe_trailing_stop_exit(
+        fake, "AAPL", _sentiment(5.0, 4), "sentiment_momentum", sector_counts, stats)
+
+    assert fired is True
+    assert stats.sells == 1
+    assert sector_counts["tech"] == 0
+    assert fake.state.exits == ["AAPL"]
+    assert len(fake.sells) == 1
+    sold = fake.sells[0]
+    assert sold["symbol"] == "AAPL"
+    assert sold["entry_path"] == "sentiment_momentum"
+    assert "trailing stop" in sold["reason"]
+    assert "120.00" in sold["reason"]
+    assert "110.00" in sold["reason"]
+
+
+def test_trailing_stop_fires_for_mean_reversion_entries_too():
+    """The trailing-stop layer is a price-only backstop that runs ahead of
+    EITHER entry path's own sell rule - not exclusive to sentiment-momentum
+    entries."""
+    recorder = _FakeTrailingRecorder(last_buy={"price": 50.0}, peak=60.0)
+    fake = _FakeTrailingStrategy(
+        cfg=_trailing_cfg(trailing_stop_enabled=True, trailing_stop_activation_pct=3.0,
+                           trailing_stop_pct=5.0),
+        recorder=recorder, broker=_FakeTrailingBroker(56.0))
+    fired = SentimentStrategy._maybe_trailing_stop_exit(
+        fake, "MRK", _sentiment(0.0, 4), "mean_reversion", {"healthcare": 1}, CycleStats())
+    assert fired is True
+    assert fake.sells[0]["entry_path"] == "mean_reversion"
+
+
+def test_trailing_stop_recorder_error_fails_open():
+    """A DB hiccup on the last-buy lookup must never raise into the
+    trading loop - same fail-open posture as every other Recorder
+    integration point in this file."""
+    class _BrokenRecorder(_FakeTrailingRecorder):
+        def get_last_buy_trade(self, symbol):
+            raise RuntimeError("connection refused")
+
+    fake = _FakeTrailingStrategy(cfg=_trailing_cfg(trailing_stop_enabled=True),
+                                  recorder=_BrokenRecorder(), broker=_FakeTrailingBroker(110.0))
+    fired = SentimentStrategy._maybe_trailing_stop_exit(
+        fake, "AAPL", _sentiment(5.0, 4), "sentiment_momentum", {}, CycleStats())
+    assert fired is False
+    assert fake.sells == []

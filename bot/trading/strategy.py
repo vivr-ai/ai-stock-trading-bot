@@ -36,6 +36,17 @@ Sell rule:
     when they fire, the position simply "disappears" between cycles — caught
     by BotState.detect_exits() and logged to the closed-trade ledger from
     there, since we didn't place that closing order ourselves.
+  * optional software trailing-stop layer (risk.trailing_stop_enabled, off
+    by default) - checked ahead of either entry path's own sell rule, every
+    cycle a position is held. When on, the broker bracket's take-profit leg
+    widens to a distant backstop (trailing_stop_backstop_take_profit_pct)
+    and this check becomes the real profit-taking mechanism instead: once
+    price is up trailing_stop_activation_pct from entry, a durable
+    per-symbol peak price is tracked (db/schema.sql's position_peaks
+    table), and the position is sold once price pulls back
+    trailing_stop_pct from that peak - letting winners run past the old
+    hard +20% cap while still locking in gains on a real reversal. See
+    SentimentStrategy._maybe_trailing_stop_exit.
 """
 from __future__ import annotations
 
@@ -523,7 +534,12 @@ class SentimentStrategy:
             if not entry_price or entry_price <= 0 or not qty or qty <= 0:
                 continue
             stop_price = round(entry_price * (1.0 - self.cfg.risk.stop_loss_pct / 100.0), 2)
-            take_profit_price = round(entry_price * (1.0 + self.cfg.risk.take_profit_pct / 100.0), 2)
+            effective_take_profit_pct = (
+                self.cfg.risk.trailing_stop_backstop_take_profit_pct
+                if self.cfg.risk.trailing_stop_enabled
+                else self.cfg.risk.take_profit_pct
+            )
+            take_profit_price = round(entry_price * (1.0 + effective_take_profit_pct / 100.0), 2)
 
             protected_now = not needs_protection  # already had a bracket/OCO before this cycle
             protect_order_id = ""
@@ -782,6 +798,13 @@ class SentimentStrategy:
         if holding:
             lot = self.state.peek_open(symbol)
             entry_path = (lot or {}).get("entry_path") or "sentiment_momentum"
+
+            # Software trailing-stop layer (risk.trailing_stop_enabled) -
+            # checked ahead of either entry path's own sell rule; see
+            # _maybe_trailing_stop_exit's docstring. No-op (returns False
+            # immediately) when the feature is off, which is the default.
+            if self._maybe_trailing_stop_exit(symbol, sentiment, entry_path, sector_counts, stats):
+                return exposure
 
             if entry_path == "mean_reversion":
                 snap = self.broker.market_snapshot(
@@ -1198,6 +1221,96 @@ class SentimentStrategy:
             metadata={"closed_count": closed_count, "weeks_observed": round(weeks_observed, 1)},
         )
 
+    def _maybe_trailing_stop_exit(self, symbol, sentiment, entry_path, sector_counts, stats) -> bool:
+        """Software trailing-stop layer (risk.trailing_stop_enabled).
+
+        Runs for BOTH entry paths, ahead of either one's own sell rule - a
+        winner is a winner whether it was entered on sentiment or on
+        mean-reversion, and this is a price-only backstop layered on top,
+        not a replacement for either path's own logic. When enabled, the
+        broker bracket's take-profit leg is widened to
+        trailing_stop_backstop_take_profit_pct (see RiskManager.evaluate())
+        specifically so this check - not the static bracket - is what
+        normally takes the profit, letting winners run further than the
+        old hard take_profit_pct cap while still selling once the price
+        meaningfully pulls back from its high.
+
+        Tracks a durable per-symbol high-water mark in the position_peaks
+        table (never open_positions - that table is resynced from Alpaca
+        at the START of every cycle, before this runs, so storing the peak
+        there would make every cycle see 0% pullback from "the current
+        price"). Sells once BOTH:
+          * price is up at least trailing_stop_activation_pct from entry
+            (so this can't fire on ordinary noise near breakeven), and
+          * price has pulled back at least trailing_stop_pct from the
+            recorded peak.
+
+        Entry price comes from the durable trades table (get_last_buy_trade),
+        not the ephemeral state-file lot - the same fix applied to
+        AI Confidence/Entry Reason above, and for the same reason: a
+        Railway redeploy wipes bot/state.py's JSON file, and re-introducing
+        that fragility into a real sell decision (rather than just a
+        dashboard display value) would be a materially worse bug.
+
+        Fails open on any missing price/entry data or DB error: returns
+        False and does nothing, leaving the existing bracket order and the
+        entry path's own sell rule as the backstop. Returns True only when
+        it actually sold, so the caller can skip the rest of this cycle's
+        holding-management logic for `symbol` (mirroring how the
+        mean-reversion branch below returns immediately after its own
+        exit)."""
+        if not self.cfg.risk.trailing_stop_enabled:
+            return False
+
+        try:
+            price = self.broker.latest_price(symbol)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Trailing-stop check skipped for %s (price lookup failed): %s",
+                            symbol, exc)
+            return False
+        if price is None or price <= 0:
+            return False
+
+        try:
+            buy = self.recorder.get_last_buy_trade(symbol)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Trailing-stop check skipped for %s (last-buy lookup failed): %s",
+                            symbol, exc)
+            return False
+        entry_price = buy.get("price") if buy else None
+        if not entry_price or entry_price <= 0:
+            return False
+
+        gain_pct = (price - entry_price) / entry_price * 100.0
+        if gain_pct < self.cfg.risk.trailing_stop_activation_pct:
+            # Not armed yet. Still ratchet the peak so it's already
+            # up to date the moment activation is crossed, rather than
+            # needing a cycle to "catch up" from a stale/missing value.
+            self.recorder.update_position_peak(symbol, price)
+            return False
+
+        peak = self.recorder.get_position_peak(symbol)
+        if peak is None or peak < price:
+            peak = price
+        self.recorder.update_position_peak(symbol, price)
+
+        pullback_pct = (peak - price) / peak * 100.0 if peak > 0 else 0.0
+        if pullback_pct < self.cfg.risk.trailing_stop_pct:
+            return False
+
+        reason = (
+            f"trailing stop: peak ${peak:.2f}, now ${price:.2f} "
+            f"(-{pullback_pct:.1f}% from peak, still +{gain_pct:.1f}% above entry)"
+        )
+        logger.info("SELL %s trailing stop triggered: %s", symbol, reason,
+                    extra={"symbol": symbol, "decision": "trailing_stop", "peak": peak,
+                           "price": price, "pullback_pct": pullback_pct, "gain_pct": gain_pct})
+        self._do_sell(symbol, sentiment, reason=reason, entry_path=entry_path)
+        self.state.mark_exit(symbol)
+        sector_counts[sector_of(symbol)] -= 1
+        stats.sells += 1
+        return True
+
     def _do_buy(self, symbol, sentiment, price, acct, exposure, open_positions,
                 sector_counts, stats, market_regime=None,
                 entry_path: str = "sentiment_momentum", reason: Optional[str] = None) -> float:
@@ -1309,6 +1422,14 @@ class SentimentStrategy:
                                market_regime=market_regime,
                                strategy_version=self.version_provider.current_version(),
                                entry_path=entry_path)
+        # Hard-reset (not ratchet) the trailing-stop peak for this symbol -
+        # see Recorder.reset_position_peak's docstring for why this must be
+        # a hard overwrite: a stale peak from this symbol's prior holding
+        # period (if any) could otherwise trigger an immediate trailing-
+        # stop sell moments after this fresh entry. Harmless no-op when
+        # risk.trailing_stop_enabled is off - _maybe_trailing_stop_exit
+        # never reads this table in that case.
+        self.recorder.reset_position_peak(symbol, plan.price)
 
         open_positions[symbol] = plan.qty
         sector_counts[sector_of(symbol)] += 1
@@ -1362,6 +1483,12 @@ class SentimentStrategy:
                     # _log_closed_trade_from_history - reconstruct from the
                     # trades table instead of dropping this exit.
                     self._log_closed_trade_from_history(symbol, exit_price, f"dry_run: {reason}")
+            # Position closed (simulated) - drop its trailing-stop peak so a
+            # future re-entry starts clean rather than inheriting this
+            # round's high-water mark (reset_position_peak at the next buy
+            # would also fix this, but clearing here matches open_positions'
+            # own delete-on-close housekeeping).
+            self.recorder.clear_position_peak(symbol)
             return
 
         # Guard against racing a working order for the same symbol - most
@@ -1420,6 +1547,9 @@ class SentimentStrategy:
         self.recorder.record_notification(
             type_="trade_executed", title=f"SELL {symbol}", message=reason,
         )
+        # Real close submitted - drop this symbol's trailing-stop peak (see
+        # the dry-run branch above for why).
+        self.recorder.clear_position_peak(symbol)
 
         if self.closed_trade_logger is not None:
             exit_price = order.filled_avg_price or self.broker.latest_price(symbol)

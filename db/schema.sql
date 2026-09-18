@@ -197,6 +197,26 @@ CREATE TABLE IF NOT EXISTS open_positions (
 );
 
 -- ---------------------------------------------------------------------
+-- position_peaks: the highest price observed for each currently-open
+-- position since it was bought - the durable high-water mark the
+-- software trailing-stop layer (risk.trailing_stop_enabled - see
+-- SentimentStrategy._maybe_trailing_stop_exit) compares the live price
+-- against. Deliberately its own small table rather than a column on
+-- open_positions: open_positions is synced (deleted/upserted) once near
+-- the START of each cycle, before the per-symbol sell loop runs, so a
+-- peak stored there would already reflect THIS cycle's price by the
+-- time the trailing check ran against it, always showing a 0% pullback.
+-- Reset to the entry price at buy time (see _do_buy) so a stale peak
+-- from a symbol's PRIOR holding period can never trigger an immediate
+-- sell right after a fresh re-entry; removed at sell time (_do_sell).
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS position_peaks (
+    symbol      TEXT PRIMARY KEY,
+    peak_price  NUMERIC NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ---------------------------------------------------------------------
 -- notifications: alert history for the Notifications Centre.
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS notifications (

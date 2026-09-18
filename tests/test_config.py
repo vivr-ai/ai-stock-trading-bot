@@ -83,3 +83,47 @@ def test_momentum_buy_score_of_exactly_one_is_allowed(monkeypatch, tmp_path):
     monkeypatch.setenv("STRATEGY_MOMENTUM_BUY_SCORE", "1.0")
     cfg = load_config(str(tmp_path / "nope.ini"))
     assert cfg.strategy.momentum_buy_score == 1.0
+
+
+def test_trailing_stop_disabled_by_default(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    cfg = load_config(str(tmp_path / "nope.ini"))
+    assert cfg.risk.trailing_stop_enabled is False
+    assert cfg.risk.trailing_stop_pct == 7.0
+    assert cfg.risk.trailing_stop_activation_pct == 3.0
+    assert cfg.risk.trailing_stop_backstop_take_profit_pct == 50.0
+
+
+def test_trailing_stop_backstop_must_exceed_activation_when_enabled(monkeypatch, tmp_path):
+    """Same class of bug as momentum_buy_score above - a backstop
+    take-profit at or below the activation threshold would validate
+    cleanly while silently defeating the feature: the broker's own
+    take-profit leg would fire before the trailing check ever arms."""
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("RISK_TRAILING_STOP_ENABLED", "true")
+    monkeypatch.setenv("RISK_TRAILING_STOP_ACTIVATION_PCT", "10.0")
+    monkeypatch.setenv("RISK_TRAILING_STOP_BACKSTOP_TAKE_PROFIT_PCT", "10.0")
+    with pytest.raises(ValueError, match="trailing_stop_backstop_take_profit_pct"):
+        load_config(str(tmp_path / "nope.ini"))
+
+
+def test_trailing_stop_backstop_check_skipped_when_disabled(monkeypatch, tmp_path):
+    """The same otherwise-invalid combination is allowed to load when the
+    feature is off - it's inert, not dangerous, while disabled."""
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("RISK_TRAILING_STOP_ENABLED", "false")
+    monkeypatch.setenv("RISK_TRAILING_STOP_ACTIVATION_PCT", "10.0")
+    monkeypatch.setenv("RISK_TRAILING_STOP_BACKSTOP_TAKE_PROFIT_PCT", "10.0")
+    cfg = load_config(str(tmp_path / "nope.ini"))
+    assert cfg.risk.trailing_stop_enabled is False
+
+
+def test_trailing_stop_pct_out_of_range_is_rejected(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("RISK_TRAILING_STOP_PCT", "0")
+    with pytest.raises(ValueError, match="trailing_stop_pct"):
+        load_config(str(tmp_path / "nope.ini"))
