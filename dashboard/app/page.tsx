@@ -2,42 +2,41 @@
 
 /**
  * Home: the "operations cockpit" redesigned per docs/dashboard-ux-redesign-
- * proposal.md §2.5. Structural additions over the old flat 10-StatCard grid:
+ * proposal.md §2.5, further condensed (Sep 2026) from a 6-section grid of
+ * 24 uniform StatCards down to:
  *   1. A status strip pinned above everything (Bot / Market / Risk /
  *      Today's P/L) - the literal "answer within 5 seconds" affordance.
  *   2. Alerts as a distinct banner, not a card, hidden entirely when empty.
- *   3. Content grouped into the sections from the original brief (Portfolio,
- *      Trading Activity, Bot Status, Market Status, AI Activity, Risk
- *      Snapshot) plus Quick Actions, instead of one undifferentiated grid.
+ *   3. A 4-card hero row for the numbers that matter most at a glance
+ *      (Portfolio Value, Today's P/L, Open Positions, Risk Level).
+ *   4. Everything else grouped into 4 compact Panels of InfoRows (Portfolio,
+ *      Trading Activity, Bot & Market, AI & Risk) instead of one StatCard
+ *      per fact - same data, far less vertical space and far fewer boxes,
+ *      so the page reads as a small number of coherent panels rather than
+ *      a wall of identical tiles.
  * All data comes from one aggregator, /api/home (see that route for the
  * heuristics disclosure on "next scheduled run" / "time until next
  * session").
  */
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import StatCard from "@/components/StatCard";
 import StatusBadge from "@/components/StatusBadge";
 import StatusDot, { type DotTone } from "@/components/StatusDot";
 import AlertsBanner, { type HomeAlert } from "@/components/AlertsBanner";
+import Panel from "@/components/Panel";
+import InfoRow from "@/components/InfoRow";
 import LoadingSkeleton from "@/components/LoadingSkeleton";
 import ErrorState from "@/components/ErrorState";
 import { fmtMoney, fmtPct, timeAgo, toneFor } from "@/lib/format";
 import {
   Wallet,
-  Banknote,
   TrendingUp,
   Layers,
   Repeat,
-  Target,
-  Radio,
-  Clock,
-  CalendarClock,
   Bot,
   Gauge,
-  GitBranch,
   ShieldAlert,
-  TrendingDown,
-  PieChart,
   Pause,
   Play,
   OctagonAlert,
@@ -106,15 +105,6 @@ type HomeResponse = {
   alerts: HomeAlert[];
   botControl: { isPaused: boolean; reason: string | null };
 };
-
-function Section({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <div className="mb-8">
-      <h2 className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted">{title}</h2>
-      <div className="grid grid-cols-2 gap-4 sm:grid-cols-2 lg:grid-cols-4">{children}</div>
-    </div>
-  );
-}
 
 function riskDotTone(risk: "normal" | "elevated" | "high"): DotTone {
   return risk === "high" ? "loss" : risk === "elevated" ? "warning" : "gain";
@@ -220,157 +210,167 @@ export default function HomePage() {
 
           <AlertsBanner alerts={data.alerts} />
 
-          <Section title="Portfolio">
+          {/* ---- Hero row: the 4 numbers that matter most, answered without
+              any scrolling - Portfolio's the daily-use question ("what's my
+              money doing"), the other 3 round out "is anything wrong." Every
+              other fact on this page is one click away in a Panel below,
+              not because it's unimportant, but because it's not what you
+              open Home to check every 30 minutes. */}
+          <div className="mb-5 grid grid-cols-2 gap-4 lg:grid-cols-4">
             <StatCard
+              size="lg"
               label="Portfolio Value"
               value={fmtMoney(data.portfolio.value)}
-              sublabel={data.portfolio.isAsOfLastActiveCycle ? "As of last active cycle (market closed)" : undefined}
+              sublabel={data.portfolio.isAsOfLastActiveCycle ? "As of last active cycle (market closed)" : "Live"}
               icon={<Wallet size={15} />}
             />
             <StatCard
-              label="Cash Available"
-              value={fmtMoney(data.portfolio.cash)}
-              sublabel={data.portfolio.isAsOfLastActiveCycle ? "As of last active cycle (market closed)" : undefined}
-              icon={<Banknote size={15} />}
-            />
-            <StatCard
+              size="lg"
               label="Today's P/L"
               value={fmtMoney(data.portfolio.todaysPl)}
               tone={toneFor(data.portfolio.todaysPl)}
               icon={<TrendingUp size={15} />}
             />
             <StatCard
-              label="Weekly / Monthly / Lifetime"
-              value={
-                <span className="text-base">
-                  {fmtPct(data.portfolio.weeklyReturnPct)} · {fmtPct(data.portfolio.monthlyReturnPct)} ·{" "}
-                  {fmtPct(data.portfolio.lifetimeReturnPct)}
-                </span>
-              }
-              icon={<PieChart size={15} />}
-            />
-          </Section>
-
-          <Section title="Trading Activity">
-            <StatCard label="Open Positions" value={data.tradingActivity.openPositions} icon={<Layers size={15} />} />
-            <StatCard
-              label="Last Executed Trade"
-              value={
-                data.tradingActivity.lastTrade
-                  ? `${data.tradingActivity.lastTrade.action.toUpperCase()} ${data.tradingActivity.lastTrade.symbol}`
-                  : "—"
-              }
-              sublabel={
-                data.tradingActivity.lastTrade
-                  ? `${data.tradingActivity.lastTrade.qty ?? ""} @ ${fmtMoney(data.tradingActivity.lastTrade.price)} · ${timeAgo(
-                      data.tradingActivity.lastTrade.ts
-                    )}`
-                  : "No trades yet"
-              }
-              icon={<Repeat size={15} />}
-            />
-            <StatCard label="Trades Today" value={data.tradingActivity.tradesToday} icon={<Target size={15} />} />
-            <StatCard
-              label="Win Rate (all-time)"
-              value={fmtPct(data.tradingActivity.winRatePct, 1)}
-              icon={<TrendingUp size={15} />}
-            />
-          </Section>
-
-          <Section title="Bot Status">
-            <StatCard
-              label="Running / Paused"
-              value={
-                <StatusBadge status={data.botControl.isPaused ? "paused" : data.botStatusPanel.running ? "running" : "stopped"} />
-              }
-              sublabel={data.botStatusPanel.dryRun ? "Dry run (no real orders)" : "Live paper trading"}
-              icon={<Bot size={15} />}
-            />
-            <StatCard
-              label="Last Heartbeat"
-              value={timeAgo(data.botStatusPanel.lastHeartbeat)}
-              sublabel={data.botStatusPanel.lastHeartbeat ? new Date(data.botStatusPanel.lastHeartbeat).toLocaleString() : undefined}
-              icon={<Clock size={15} />}
-            />
-            <StatCard label="Scheduler Status" value={data.botStatusPanel.schedulerStatus ?? "—"} icon={<Gauge size={15} />} />
-            <StatCard
-              label="Next Scheduled Run"
-              value={new Date(data.botStatusPanel.nextScheduledRun).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-              sublabel="Estimate - doesn't account for market holidays"
-              icon={<CalendarClock size={15} />}
-            />
-          </Section>
-
-          <Section title="Market Status">
-            <StatCard
-              label="Market Status"
-              value={data.marketStatus.open == null ? "—" : data.marketStatus.open ? "Open" : "Closed"}
-              tone={data.marketStatus.open ? "gain" : "neutral"}
-              icon={<Radio size={15} />}
-            />
-            <StatCard label="Current Session" value={data.marketStatus.sessionLabel} icon={<Clock size={15} />} />
-            <StatCard
-              label="Time Until Next Session"
-              value={fmtMinutes(data.marketStatus.minutesUntilNextOpen)}
-              sublabel={data.marketStatus.minutesUntilNextOpen == null ? "Already in session" : "Estimate - no holiday calendar"}
-              icon={<CalendarClock size={15} />}
-            />
-          </Section>
-
-          <Section title="AI Activity">
-            <StatCard
-              label="Latest AI Decision"
-              value={
-                data.aiActivity.latestDecision
-                  ? `${data.aiActivity.latestDecision.decision.toUpperCase()} ${data.aiActivity.latestDecision.symbol}`
-                  : "—"
-              }
-              sublabel={data.aiActivity.latestDecision ? timeAgo(data.aiActivity.latestDecision.ts) : "No decisions yet"}
-              icon={<Bot size={15} />}
-            />
-            <StatCard
-              label="Confidence Score"
-              value={
-                data.aiActivity.latestDecision?.confidence != null
-                  ? data.aiActivity.latestDecision.confidence.toFixed(1)
-                  : "—"
-              }
-              sublabel="Sentiment score (-10 to +10), not a probability"
-              icon={<Gauge size={15} />}
-            />
-            <StatCard label="Current Strategy Version" value={data.aiActivity.activeStrategyVersion} icon={<GitBranch size={15} />} />
-            <StatCard label="Market Sentiment" value={data.aiActivity.marketSentimentLabel ?? "—"} icon={<TrendingUp size={15} />} />
-          </Section>
-
-          <Section title="Risk Snapshot">
-            <StatCard
-              label="Current Drawdown"
-              value={fmtPct(data.riskSnapshot.drawdownPct != null ? -data.riskSnapshot.drawdownPct : null, 1)}
-              icon={<TrendingDown size={15} />}
-            />
-            <StatCard
-              label="Portfolio Exposure"
-              value={fmtPct(data.riskSnapshot.totalExposurePct, 1)}
-              icon={<PieChart size={15} />}
-            />
-            <StatCard
-              label="Largest Position"
-              value={data.riskSnapshot.largestPosition?.symbol ?? "—"}
-              sublabel={
-                data.riskSnapshot.largestPosition
-                  ? fmtPct(data.riskSnapshot.largestPosition.allocationPct, 1)
-                  : undefined
-              }
+              size="lg"
+              label="Open Positions"
+              value={data.tradingActivity.openPositions}
+              sublabel={fmtPct(data.riskSnapshot.totalExposurePct, 1) + " of capital deployed"}
               icon={<Layers size={15} />}
             />
             <StatCard
-              label="Current Risk Level"
+              size="lg"
+              label="Risk Level"
               value={data.riskSnapshot.riskLevel[0].toUpperCase() + data.riskSnapshot.riskLevel.slice(1)}
               tone={data.riskSnapshot.riskLevel === "high" ? "loss" : data.riskSnapshot.riskLevel === "elevated" ? "neutral" : "gain"}
               sublabel={`Daily loss limit ${data.riskSnapshot.dailyLossLimitPct}%`}
               icon={<ShieldAlert size={15} />}
             />
-          </Section>
+          </div>
+
+          {/* ---- Everything else: grouped into a few compact panels of rows
+              instead of one StatCard per fact - same information, far fewer
+              boxes and far less vertical space per fact. */}
+          <div className="mb-6 grid grid-cols-1 gap-5 lg:grid-cols-2">
+            <div className="flex flex-col gap-5">
+              <Panel title="Portfolio" icon={<Wallet size={14} className="text-accent" />}>
+                <InfoRow
+                  label="Cash Available"
+                  value={fmtMoney(data.portfolio.cash)}
+                  sublabel={data.portfolio.isAsOfLastActiveCycle ? "As of last active cycle" : undefined}
+                />
+                <InfoRow
+                  label="Weekly Return"
+                  value={fmtPct(data.portfolio.weeklyReturnPct)}
+                  tone={toneFor(data.portfolio.weeklyReturnPct)}
+                />
+                <InfoRow
+                  label="Monthly Return"
+                  value={fmtPct(data.portfolio.monthlyReturnPct)}
+                  tone={toneFor(data.portfolio.monthlyReturnPct)}
+                />
+                <InfoRow
+                  label="Lifetime Return"
+                  value={fmtPct(data.portfolio.lifetimeReturnPct)}
+                  tone={toneFor(data.portfolio.lifetimeReturnPct)}
+                />
+              </Panel>
+
+              <Panel title="Trading Activity" icon={<Repeat size={14} className="text-accent" />}>
+                <InfoRow
+                  label="Last Executed Trade"
+                  value={
+                    data.tradingActivity.lastTrade
+                      ? `${data.tradingActivity.lastTrade.action.toUpperCase()} ${data.tradingActivity.lastTrade.symbol}`
+                      : "—"
+                  }
+                  sublabel={
+                    data.tradingActivity.lastTrade
+                      ? `${data.tradingActivity.lastTrade.qty ?? ""} @ ${fmtMoney(
+                          data.tradingActivity.lastTrade.price
+                        )} · ${timeAgo(data.tradingActivity.lastTrade.ts)}`
+                      : "No trades yet"
+                  }
+                />
+                <InfoRow label="Trades Today" value={data.tradingActivity.tradesToday} />
+                <InfoRow
+                  label="Win Rate (all-time)"
+                  value={data.tradingActivity.winRatePct != null ? `${data.tradingActivity.winRatePct.toFixed(1)}%` : "—"}
+                />
+              </Panel>
+            </div>
+
+            <div className="flex flex-col gap-5">
+              <Panel title="Bot & Market" icon={<Bot size={14} className="text-accent" />}>
+                <InfoRow
+                  label="Running / Paused"
+                  value={
+                    <StatusBadge status={data.botControl.isPaused ? "paused" : data.botStatusPanel.running ? "running" : "stopped"} />
+                  }
+                  sublabel={data.botStatusPanel.dryRun ? "Dry run (no real orders)" : "Live paper trading"}
+                />
+                <InfoRow
+                  label="Last Heartbeat"
+                  value={timeAgo(data.botStatusPanel.lastHeartbeat)}
+                  sublabel={data.botStatusPanel.lastHeartbeat ? new Date(data.botStatusPanel.lastHeartbeat).toLocaleString() : undefined}
+                />
+                <InfoRow label="Scheduler Status" value={data.botStatusPanel.schedulerStatus ?? "—"} />
+                <InfoRow
+                  label="Next Scheduled Run"
+                  value={new Date(data.botStatusPanel.nextScheduledRun).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                  sublabel="Estimate - doesn't account for market holidays"
+                />
+                <InfoRow
+                  label="Market Status"
+                  value={data.marketStatus.open == null ? "—" : data.marketStatus.open ? "Open" : "Closed"}
+                  tone={data.marketStatus.open ? "gain" : "neutral"}
+                />
+                <InfoRow label="Current Session" value={data.marketStatus.sessionLabel} />
+                <InfoRow
+                  label="Time Until Next Session"
+                  value={fmtMinutes(data.marketStatus.minutesUntilNextOpen)}
+                  sublabel={data.marketStatus.minutesUntilNextOpen == null ? "Already in session" : "Estimate - no holiday calendar"}
+                />
+              </Panel>
+
+              <Panel title="AI & Risk" icon={<Gauge size={14} className="text-accent2" />}>
+                <InfoRow
+                  label="Latest AI Decision"
+                  value={
+                    data.aiActivity.latestDecision
+                      ? `${data.aiActivity.latestDecision.decision.toUpperCase()} ${data.aiActivity.latestDecision.symbol}`
+                      : "—"
+                  }
+                  sublabel={data.aiActivity.latestDecision ? timeAgo(data.aiActivity.latestDecision.ts) : "No decisions yet"}
+                />
+                <InfoRow
+                  label="Confidence Score"
+                  value={
+                    data.aiActivity.latestDecision?.confidence != null
+                      ? data.aiActivity.latestDecision.confidence.toFixed(1)
+                      : "—"
+                  }
+                  sublabel="Sentiment score (-10 to +10), not a probability"
+                />
+                <InfoRow label="Strategy Version" value={data.aiActivity.activeStrategyVersion} />
+                <InfoRow label="Market Sentiment" value={data.aiActivity.marketSentimentLabel ?? "—"} />
+                <InfoRow
+                  label="Current Drawdown"
+                  value={fmtPct(data.riskSnapshot.drawdownPct != null ? -data.riskSnapshot.drawdownPct : null, 1)}
+                  tone={data.riskSnapshot.drawdownPct ? "loss" : "neutral"}
+                />
+                <InfoRow
+                  label="Largest Position"
+                  value={data.riskSnapshot.largestPosition?.symbol ?? "—"}
+                  sublabel={
+                    data.riskSnapshot.largestPosition
+                      ? fmtPct(data.riskSnapshot.largestPosition.allocationPct, 1)
+                      : undefined
+                  }
+                />
+              </Panel>
+            </div>
+          </div>
 
           <div className="mb-8">
             <h2 className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted">Quick Actions</h2>

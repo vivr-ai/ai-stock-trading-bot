@@ -26,6 +26,11 @@ type EntryOrderLevels = {
   take_profit: number | null;
 };
 
+type PositionPeak = {
+  symbol: string;
+  peak_price: number;
+};
+
 export async function GET() {
   const session = await getServerSession(authOptions);
   if (!session) {
@@ -59,10 +64,27 @@ export async function GET() {
       levelsBySymbol = new Map(levels.map((l) => [l.symbol, l]));
     }
 
+    // Software trailing-stop layer (bot/trading/strategy.py's
+    // _maybe_trailing_stop_exit, RISK_TRAILING_STOP_ENABLED). A row only
+    // exists here once that feature has actually run at least one cycle
+    // for this symbol, so this naturally stays empty (and the column below
+    // shows "—") until the feature is both turned on and has processed a
+    // real cycle - no need to also plumb the on/off flag itself over here.
+    let peaksBySymbol = new Map<string, number>();
+    if (positions.length > 0) {
+      const symbols = positions.map((p) => p.symbol);
+      const peaks = await query<PositionPeak>(
+        `SELECT symbol, peak_price FROM position_peaks WHERE symbol = ANY($1::text[])`,
+        [symbols]
+      );
+      peaksBySymbol = new Map(peaks.map((p) => [p.symbol, Number(p.peak_price)]));
+    }
+
     const positionsWithLevels = positions.map((p) => ({
       ...p,
       stop_loss_price: levelsBySymbol.get(p.symbol)?.stop_price ?? null,
       take_profit_price: levelsBySymbol.get(p.symbol)?.take_profit ?? null,
+      trailing_peak_price: peaksBySymbol.get(p.symbol) ?? null,
     }));
 
     return NextResponse.json({

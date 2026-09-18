@@ -20,6 +20,7 @@ type Position = {
   updated_at: string;
   stop_loss_price: number | null;
   take_profit_price: number | null;
+  trailing_peak_price: number | null;
 };
 
 type PositionsResponse = {
@@ -32,6 +33,23 @@ function ConfidenceBadge({ score }: { score: number | null }) {
   if (score == null) return <span className="text-muted">—</span>;
   const tone = score > 0 ? "text-gain" : score < 0 ? "text-loss" : "text-muted";
   return <span className={`font-medium tabular-nums ${tone}`}>{score.toFixed(1)}</span>;
+}
+
+/** Software trailing-stop layer (RISK_TRAILING_STOP_ENABLED) - see
+ * bot/trading/strategy.py's _maybe_trailing_stop_exit. A peak is only
+ * recorded once that feature is on AND has run at least one cycle for this
+ * symbol, so "—" here just means "not applicable yet," not an error. */
+function TrailingStopCell({ peak, current }: { peak: number | null; current: number }) {
+  if (peak == null) return <span className="text-muted">—</span>;
+  const pullbackPct = peak > 0 ? ((peak - current) / peak) * 100 : 0;
+  return (
+    <span className="tabular-nums">
+      {fmtMoney(peak)}{" "}
+      <span className={`text-xs ${pullbackPct > 0 ? "text-loss/90" : "text-muted"}`}>
+        (-{pullbackPct.toFixed(1)}% off peak)
+      </span>
+    </span>
+  );
 }
 
 export default function PortfolioPage() {
@@ -87,7 +105,7 @@ export default function PortfolioPage() {
 
       {!loading && !error && data && data.positions.length > 0 && (
         <div className="overflow-x-auto rounded-xl border border-bg-border bg-bg-panel">
-          <table className="w-full min-w-[1000px] text-left text-sm">
+          <table className="w-full min-w-[1150px] text-left text-sm">
             <thead>
               <tr className="border-b border-bg-border text-xs uppercase tracking-wide text-muted">
                 <th className="px-4 py-3 font-medium">Symbol</th>
@@ -95,6 +113,7 @@ export default function PortfolioPage() {
                 <th className="px-4 py-3 font-medium">Avg Entry</th>
                 <th className="px-4 py-3 font-medium">Current Price</th>
                 <th className="px-4 py-3 font-medium">Stop Loss</th>
+                <th className="px-4 py-3 font-medium">Trailing Peak</th>
                 <th className="px-4 py-3 font-medium">Unrealized P/L</th>
                 <th className="px-4 py-3 font-medium">Allocation</th>
                 <th className="px-4 py-3 font-medium">AI Confidence</th>
@@ -110,8 +129,20 @@ export default function PortfolioPage() {
                     <td className="px-4 py-3 tabular-nums">{fmtNumber(p.qty)}</td>
                     <td className="px-4 py-3 tabular-nums">{fmtMoney(p.avg_entry_price)}</td>
                     <td className="px-4 py-3 tabular-nums">{fmtMoney(p.current_price)}</td>
-                    <td className="px-4 py-3 tabular-nums text-loss/90" title={p.take_profit_price != null ? `Take profit: ${fmtMoney(p.take_profit_price)}` : undefined}>
+                    <td
+                      className="px-4 py-3 tabular-nums text-loss/90"
+                      title={
+                        p.take_profit_price != null
+                          ? p.trailing_peak_price != null
+                            ? `Take profit (backstop): ${fmtMoney(p.take_profit_price)} - the trailing stop, not this, is the primary exit while it's tracking a peak`
+                            : `Take profit: ${fmtMoney(p.take_profit_price)}`
+                          : undefined
+                      }
+                    >
                       {p.stop_loss_price != null ? fmtMoney(p.stop_loss_price) : "—"}
+                    </td>
+                    <td className="px-4 py-3">
+                      <TrailingStopCell peak={p.trailing_peak_price} current={p.current_price} />
                     </td>
                     <td
                       className={`px-4 py-3 tabular-nums ${

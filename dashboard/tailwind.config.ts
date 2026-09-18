@@ -14,6 +14,10 @@ const config: Config = {
         gain: "#22c55e",
         loss: "#ef4444",
         accent: "#3b82f6",
+        // Secondary accent - used sparingly to give AI/Intelligence-flavoured
+        // content (vs. plain P/L numbers) its own visual identity instead of
+        // everything defaulting to the same blue.
+        accent2: "#8b5cf6",
         muted: "#8592a8",
       },
       fontFamily: {
