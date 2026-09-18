@@ -187,8 +187,21 @@ export default function StrategyPage() {
             falls 10% below its entry price — capping the loss on any single trade.
           </li>
           <li>
-            <span className="text-white">Take-profit at +20%.</span> Every position automatically sells if it
-            gains 20%, locking in the win rather than hoping for more.
+            <span className="text-white">Take-profit at +20% — or a trailing stop instead.</span> By default,
+            every position automatically sells the moment it gains 20%, locking in the win rather than hoping
+            for more. There&apos;s also an optional{" "}
+            <Term definition="A protective exit that follows a position's price upward instead of selling at one fixed target, so a strong winner isn't capped at the same level as a modest one. Off by default; a config setting turns it on.">
+              trailing stop
+            </Term>{" "}
+            layer that changes this: once on, the fixed +20% exit steps aside for a distant 50% backstop, and
+            the bot instead tracks each held position&apos;s highest price reached so far (its{" "}
+            <Term definition="The highest price a position has reached since it was bought, tracked continuously while the position is held. Used only by the trailing-stop layer to judge how far the price has since pulled back.">
+              peak
+            </Term>
+            ). Once a position is up at least 3% from where it was bought, the bot arms itself, and sells as
+            soon as the price falls back 7% from that peak — locking in most of a run instead of capping every
+            winner at the same +20%, or watching a big gain evaporate on the way back down. The stop-loss above
+            still applies underneath it exactly the same either way.
           </li>
           <li>
             <span className="text-white">Sentiment-driven exit at -5 (Path A positions).</span> Independent of
@@ -278,6 +291,15 @@ export default function StrategyPage() {
             The bot holds a stock bought two weeks ago on a momentum signal. New headlines about a product
             recall push sentiment to -6.5. The price hasn&apos;t yet dropped 10%, but because the sentiment rule
             (-5 threshold) is triggered independently, the bot sells early rather than waiting for the stop-loss.
+          </ExampleCard>
+          <ExampleCard type="sell" title="Trailing stop: letting a winner run, then locking it in">
+            Bought at $100. With the fixed rule, this position would auto-sell the instant it hit $120 — no
+            matter what. With the trailing stop on, that $120 exit is pushed way out to a $150 backstop instead,
+            so the bot keeps holding as the price climbs: $110, then $125, then a peak of $140 (already +40%,
+            well past the 3% that arms the trailing check). The price then slips back to $130 — a 7.1% pullback
+            from that $140 peak, just past the 7% trigger — and the bot sells there, locking in a $30 (30%)
+            gain. Had the price instead kept climbing straight to $150 without ever pulling back 7%, the bot
+            would have kept holding all the way there.
           </ExampleCard>
           <ExampleCard type="hold" title="Path B: an oversold dip, logged not bought">
             A stock trading well above its 200-day average drops sharply over two days — RSI(2) reads 4.1, deep
