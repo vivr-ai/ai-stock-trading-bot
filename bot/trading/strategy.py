@@ -435,9 +435,19 @@ class SentimentStrategy:
 
     def _sync_open_positions_snapshot(self, portfolio_value) -> None:
         """Push the full current book (with unrealized P/L straight from
-        Alpaca, plus the entry reason/confidence we recorded at buy time) to
+        Alpaca, plus the entry reason/confidence recorded at buy time) to
         the dashboard's open_positions table. Best-effort: any failure here
-        never affects trading, only what the dashboard shows."""
+        never affects trading, only what the dashboard shows.
+
+        ai_confidence/entry_reason/entry_time are read from the durable
+        `trades` table (Recorder.get_last_buy_trade) - NOT
+        bot/state.py's ephemeral open-lot JSON, which is wiped on every
+        Railway redeploy. That was the previous source, and it's exactly
+        why the Portfolio page could show these for a symbol bought after
+        the last redeploy but blank for anything held across one. Falls
+        back to the ephemeral lot only if there's no durable buy row at
+        all (e.g. a manually-adopted position with no trades-table
+        history, or the DB briefly unreachable)."""
         try:
             detailed = self.broker.open_positions_detailed()
         except Exception as exc:  # noqa: BLE001
@@ -446,6 +456,23 @@ class SentimentStrategy:
         rows = []
         for symbol, pos in detailed.items():
             lot = self.state.peek_open(symbol) or {}
+            try:
+                buy = self.recorder.get_last_buy_trade(symbol) or {}
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Durable buy-row lookup failed for %s (falling back to "
+                               "ephemeral state): %s", symbol, exc)
+                buy = {}
+            # Explicit None-checks, not `or`/`.get(k, default)` - a real
+            # sentiment_score of 0.0 is falsy but valid, and a present key
+            # with a None value (an adopted/backfilled buy row with no
+            # sentiment data) must still fall through to the ephemeral lot.
+            ai_confidence = buy.get("sentiment_score")
+            if ai_confidence is None:
+                ai_confidence = lot.get("sentiment_score")
+            entry_reason = buy.get("reason")
+            if entry_reason is None:
+                entry_reason = lot.get("reason")
+            entry_time = buy["ts"].timestamp() if buy.get("ts") else lot.get("entry_time")
             allocation_pct = (
                 (pos.market_value / portfolio_value * 100.0)
                 if portfolio_value else None
@@ -454,8 +481,8 @@ class SentimentStrategy:
                 "symbol": symbol, "qty": pos.qty, "avg_entry_price": pos.avg_entry_price,
                 "current_price": pos.current_price, "market_value": pos.market_value,
                 "unrealized_pl": pos.unrealized_pl, "unrealized_plpc": pos.unrealized_plpc,
-                "allocation_pct": allocation_pct, "ai_confidence": lot.get("sentiment_score"),
-                "entry_reason": lot.get("reason"), "entry_time": lot.get("entry_time"),
+                "allocation_pct": allocation_pct, "ai_confidence": ai_confidence,
+                "entry_reason": entry_reason, "entry_time": entry_time,
             })
         self.recorder.sync_open_positions(rows)
 
