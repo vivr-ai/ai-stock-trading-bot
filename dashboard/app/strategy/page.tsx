@@ -187,21 +187,43 @@ export default function StrategyPage() {
             falls 10% below its entry price — capping the loss on any single trade.
           </li>
           <li>
-            <span className="text-white">Take-profit at +20% — or a trailing stop instead.</span> By default,
-            every position automatically sells the moment it gains 20%, locking in the win rather than hoping
-            for more. There&apos;s also an optional{" "}
-            <Term definition="A protective exit that follows a position's price upward instead of selling at one fixed target, so a strong winner isn't capped at the same level as a modest one. Off by default; a config setting turns it on.">
-              trailing stop
-            </Term>{" "}
-            layer that changes this: once on, the fixed +20% exit steps aside for a distant 50% backstop, and
-            the bot instead tracks each held position&apos;s highest price reached so far (its{" "}
-            <Term definition="The highest price a position has reached since it was bought, tracked continuously while the position is held. Used only by the trailing-stop layer to judge how far the price has since pulled back.">
-              peak
-            </Term>
-            ). Once a position is up at least 3% from where it was bought, the bot arms itself, and sells as
-            soon as the price falls back 7% from that peak — locking in most of a run instead of capping every
-            winner at the same +20%, or watching a big gain evaporate on the way back down. The stop-loss above
-            still applies underneath it exactly the same either way.
+            <span className="text-white">Take-profit: a fixed +20% flag, or a trailing stop that lets it run —
+            never both.</span> This is a single switch for the whole bot, not a per-trade choice, and it&apos;s
+            decided once, the moment a position is bought, by whichever mode the bot is in at that instant:
+            <ul className="mt-2 list-disc space-y-1.5 pl-5">
+              <li>
+                <span className="text-white">Switch off (the plain default).</span> Every new position gets one
+                simple order taped to it: sell the instant it&apos;s up 20%. Fixed target, no exceptions — the
+                trailing logic below never even runs.
+              </li>
+              <li>
+                <span className="text-white">Switch on ({" "}
+                <Term definition="A protective exit that follows a position's price upward instead of selling at one fixed target, so a strong winner isn't capped at the same level as a modest one. A config setting turns it on for the whole bot at once — it isn't decided trade by trade.">
+                  trailing stop
+                </Term>
+                {" "}enabled — this bot&apos;s current setting).</span> The 20% flag isn&apos;t placed at all.
+                Instead, every new position gets a much further-out 50% backstop, and the bot starts tracking
+                its{" "}
+                <Term definition="The highest price a position has reached since it was bought, tracked continuously while the position is held. Used only by the trailing-stop layer to judge how far the price has since pulled back.">
+                  peak
+                </Term>{" "}
+                — the highest price it has reached so far. Once the position is up at least 3% from where it
+                was bought, the trailing stop arms itself and starts watching for a pullback. From then on, the
+                moment the price falls 7% below its peak, the bot sells right there — banking whatever gain
+                that locks in, which is usually well past 20%, but could occasionally be less if the position
+                barely got going before turning back down. If the price somehow keeps climbing without ever
+                pulling back 7%, the 50% backstop alone would eventually end the trade — but in practice the
+                7% pullback almost always fires first.
+              </li>
+            </ul>
+            Because the mode is set once per trade and never changes mid-flight, a single position never has
+            both the 20% flag and a trailing check racing each other — one or the other, decided at entry. The
+            one exception: a position bought <em>before</em> this setting was switched on keeps whichever order
+            it already had (possibly the old 20% flag), and the trailing check has since started watching it
+            too, since that check doesn&apos;t care when a position was opened — only whether the setting is
+            currently on. For that position alone, both are live, and whichever fires first wins. Either way,
+            the stop-loss above is a completely separate, always-on order — it doesn&apos;t know or care which
+            take-profit mode is active, and it&apos;s watching every position from the moment it&apos;s bought.
           </li>
           <li>
             <span className="text-white">Sentiment-driven exit at -5 (Path A positions).</span> Independent of
@@ -293,13 +315,15 @@ export default function StrategyPage() {
             (-5 threshold) is triggered independently, the bot sells early rather than waiting for the stop-loss.
           </ExampleCard>
           <ExampleCard type="sell" title="Trailing stop: letting a winner run, then locking it in">
-            Bought at $100. With the fixed rule, this position would auto-sell the instant it hit $120 — no
-            matter what. With the trailing stop on, that $120 exit is pushed way out to a $150 backstop instead,
-            so the bot keeps holding as the price climbs: $110, then $125, then a peak of $140 (already +40%,
-            well past the 3% that arms the trailing check). The price then slips back to $130 — a 7.1% pullback
-            from that $140 peak, just past the 7% trigger — and the bot sells there, locking in a $30 (30%)
-            gain. Had the price instead kept climbing straight to $150 without ever pulling back 7%, the bot
-            would have kept holding all the way there.
+            Bought at $100 with the trailing stop on, so no 20% flag was ever placed — just a distant $150
+            backstop and a $90 stop-loss, both set the moment the trade opens. The price climbs: $102 (past the
+            3% that arms the trailing check, so the bot now has a peak to trail), then $110, then $125, then a
+            peak of $140. It slips back to $130 — a 7.1% pullback from that $140 peak, just past the 7%
+            trigger — and the bot sells there, locking in a $30 (30%) gain. Note the $90 stop-loss was live the
+            entire time, completely separately: if the price had instead dropped straight from $102 down to $90
+            without ever climbing further, the stop-loss alone would have sold it there for a loss, regardless
+            of the trailing stop never having anything to trail from. And had the price instead kept climbing
+            straight to $150 without ever pulling back 7%, the bot would have kept holding all the way there.
           </ExampleCard>
           <ExampleCard type="hold" title="Path B: an oversold dip, logged not bought">
             A stock trading well above its 200-day average drops sharply over two days — RSI(2) reads 4.1, deep
