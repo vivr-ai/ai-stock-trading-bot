@@ -666,8 +666,16 @@ class SentimentStrategy:
                 symbol,
             )
             return
-        entry_price = last_buy["price"]
-        qty = last_buy["qty"]
+        # Same defensive cast as _maybe_trailing_stop_exit above, and for the
+        # same reason: get_last_buy_trade() already normalizes NUMERIC
+        # columns to float, but exit_price here is a plain float too (see
+        # this method's signature), and float arithmetic with a
+        # decimal.Decimal raises TypeError rather than losing precision -
+        # this fallback path exists specifically to recover a trade after a
+        # Railway redeploy wiped local state, so it's exactly the wrong
+        # place to have a second, unrelated failure mode.
+        entry_price = float(last_buy["price"])
+        qty = float(last_buy["qty"])
         full_reason = f"{exit_reason} (reconstructed - open-lot state was lost)"
         pnl = self.closed_trade_logger.log(
             symbol, qty, entry_price, exit_price,
@@ -1280,6 +1288,17 @@ class SentimentStrategy:
         entry_price = buy.get("price") if buy else None
         if not entry_price or entry_price <= 0:
             return False
+        # Recorder.get_last_buy_trade() already normalizes NUMERIC columns
+        # to float (see db.py's _row_to_dict), but this cast stays here too
+        # as a second line of defense - `price` (from broker.latest_price)
+        # is always a plain float, and float arithmetic with a
+        # decimal.Decimal raises TypeError immediately rather than losing
+        # precision, which is exactly what silently broke this check (and
+        # the sentiment-exit/mean-reversion-exit checks below it, since the
+        # exception aborted the rest of _process_symbol) on every cycle for
+        # every held position from the moment RISK_TRAILING_STOP_ENABLED
+        # was first turned on in production.
+        entry_price = float(entry_price)
 
         gain_pct = (price - entry_price) / entry_price * 100.0
         if gain_pct < self.cfg.risk.trailing_stop_activation_pct:

@@ -11,6 +11,7 @@ import sys
 import time as time_module
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -583,6 +584,33 @@ def test_trailing_stop_fires_on_pullback_from_peak():
     assert "trailing stop" in sold["reason"]
     assert "120.00" in sold["reason"]
     assert "110.00" in sold["reason"]
+
+
+def test_trailing_stop_handles_decimal_entry_price_from_db():
+    """Regression test for a real production incident: psycopg2 returns
+    every NUMERIC column (trades.price included) as decimal.Decimal, not
+    float, so a real get_last_buy_trade() call returns {"price":
+    Decimal("100.0")} - never the plain float this file's other fakes use.
+    Before the fix (bot/persistence/db.py's _row_to_dict), `price -
+    entry_price` at the top of this method mixed a float (from
+    broker.latest_price) with a Decimal and raised TypeError on every
+    single cycle for every held position from the moment
+    RISK_TRAILING_STOP_ENABLED was first turned on - silently disabling
+    not just the trailing stop but the sentiment-exit/mean-reversion-exit
+    checks below it too, since the exception propagated out of
+    _process_symbol before either ran. This fake intentionally returns a
+    Decimal to make sure that class of bug can't silently come back."""
+    recorder = _FakeTrailingRecorder(last_buy={"price": Decimal("100.0")}, peak=120.0)
+    fake = _FakeTrailingStrategy(
+        cfg=_trailing_cfg(trailing_stop_enabled=True, trailing_stop_activation_pct=3.0,
+                           trailing_stop_pct=7.0),
+        recorder=recorder, broker=_FakeTrailingBroker(110.0))
+
+    fired = SentimentStrategy._maybe_trailing_stop_exit(
+        fake, "AAPL", _sentiment(5.0, 4), "sentiment_momentum", {"tech": 1}, CycleStats())
+
+    assert fired is True
+    assert len(fake.sells) == 1
 
 
 def test_trailing_stop_fires_for_mean_reversion_entries_too():

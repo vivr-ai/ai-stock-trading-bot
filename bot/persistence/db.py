@@ -17,6 +17,7 @@ Design goals:
 """
 from __future__ import annotations
 
+import decimal
 import json
 import logging
 import os
@@ -24,6 +25,23 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _row_to_dict(cols, row) -> Dict[str, Any]:
+    """psycopg2 returns every NUMERIC column as decimal.Decimal, not float.
+    Decimal refuses to mix with a plain float in ANY arithmetic - not
+    "loses precision", raises TypeError immediately - and the trading
+    logic's own price math is all done in float (see e.g.
+    SentimentStrategy._maybe_trailing_stop_exit, alpaca_client.latest_price).
+    A row handed back as decimal.Decimal is a bug waiting to crash the very
+    first cycle that does arithmetic with it - see the trailing-stop
+    incident this was found from (RISK_TRAILING_STOP_ENABLED crashed on
+    every held position from the day it was turned on, because
+    get_last_buy_trade's price came back as Decimal). Every raw DB row this
+    module turns into a dict for the trading logic to consume goes through
+    this, so callers get ordinary floats like every other price value in
+    this codebase, and a future caller doesn't have to remember to cast."""
+    return {c: (float(v) if isinstance(v, decimal.Decimal) else v) for c, v in zip(cols, row)}
 
 
 class Recorder:
@@ -507,7 +525,7 @@ class Recorder:
                     if row is None:
                         return None
                     cols = [d[0] for d in cur.description]
-                    return dict(zip(cols, row))
+                    return _row_to_dict(cols, row)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Dashboard DB last-buy lookup failed for %s: %s", symbol, exc)
             return None
@@ -566,7 +584,7 @@ class Recorder:
                     if buy_row is None:
                         return None
                     buy_cols = [d[0] for d in cur.description]
-                    buy = dict(zip(buy_cols, buy_row))
+                    buy = _row_to_dict(buy_cols, buy_row)
 
                     cur.execute(
                         """
