@@ -185,6 +185,19 @@ class DashboardConfig:
 
 
 @dataclass
+class RetentionConfig:
+    # How long decisions rows are kept before the daily prune job deletes
+    # them (see bot/persistence/db.py's Recorder.prune_old_decisions and
+    # main.py's run_prune_old_decisions). Never applies to trades,
+    # closed_trades, or notifications - those are kept forever for tax/audit
+    # purposes - and never to reversion_shadow_buy/reversion_shadow_exit
+    # rows regardless of age, since Path B's shadow-verdict-readiness sample
+    # depends on the all-time earliest one of those.
+    decisions_days: int
+    prune_batch_size: int
+
+
+@dataclass
 class Config:
     alpaca: AlpacaConfig
     universe: UniverseConfig
@@ -199,6 +212,7 @@ class Config:
     telegram: TelegramConfig
     trading: TradingConfig
     dashboard: DashboardConfig
+    retention: RetentionConfig
     project_root: str = field(default="")
     config_file_used: Optional[str] = field(default=None)
 
@@ -455,6 +469,14 @@ def load_config(path: str = "config.ini") -> Config:
                 parser, "dashboard", "internal_api_key", "DASHBOARD_INTERNAL_API_KEY", ""
             ),
         ),
+        retention=RetentionConfig(
+            decisions_days=_get(
+                parser, "retention", "decisions_days", "RETENTION_DECISIONS_DAYS", 120, int
+            ),
+            prune_batch_size=_get(
+                parser, "retention", "prune_batch_size", "RETENTION_PRUNE_BATCH_SIZE", 5000, int
+            ),
+        ),
         project_root=project_root,
         config_file_used=path if parser is not None else None,
     )
@@ -573,6 +595,16 @@ def _validate(cfg: Config) -> None:
             raise ValueError(
                 "strategy.reversion_max_hold_days / STRATEGY_REVERSION_MAX_HOLD_DAYS must be >= 1"
             )
+
+    # ---- decisions-table retention/pruning -------------------------------
+    if cfg.retention.decisions_days < 1:
+        raise ValueError(
+            "retention.decisions_days / RETENTION_DECISIONS_DAYS must be >= 1"
+        )
+    if cfg.retention.prune_batch_size < 1:
+        raise ValueError(
+            "retention.prune_batch_size / RETENTION_PRUNE_BATCH_SIZE must be >= 1"
+        )
 
     # ---- Software trailing-stop layer ------------------------------------
     if not (0.0 < cfg.risk.trailing_stop_pct < 100.0):

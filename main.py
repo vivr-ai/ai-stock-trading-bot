@@ -403,6 +403,29 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001 - best-effort, must never crash the scheduler
             log.warning("Monthly research report failed: %s", exc)
 
+    def run_prune_old_decisions():
+        # Keeps the decisions table's steady-state size bounded (see
+        # bot/persistence/db.py's Recorder.prune_old_decisions for the full
+        # rationale - retention window, the shadow-decision exclusion, and
+        # why trades/closed_trades/notifications are never touched here).
+        # Best-effort like the account-activities sync above: a failure just
+        # logs a warning and the next day's run picks up where this one left
+        # off, never anything that should interrupt trading.
+        deleted = recorder.prune_old_decisions(
+            retention_days=cfg.retention.decisions_days,
+            batch_size=cfg.retention.prune_batch_size,
+        )
+        if deleted is None:
+            log.warning("decisions-table prune did not complete (see prior warning for cause).")
+        elif deleted:
+            log.info(
+                "Pruned %d decisions row(s) older than %d days.",
+                deleted, cfg.retention.decisions_days,
+            )
+        else:
+            log.info("decisions-table prune: nothing older than %d days to delete.",
+                      cfg.retention.decisions_days)
+
     if args.monthly_report:
         run_monthly_report()
         return 0
@@ -435,6 +458,7 @@ def main() -> int:
             cfg, run_cycle_safely,
             eod_fn=run_eod, shutdown_event=_shutdown, on_crash=on_scheduler_crash,
             monthly_report_fn=run_monthly_report,
+            prune_fn=run_prune_old_decisions,
         )
     except Exception as exc:  # noqa: BLE001 - truly unhandled; last-resort alert before exit
         log.exception("Bot process is exiting due to an unhandled error: %s", exc)

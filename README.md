@@ -213,6 +213,18 @@ ephemeral state file, so it survives a Railway redeploy mid-hold. Runs ahead
 of both entry paths' own sell rules; the existing stop-loss and (widened)
 take-profit bracket stay in place underneath it as the ultimate backstop.
 
+## Decisions-table retention
+
+A daily job (03:00 market time, well before the open) deletes `decisions`
+rows older than `RETENTION_DECISIONS_DAYS` (120 by default), in batches of
+`RETENTION_PRUNE_BATCH_SIZE` (5000) so a large backlog doesn't hold one long
+lock against a table the dashboard reads from constantly. `trades`,
+`closed_trades`, and `notifications` are never pruned — full buy/sell/P&L
+history is kept forever for tax records — and `reversion_shadow_buy` /
+`reversion_shadow_exit` rows are excluded from deletion at any age, since
+Path B's shadow-verdict-readiness sample depends on the all-time earliest
+one of those. See `Recorder.prune_old_decisions` in `bot/persistence/db.py`.
+
 ## Daily performance report
 
 `python main.py --eod` (or the automatic 16:05 ET job) writes

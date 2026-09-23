@@ -127,3 +127,37 @@ def test_trailing_stop_pct_out_of_range_is_rejected(monkeypatch, tmp_path):
     monkeypatch.setenv("RISK_TRAILING_STOP_PCT", "0")
     with pytest.raises(ValueError, match="trailing_stop_pct"):
         load_config(str(tmp_path / "nope.ini"))
+
+
+def test_decisions_retention_defaults(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    cfg = load_config(str(tmp_path / "nope.ini"))
+    assert cfg.retention.decisions_days == 120
+    assert cfg.retention.prune_batch_size == 5000
+
+
+def test_decisions_retention_days_is_configurable(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("RETENTION_DECISIONS_DAYS", "60")
+    monkeypatch.setenv("RETENTION_PRUNE_BATCH_SIZE", "1000")
+    cfg = load_config(str(tmp_path / "nope.ini"))
+    assert cfg.retention.decisions_days == 60
+    assert cfg.retention.prune_batch_size == 1000
+
+
+def test_decisions_retention_days_below_one_is_rejected(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("RETENTION_DECISIONS_DAYS", "0")
+    with pytest.raises(ValueError, match="decisions_days"):
+        load_config(str(tmp_path / "nope.ini"))
+
+
+def test_decisions_prune_batch_size_below_one_is_rejected(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("RETENTION_PRUNE_BATCH_SIZE", "0")
+    with pytest.raises(ValueError, match="prune_batch_size"):
+        load_config(str(tmp_path / "nope.ini"))

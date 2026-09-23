@@ -24,7 +24,8 @@ logger = logging.getLogger(__name__)
 
 def start_scheduler(cfg, run_cycle_fn: Callable, eod_fn: Optional[Callable] = None,
                      shutdown_event=None, on_crash: Optional[Callable[[str], None]] = None,
-                     monthly_report_fn: Optional[Callable] = None) -> None:
+                     monthly_report_fn: Optional[Callable] = None,
+                     prune_fn: Optional[Callable] = None) -> None:
     from apscheduler.schedulers.blocking import BlockingScheduler
     from apscheduler.triggers.cron import CronTrigger
 
@@ -62,6 +63,18 @@ def start_scheduler(cfg, run_cycle_fn: Callable, eod_fn: Optional[Callable] = No
                 monthly_report_fn,
                 CronTrigger(day="1", hour="6", minute="0", timezone=tz),
                 id="monthly_research_report", max_instances=1, misfire_grace_time=86_400,
+            )
+        if prune_fn is not None:
+            # Daily, well before market open, off the trading cycle entirely
+            # (unlike cycle/cycle_close, this doesn't need a trading day -
+            # decisions rows accumulate every calendar day the bot runs).
+            # misfire_grace_time is generous (a day) since missing the exact
+            # hour on a Railway restart is harmless - the next day's run
+            # just deletes a slightly larger backlog.
+            scheduler.add_job(
+                prune_fn,
+                CronTrigger(hour="3", minute="0", timezone=tz),
+                id="decisions_prune", max_instances=1, misfire_grace_time=86_400,
             )
 
         def _handle_stop(signum, _frame):

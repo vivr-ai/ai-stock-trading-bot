@@ -878,3 +878,87 @@ class Recorder:
             dict(type=type_, severity=severity, title=title, message=message,
                  metadata=self._json(metadata)),
         )
+
+    def prune_old_decisions(self, retention_days: int = 120, batch_size: int = 5000) -> Optional[int]:
+        """Deletes decisions rows older than retention_days, in batches, so
+        the table doesn't grow forever (~90-100 rows/cycle, ~14 cycles/
+        weekday - unbounded, this heads toward hundreds of thousands of
+        rows/year against Postgres's 500MB volume). Run daily from
+        main.py's run_prune_old_decisions via bot/scheduler.py's prune_fn.
+
+        This is the ONLY table this (or any) pruning touches. trades,
+        closed_trades, and notifications are never pruned - full buy/sell/
+        P&L history has to survive indefinitely for tax records, which is
+        exactly the constraint that ruled out pruning those tables at all.
+
+        Explicitly excludes reversion_shadow_buy/reversion_shadow_exit rows
+        from deletion at ANY age: get_shadow_verdict_progress() (above) and
+        the dashboard's Shadow vs Live page both depend on the all-time
+        earliest shadow row to compute "weeks observed" for Path B's
+        readiness bar (SHADOW_VERDICT_MIN_CLOSED/MIN_WEEKS in
+        bot/trading/strategy.py). Pruning those rows would silently corrupt
+        that sample the same way the Decimal/float bug silently corrupted
+        the trailing-stop sell path - quietly, with no error anywhere.
+
+        Deletes in batches (batch_size rows per statement, each its own
+        committed transaction) rather than one unbounded DELETE, so working
+        through a large first-run backlog doesn't hold one long-running lock
+        against a table several dashboard API routes read from concurrently
+        (decisions, system-health, risk, home, shadow-comparison). Each
+        batch uses the existing idx_decisions_ts index for its range scan.
+
+        Returns the total number of rows deleted, or None if the DB isn't
+        configured, or a connection error meant nothing could be attempted
+        at all. Fails toward "did nothing further" rather than raising into
+        the caller - this runs from a best-effort daily scheduler job, the
+        same posture as every other Recorder integration point in this
+        module; the next day's run just picks up where this one left off."""
+        if not self.enabled:
+            return None
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB connect failed (decisions prune skipped): %s", exc)
+            return None
+        total_deleted = 0
+        try:
+            with conn.cursor() as cur:
+                while True:
+                    cur.execute(
+                        """
+                        DELETE FROM decisions
+                        WHERE id IN (
+                            SELECT id FROM decisions
+                            WHERE ts < now() - make_interval(days => %(retention_days)s)
+                              AND decision NOT IN ('reversion_shadow_buy', 'reversion_shadow_exit')
+                            ORDER BY ts
+                            LIMIT %(batch_size)s
+                        )
+                        """,
+                        dict(retention_days=retention_days, batch_size=batch_size),
+                    )
+                    deleted = cur.rowcount
+                    conn.commit()
+                    total_deleted += deleted
+                    if deleted < batch_size:
+                        break
+            self.healthy = True
+            self.last_error = None
+            return total_deleted
+        except Exception as exc:  # noqa: BLE001
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            logger.warning(
+                "Dashboard DB decisions prune failed after deleting %d row(s): %s",
+                total_deleted, exc,
+            )
+            self.healthy = False
+            self.last_error = str(exc)
+            return total_deleted if total_deleted else None
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
