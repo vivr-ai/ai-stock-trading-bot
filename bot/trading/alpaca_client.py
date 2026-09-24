@@ -16,6 +16,7 @@ Docs: https://alpaca.markets/sdks/python/
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set
@@ -787,19 +788,42 @@ class AlpacaBroker:
             status=str(order.status),
         )
 
-    def cancel_orders_for(self, symbol: str) -> None:
-        """Cancel any live orders for a symbol (the leftover bracket legs)."""
+    def cancel_orders_for(self, symbol: str, settle_timeout_s: float = 10.0,
+                          poll_interval_s: float = 0.5) -> None:
+        """Cancel any live orders for a symbol (the leftover bracket legs),
+        then wait (up to settle_timeout_s) until Alpaca no longer reports any
+        open order for it. Alpaca processes cancels asynchronously - an order
+        sits in pending_cancel for a moment and its shares stay reserved
+        (held_for_orders) until the cancel completes - so calling
+        close_position immediately afterwards can fail with "insufficient
+        qty available". Waiting here is what lets close_position safely
+        flatten a position that has a standing protective order."""
         from alpaca.trading.requests import GetOrdersRequest
         from alpaca.trading.enums import QueryOrderStatus
 
-        try:
+        def _open_for_symbol():
             orders = self._retry(
                 lambda: self._trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN)),
                 "get_orders(open)",
             )
-            for o in orders:
-                if o.symbol == symbol:
-                    self._retry(lambda: self._trading.cancel_order_by_id(o.id), f"cancel_order({symbol})")
+            return [o for o in orders if o.symbol == symbol]
+
+        try:
+            open_orders = _open_for_symbol()
+            for o in open_orders:
+                self._retry(lambda o=o: self._trading.cancel_order_by_id(o.id),
+                            f"cancel_order({symbol})")
+            if not open_orders:
+                return
+            deadline = time.monotonic() + settle_timeout_s
+            while time.monotonic() < deadline:
+                time.sleep(poll_interval_s)
+                if not _open_for_symbol():
+                    return
+            logger.warning(
+                "cancel_orders_for %s: orders still open after %.1fs; attempting close anyway",
+                symbol, settle_timeout_s,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("cancel_orders_for %s failed: %s", symbol, exc)
 

@@ -55,7 +55,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Set
 
 from ..sentiment.base import SentimentResult
 from ..universe.static_universe import sector_of
@@ -137,6 +137,12 @@ class SentimentStrategy:
         # local fallback, and a recovery note once it stops, instead of
         # spamming Telegram every 30 min while degraded.
         self._last_clock_degraded: bool = False
+        # Symbols _adopt_legacy_positions submitted a NEW protective
+        # stop/take-profit order for during the current cycle. _do_sell skips
+        # only these (see the guard there) - NOT every symbol with any open
+        # order, which is every held position, since each one always carries
+        # its standing protective order. Reset at the top of each adoption pass.
+        self._protected_this_cycle: Set[str] = set()
 
     def run_cycle(self, force: bool = False, scheduler_status: str = "scheduled") -> None:
         market_open = self.broker.is_market_open()
@@ -513,6 +519,7 @@ class SentimentStrategy:
         every held symbol - not gated behind new_entries_allowed/pause since
         this manages risk on EXISTING positions, not new entries (same
         philosophy as the sentiment-driven sell path elsewhere in this file)."""
+        self._protected_this_cycle = set()
         try:
             detailed = self.broker.open_positions_detailed()
         except Exception as exc:  # noqa: BLE001
@@ -557,6 +564,7 @@ class SentimentStrategy:
                         )
                         protected_now = True
                         protect_order_id = order.order_id
+                        self._protected_this_cycle.add(symbol)
                         logger.info(
                             "Adopted %s: submitted protective stop/take-profit order %s "
                             "(stop %.2f / tp %.2f) for a position this bot didn't buy itself.",
@@ -822,8 +830,8 @@ class SentimentStrategy:
                     rsi_period=self.cfg.strategy.rsi_period,
                 )
                 exit_reason = self._reversion_exit_reason(snap, lot)
-                if exit_reason:
-                    self._do_sell(symbol, sentiment, reason=exit_reason, entry_path="mean_reversion")
+                if exit_reason and self._do_sell(symbol, sentiment, reason=exit_reason,
+                                                 entry_path="mean_reversion"):
                     self.state.mark_exit(symbol)
                     sector_counts[sector_of(symbol)] -= 1
                     stats.sells += 1
@@ -843,12 +851,12 @@ class SentimentStrategy:
                         headline_count=sentiment.article_count,
                     )
                     return exposure
-                self._do_sell(symbol, sentiment,
-                              reason=f"sentiment {sentiment.score:.1f} < {self.cfg.strategy.sell_threshold}",
-                              entry_path="sentiment_momentum")
-                self.state.mark_exit(symbol)
-                sector_counts[sector_of(symbol)] -= 1
-                stats.sells += 1
+                if self._do_sell(symbol, sentiment,
+                                 reason=f"sentiment {sentiment.score:.1f} < {self.cfg.strategy.sell_threshold}",
+                                 entry_path="sentiment_momentum"):
+                    self.state.mark_exit(symbol)
+                    sector_counts[sector_of(symbol)] -= 1
+                    stats.sells += 1
             return exposure
 
         # ---- BUY gates (cheap checks first, API calls last) - shared by both paths ----
@@ -1262,8 +1270,9 @@ class SentimentStrategy:
 
         Fails open on any missing price/entry data or DB error: returns
         False and does nothing, leaving the existing bracket order and the
-        entry path's own sell rule as the backstop. Returns True only when
-        it actually sold, so the caller can skip the rest of this cycle's
+        entry path's own sell rule as the backstop. Returns True once the
+        trailing stop has triggered (and a close was attempted), so the
+        caller can skip the rest of this cycle's
         holding-management logic for `symbol` (mirroring how the
         mean-reversion branch below returns immediately after its own
         exit)."""
@@ -1324,10 +1333,14 @@ class SentimentStrategy:
         logger.info("SELL %s trailing stop triggered: %s", symbol, reason,
                     extra={"symbol": symbol, "decision": "trailing_stop", "peak": peak,
                            "price": price, "pullback_pct": pullback_pct, "gain_pct": gain_pct})
-        self._do_sell(symbol, sentiment, reason=reason, entry_path=entry_path)
-        self.state.mark_exit(symbol)
-        sector_counts[sector_of(symbol)] -= 1
-        stats.sells += 1
+        # Returns True whether or not the close went through, so the caller
+        # doesn't immediately retry the same close via the sentiment/
+        # reversion rule (a failed close_position would just fail - and alert
+        # - a second time). Exit bookkeeping only happens on a real close.
+        if self._do_sell(symbol, sentiment, reason=reason, entry_path=entry_path):
+            self.state.mark_exit(symbol)
+            sector_counts[sector_of(symbol)] -= 1
+            stats.sells += 1
         return True
 
     def _do_buy(self, symbol, sentiment, price, acct, exposure, open_positions,
@@ -1455,7 +1468,12 @@ class SentimentStrategy:
         stats.buys += 1
         return exposure + plan.notional
 
-    def _do_sell(self, symbol, sentiment, reason, entry_path: str = "sentiment_momentum") -> None:
+    def _do_sell(self, symbol, sentiment, reason, entry_path: str = "sentiment_momentum") -> bool:
+        """Close `symbol`. Returns True if a close was submitted (or simulated
+        in dry-run), False if it was skipped or failed - callers must only do
+        their exit bookkeeping (mark_exit / sector_counts / stats.sells) on
+        True, otherwise a skipped sell frees a sector slot and starts a
+        re-entry cooldown for a position that is still held."""
         if self.cfg.risk.dry_run:
             exit_price = self.broker.latest_price(symbol)
             logger.info("[DRY RUN] would CLOSE %s (%s)", symbol, reason,
@@ -1508,33 +1526,30 @@ class SentimentStrategy:
             # would also fix this, but clearing here matches open_positions'
             # own delete-on-close housekeeping).
             self.recorder.clear_position_peak(symbol)
-            return
+            return True
 
-        # Guard against racing a working order for the same symbol - most
-        # commonly _adopt_legacy_positions placing a protective stop/take-
-        # profit in THIS SAME cycle (its qty check runs before this sentiment
-        # sell does, using a pending-orders snapshot taken before adoption
-        # ran, so it doesn't know a new order now holds the shares). Without
-        # this, close_position's own cancel-then-close attempts to flatten a
-        # position whose shares are already committed to that other order,
-        # fails with Alpaca's "insufficient qty available", and fires a
-        # scary but harmless "SELL failed" alert - the position is usually
-        # already being closed by the order that beat it here. Checking
-        # fresh (not the cycle-start `pending` set) since that's exactly
-        # what's stale in this scenario.
-        if symbol in self.broker.pending_order_symbols():
+        # Skip ONLY a position that _adopt_legacy_positions gave a brand-new
+        # protective order to earlier in THIS cycle - the one real race this
+        # guard exists for (that order was submitted seconds ago and may not
+        # be cancellable/settled yet). It previously checked
+        # broker.pending_order_symbols(), i.e. ANY open order - but every
+        # held position always has its standing protective stop/take-profit
+        # open, so that blocked every software exit (sentiment, trailing
+        # stop, mean-reversion) on every cycle from 2026-09-20 onward.
+        # close_position() already cancels those standing legs itself, and
+        # now waits for the cancels to settle before closing.
+        if symbol in getattr(self, "_protected_this_cycle", ()):
             logger.info(
-                "SELL %s skipped: a working order already exists for this symbol (likely "
-                "today's protective stop/take-profit) - avoiding a duplicate close_position "
-                "call. If sentiment is still bearish next cycle and that order hasn't "
-                "resolved it yet, this will retry then.",
-                symbol, extra={"symbol": symbol, "decision": "sell_skipped", "reason": "already_closing"},
+                "SELL %s deferred: a protective order was just submitted for this symbol "
+                "this cycle - will retry next cycle.",
+                symbol, extra={"symbol": symbol, "decision": "sell_skipped",
+                               "reason": "protected_this_cycle"},
             )
             self.recorder.record_decision(
-                symbol=symbol, decision="sell_skipped", reason="already_closing",
+                symbol=symbol, decision="sell_skipped", reason="protected_this_cycle",
                 sentiment_score=sentiment.score, sentiment_label=sentiment.label,
             )
-            return
+            return False
 
         order = self.broker.close_position(symbol)
         if order is None:
@@ -1544,7 +1559,7 @@ class SentimentStrategy:
                 type_="error", severity="warning", title=f"SELL {symbol} failed",
                 message="close_position returned no order",
             )
-            return
+            return False
         logger.info("Submitted CLOSE %s: order %s (%s)", symbol, order.order_id, reason,
                     extra={"symbol": symbol, "decision": "sell", "dry_run": False,
                            "order_id": order.order_id, "reason": reason})
@@ -1600,3 +1615,4 @@ class SentimentStrategy:
                 # _log_closed_trade_from_history - reconstruct from the
                 # trades table instead of dropping this exit.
                 self._log_closed_trade_from_history(symbol, exit_price, reason)
+        return True

@@ -62,6 +62,7 @@ class _RiskCfg:
     trailing_stop_pct: float = 7.0
     trailing_stop_activation_pct: float = 3.0
     trailing_stop_backstop_take_profit_pct: float = 50.0
+    dry_run: bool = False
 
 
 @dataclass
@@ -476,15 +477,17 @@ class _FakeTrailingState:
 
 
 class _FakeTrailingStrategy:
-    def __init__(self, cfg=None, recorder=None, broker=None):
+    def __init__(self, cfg=None, recorder=None, broker=None, sell_succeeds=True):
         self.cfg = cfg or _Cfg()
         self.recorder = recorder
         self.broker = broker
         self.state = _FakeTrailingState()
         self.sells = []
+        self._sell_succeeds = sell_succeeds
 
     def _do_sell(self, symbol, sentiment, reason, entry_path="sentiment_momentum"):
         self.sells.append({"symbol": symbol, "reason": reason, "entry_path": entry_path})
+        return self._sell_succeeds
 
 
 def _trailing_cfg(**risk_kwargs):
@@ -642,3 +645,172 @@ def test_trailing_stop_recorder_error_fails_open():
         fake, "AAPL", _sentiment(5.0, 4), "sentiment_momentum", {}, CycleStats())
     assert fired is False
     assert fake.sells == []
+
+
+def test_trailing_stop_no_exit_bookkeeping_when_sell_did_not_go_through():
+    """If _do_sell skips or fails, the position is still held - it must not
+    free a sector slot, start a re-entry cooldown, or count as a sell."""
+    recorder = _FakeTrailingRecorder(last_buy={"price": 100.0}, peak=120.0)
+    fake = _FakeTrailingStrategy(
+        cfg=_trailing_cfg(trailing_stop_enabled=True, trailing_stop_activation_pct=3.0,
+                           trailing_stop_pct=7.0),
+        recorder=recorder, broker=_FakeTrailingBroker(110.0), sell_succeeds=False)
+    stats = CycleStats()
+    sector_counts = {"tech": 1}
+
+    fired = SentimentStrategy._maybe_trailing_stop_exit(
+        fake, "AAPL", _sentiment(5.0, 4), "sentiment_momentum", sector_counts, stats)
+
+    assert fired is True           # handled: don't retry the same close this cycle
+    assert len(fake.sells) == 1    # a close WAS attempted
+    assert stats.sells == 0
+    assert sector_counts["tech"] == 1
+    assert fake.state.exits == []
+
+
+# ---- _do_sell vs. standing protective orders ---------------------------
+# Regression tests for the 2026-09-20..23 production incident: _do_sell
+# skipped any symbol in broker.pending_order_symbols() - but every held
+# position ALWAYS has its protective stop/take-profit order open, so every
+# software exit (sentiment, trailing stop, mean-reversion) was skipped on
+# every cycle ("SELL GOOGL skipped: a working order already exists...", 13
+# cycles in a row). The earlier fakes in this file stub _do_sell out
+# entirely, which is how this went unnoticed; these call the real one.
+
+class _FakeSellBroker:
+    def __init__(self, open_order_symbols=()):
+        self._open = set(open_order_symbols)  # standing protective orders
+        self.closed = []
+
+    def pending_order_symbols(self):
+        return set(self._open)
+
+    def close_position(self, symbol):
+        from bot.trading.alpaca_client import PlacedOrder
+        self.closed.append(symbol)
+        self._open.discard(symbol)
+        return PlacedOrder(order_id="ord-1", symbol=symbol, side="sell", qty=10,
+                           stop_price=0.0, take_profit_price=0.0, status="accepted",
+                           filled_avg_price=None)
+
+    def latest_price(self, symbol):
+        return 100.0
+
+
+class _FakeSellRecorder:
+    def __init__(self):
+        self.decisions = []
+
+    def record_decision(self, **kwargs):
+        self.decisions.append(kwargs)
+
+    def __getattr__(self, _name):
+        return lambda *a, **k: None
+
+
+class _FakeSellStrategy:
+    def __init__(self, broker, protected_this_cycle=()):
+        self.cfg = _Cfg()  # risk.dry_run defaults to False -> real close path
+        self.broker = broker
+        self.recorder = _FakeSellRecorder()
+        self.trade_logger = _NullRecorder()
+        self.closed_trade_logger = None
+        self._protected_this_cycle = set(protected_this_cycle)
+
+
+def test_do_sell_closes_position_that_has_a_standing_protective_order():
+    """The normal case: held position, its protective stop/take-profit is
+    open at the broker (as it always is), bearish signal -> must close.
+    close_position() cancels those legs itself."""
+    broker = _FakeSellBroker(open_order_symbols={"GOOGL"})
+    fake = _FakeSellStrategy(broker)
+
+    sold = SentimentStrategy._do_sell(fake, "GOOGL", _sentiment(-9.0, 10), reason="sentiment -9.0 < -5.0")
+
+    assert sold is True
+    assert broker.closed == ["GOOGL"]
+    assert not any(d.get("decision") == "sell_skipped" for d in fake.recorder.decisions)
+
+
+def test_do_sell_defers_only_when_protected_this_same_cycle():
+    """The one race the guard is for: _adopt_legacy_positions JUST submitted
+    a protective order for this symbol this cycle - defer to next cycle."""
+    broker = _FakeSellBroker(open_order_symbols={"NVDA"})
+    fake = _FakeSellStrategy(broker, protected_this_cycle={"NVDA"})
+
+    sold = SentimentStrategy._do_sell(fake, "NVDA", _sentiment(-9.0, 10), reason="sentiment -9.0 < -5.0")
+
+    assert sold is False
+    assert broker.closed == []
+    assert fake.recorder.decisions[-1]["reason"] == "protected_this_cycle"
+
+
+def test_do_sell_returns_false_when_close_fails():
+    class _FailingBroker(_FakeSellBroker):
+        def close_position(self, symbol):
+            return None
+
+    fake = _FakeSellStrategy(_FailingBroker())
+    assert SentimentStrategy._do_sell(fake, "ORCL", _sentiment(-9.0, 5), reason="x") is False
+
+
+# ---- AlpacaBroker.cancel_orders_for waits for cancels to settle --------
+
+class _FakeOrder:
+    def __init__(self, id_, symbol):
+        self.id = id_
+        self.symbol = symbol
+
+
+class _FakeTradingClient:
+    """Alpaca cancels asynchronously: the order stays in the open list for a
+    couple of polls after cancel_order_by_id (pending_cancel)."""
+    def __init__(self, orders, polls_until_cleared=2):
+        self._orders = list(orders)
+        self._cancelled = set()
+        self._polls_after_cancel = 0
+        self._polls_until_cleared = polls_until_cleared
+        self.cancel_calls = []
+
+    def get_orders(self, _req):
+        if self._cancelled:
+            self._polls_after_cancel += 1
+            if self._polls_after_cancel > self._polls_until_cleared:
+                self._orders = [o for o in self._orders if o.id not in self._cancelled]
+        return list(self._orders)
+
+    def cancel_order_by_id(self, id_):
+        self.cancel_calls.append(id_)
+        self._cancelled.add(id_)
+
+
+def _bare_broker(trading):
+    from bot.trading.alpaca_client import AlpacaBroker
+    b = AlpacaBroker.__new__(AlpacaBroker)  # skip __init__ (no network/credentials)
+    b._trading = trading
+    b._retry = lambda fn, op_name: fn()
+    return b
+
+
+def test_cancel_orders_for_waits_until_orders_cleared():
+    pytest = __import__("pytest")
+    pytest.importorskip("alpaca")
+    trading = _FakeTradingClient([_FakeOrder("a", "GOOGL"), _FakeOrder("b", "MSFT")],
+                                 polls_until_cleared=2)
+    broker = _bare_broker(trading)
+
+    broker.cancel_orders_for("GOOGL", settle_timeout_s=2.0, poll_interval_s=0.01)
+
+    assert trading.cancel_calls == ["a"]  # only this symbol's order
+    assert [o.symbol for o in trading.get_orders(None)] == ["MSFT"]
+
+
+def test_cancel_orders_for_gives_up_after_timeout_without_raising():
+    pytest = __import__("pytest")
+    pytest.importorskip("alpaca")
+    trading = _FakeTradingClient([_FakeOrder("a", "GOOGL")], polls_until_cleared=10_000)
+    broker = _bare_broker(trading)
+
+    t0 = time_module.monotonic()
+    broker.cancel_orders_for("GOOGL", settle_timeout_s=0.1, poll_interval_s=0.01)
+    assert time_module.monotonic() - t0 < 1.0  # bounded; close_position then tries anyway
