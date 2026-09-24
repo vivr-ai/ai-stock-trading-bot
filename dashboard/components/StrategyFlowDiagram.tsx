@@ -1,9 +1,21 @@
-import { ArrowDown, TrendingUp, TrendingDown, Minus, FlaskConical } from "lucide-react";
+import { ArrowDown, TrendingUp, TrendingDown, FlaskConical, RotateCcw } from "lucide-react";
 import type { ReactNode } from "react";
 
-function Step({ children }: { children: ReactNode }) {
+function Box({
+  children,
+  tone = "neutral",
+}: {
+  children: ReactNode;
+  tone?: "neutral" | "gain" | "loss";
+}) {
+  const toneClass =
+    tone === "gain"
+      ? "border-gain/40 bg-gain/5"
+      : tone === "loss"
+        ? "border-loss/40 bg-loss/5"
+        : "border-bg-border bg-bg-panel2";
   return (
-    <div className="rounded-lg border border-bg-border bg-bg-panel2 px-3 py-2.5 text-center text-xs leading-relaxed text-white">
+    <div className={`mx-auto max-w-lg rounded-lg border px-4 py-2.5 text-center text-sm text-white ${toneClass}`}>
       {children}
     </div>
   );
@@ -17,17 +29,9 @@ function Connector() {
   );
 }
 
-function Outcome({
-  tone,
-  children,
-}: {
-  tone: "gain" | "amber";
-  children: ReactNode;
-}) {
-  const toneClass =
-    tone === "gain" ? "border-gain/50 bg-gain/10 text-gain" : "border-amber-500/50 bg-amber-500/10 text-amber-400";
+function MiniStep({ children }: { children: ReactNode }) {
   return (
-    <div className={`rounded-lg border px-3 py-2.5 text-center text-xs font-semibold leading-relaxed ${toneClass}`}>
+    <div className="rounded-md border border-bg-border bg-bg-panel px-2.5 py-1.5 text-center text-[11px] leading-snug text-muted">
       {children}
     </div>
   );
@@ -35,73 +39,61 @@ function Outcome({
 
 export default function StrategyFlowDiagram() {
   return (
-    <div className="w-full" role="img" aria-label="Flow diagram of how the bot evaluates a buy signal along its two paths">
-      {/* shared intake */}
-      <div className="mx-auto max-w-md rounded-xl border border-bg-border bg-bg-panel2 px-4 py-3 text-center text-sm text-white">
-        Every 30 minutes during market hours — for each stock on the watch-list, after confirming the overall
-        market isn&apos;t down sharply or in a downtrend
-      </div>
+    <div className="w-full" role="img" aria-label="Diagram of the bot's full buy-to-sell lifecycle for one stock">
+      <Box>Watch-list scan, every ~30 min while the market&apos;s open</Box>
       <Connector />
 
-      {/* two paths side by side */}
-      <div className="grid gap-4 md:grid-cols-2">
-        {/* Path A */}
-        <div className="rounded-xl border border-accent/40 bg-accent/5 p-3">
-          <div className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-accent">
-            <TrendingUp size={13} /> Path A — News-driven momentum
+      {/* BUY decision — green theme */}
+      <div className="rounded-xl border border-gain/30 bg-gain/[0.03] p-3">
+        <div className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-gain">
+          <TrendingUp size={13} /> Buy check
+        </div>
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="rounded-lg border border-accent/30 bg-bg-panel2 p-2.5">
+            <div className="mb-2 text-[11px] font-semibold text-accent">Path A · news momentum</div>
+            <div className="space-y-1.5">
+              <MiniStep>Sentiment + headlines + volume → weighted score ≥ 0.60</MiniStep>
+              <MiniStep>Not already +8% today, price above 20-day average</MiniStep>
+            </div>
           </div>
-          <Step>Read today&apos;s headlines, score sentiment -10 to +10</Step>
-          <Connector />
-          <Step>
-            Weighted score: 50% sentiment quality + 20% headline coverage + 30% volume confirmation — partial
-            credit on each, no single weak leg auto-fails it
-          </Step>
-          <Connector />
-          <Step>Still hard gates: price above its 20-day average, hasn&apos;t already jumped &gt;8% today</Step>
-          <Connector />
-          <Outcome tone="gain">Composite score ≥ 0.60 → BUY signal</Outcome>
-        </div>
-
-        {/* Path B */}
-        <div className="rounded-xl border border-amber-500/40 bg-amber-500/5 p-3">
-          <div className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-amber-400">
-            <FlaskConical size={13} /> Path B — Technical mean-reversion
-            <span className="ml-auto rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-400">
-              SHADOW MODE
-            </span>
+          <div className="rounded-lg border border-amber-500/30 bg-bg-panel2 p-2.5">
+            <div className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold text-amber-400">
+              <FlaskConical size={11} /> Path B · mean-reversion
+              <span className="ml-auto rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[9px] font-semibold">
+                SHADOW
+              </span>
+            </div>
+            <div className="space-y-1.5">
+              <MiniStep>Above 200-day average, 2-day RSI ≤ 10, volume ≥ 1.3x</MiniStep>
+              <MiniStep>Logged only — no order placed yet</MiniStep>
+            </div>
           </div>
-          <Step>Price above its 200-day average? (confirms a genuine long-term uptrend, not a stock in decline)</Step>
-          <Connector />
-          <Step>2-day RSI at or below 10? (sharply, briefly oversold)</Step>
-          <Connector />
-          <Step>Volume ≥1.3x normal, and news sentiment isn&apos;t actively bearish (above -5)</Step>
-          <Connector />
-          <Outcome tone="amber">All yes → WOULD buy — logged only, no order is placed</Outcome>
         </div>
-      </div>
-
-      <Connector />
-      <div className="mx-auto max-w-md rounded-xl border border-bg-border bg-bg-panel2 px-4 py-3 text-center text-sm text-white">
-        Every real buy signal still has to clear the risk rules — position size, sector cap, available cash —
-        before anything is acted on
       </div>
       <Connector />
+      <Box tone="gain">Position opened — stop-loss &amp; take-profit/trailing attached immediately</Box>
+      <Connector />
+      <Box>Held position re-checked against every sell rule, every cycle</Box>
+      <Connector />
 
-      <div className="grid grid-cols-3 gap-3">
-        <div className="flex flex-col items-center gap-1 rounded-lg border border-loss/40 bg-loss/10 px-2 py-2.5 text-xs font-semibold text-loss">
-          <TrendingDown size={14} /> SELL
+      {/* SELL decision — red theme */}
+      <div className="rounded-xl border border-loss/30 bg-loss/[0.03] p-3">
+        <div className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-loss">
+          <TrendingDown size={13} /> Sell check — any one rule firing is enough
         </div>
-        <div className="flex flex-col items-center gap-1 rounded-lg border border-bg-border bg-bg-panel2 px-2 py-2.5 text-xs font-semibold text-muted">
-          <Minus size={14} /> HOLD
-        </div>
-        <div className="flex flex-col items-center gap-1 rounded-lg border border-gain/40 bg-gain/10 px-2 py-2.5 text-xs font-semibold text-gain">
-          <TrendingUp size={14} /> BUY
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+          <MiniStep>Stop-loss −10%</MiniStep>
+          <MiniStep>Take-profit +20% or trailing pullback</MiniStep>
+          <MiniStep>Sentiment −5 (or −8 severe)</MiniStep>
+          <MiniStep>10 trading days, going nowhere</MiniStep>
         </div>
       </div>
-      <p className="mt-2 text-center text-[11px] text-muted">
-        Then it waits for the next cycle (~30 minutes) and repeats — nothing carries over except its actual open
-        positions.
-      </p>
+      <Connector />
+      <Box tone="loss">Position closed</Box>
+      <Connector />
+      <div className="mx-auto flex max-w-lg items-center justify-center gap-2 rounded-lg border border-bg-border bg-bg-panel2 px-4 py-2.5 text-center text-xs text-muted">
+        <RotateCcw size={13} className="shrink-0" /> 24-hour cooldown, then eligible to be bought again
+      </div>
     </div>
   );
 }
