@@ -70,33 +70,66 @@ function sharpeRatio(dailyPctReturns: number[]): number | null {
   return (mean / stddev) * Math.sqrt(252);
 }
 
-export async function GET() {
+export async function GET(req: Request) {
   const session = await getServerSession(authOptions);
   if (!session) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  // `from` is an optional ISO timestamp (see the page's PeriodSelector,
+  // which computes it client-side from the chosen preset - 1W/1M/3M/6M/
+  // YTD/1Y/FY/All - in the viewer's own local calendar, since "financial
+  // year" and "year to date" are personal/tax concepts, not the bot's).
+  // Omitted or invalid = "All", the original unfiltered behavior.
+  const { searchParams } = new URL(req.url);
+  const fromRaw = searchParams.get("from");
+  const from = fromRaw && !Number.isNaN(Date.parse(fromRaw)) ? fromRaw : null;
+
   try {
-    const [snapshots, tradeAgg, heartbeat] = await Promise.all([
+    const [snapshotsInWindow, baselineRows, tradeAgg, heartbeat] = await Promise.all([
       query<Snapshot>(
-        "SELECT ts, portfolio_value FROM portfolio_snapshots ORDER BY ts ASC LIMIT 5000"
+        from
+          ? "SELECT ts, portfolio_value FROM portfolio_snapshots WHERE ts >= $1 ORDER BY ts ASC LIMIT 5000"
+          : "SELECT ts, portfolio_value FROM portfolio_snapshots ORDER BY ts ASC LIMIT 5000",
+        from ? [from] : []
       ),
+      // One snapshot from strictly before `from`'s own calendar day (not
+      // just before `from` itself, which is almost never midnight - a
+      // same-day baseline would collapse into the same dayKey bucket as
+      // the window's first day and silently swallow its return bar
+      // instead of fixing it). Used ONLY as the reference point for the
+      // first in-window day/month's % return (a "1 Week" view still
+      // needs ~7 daily bars, not 6, the same way a stock chart's day-1
+      // change is relative to the prior close) - never shown on the
+      // equity curve itself, which starts exactly at `from`, and never
+      // counted in maxDrawdown/Sharpe (those reflect the window only).
+      from
+        ? query<Snapshot>(
+            `SELECT ts, portfolio_value FROM portfolio_snapshots
+             WHERE ts < date_trunc('day', $1::timestamptz)
+             ORDER BY ts DESC LIMIT 1`,
+            [from]
+          )
+        : Promise.resolve<Snapshot[]>([]),
       queryOne<ClosedTradeAgg>(
         `SELECT count(*) as total,
                 count(*) FILTER (WHERE pnl > 0) as wins,
                 avg(pnl) FILTER (WHERE pnl > 0) as avg_gain,
                 avg(pnl) FILTER (WHERE pnl < 0) as avg_loss
-         FROM closed_trades`
+         FROM closed_trades
+         ${from ? "WHERE ts >= $1" : ""}`,
+        from ? [from] : []
       ),
       queryOne<{ ts: string }>("SELECT ts FROM heartbeats ORDER BY ts DESC LIMIT 1"),
     ]);
 
-    const dailySeries = collapseToLast(snapshots, dayKey);
-    const monthlySeries = collapseToLast(snapshots, monthKey);
+    const snapshotsForReturns = [...baselineRows, ...snapshotsInWindow];
+    const dailySeries = collapseToLast(snapshotsForReturns, dayKey);
+    const monthlySeries = collapseToLast(snapshotsForReturns, monthKey);
     const dailyReturns = pctReturns(dailySeries);
     const monthlyReturns = pctReturns(monthlySeries);
 
-    const equityValues = snapshots
+    const equityValues = snapshotsInWindow
       .map((s) => s.portfolio_value)
       .filter((v): v is number => v != null);
 
@@ -105,7 +138,7 @@ export async function GET() {
 
     return NextResponse.json({
       hasAnyData: Boolean(heartbeat),
-      equityCurve: snapshots
+      equityCurve: snapshotsInWindow
         .filter((s) => s.portfolio_value != null)
         .map((s) => ({ ts: s.ts, value: s.portfolio_value })),
       dailyReturns: dailyReturns.map((d) => ({ label: d.key, pct: d.pct })),
