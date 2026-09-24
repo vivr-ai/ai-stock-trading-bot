@@ -31,7 +31,17 @@ Buy rule (ALL must hold):
   * passes the risk manager (size, position count, exposure cap)
 
 Sell rule:
-  * held AND score < sell_threshold (-5) AND >= sell_min_headlines headlines
+  * held AND score < sell_threshold (-5) AND >= sell_min_headlines headlines,
+    OR held AND score <= sell_severe_threshold (-8) regardless of headline
+    count (Strategy v3: a severe reading is trusted with less news behind it
+    than the ordinary threshold requires - see
+    SentimentStrategy._sentiment_exit_reason, and docs/sell-strategy.md for why this stayed a two-tier
+    threshold rather than becoming a weighted composite like the buy score)
+  * OR held (sentiment-momentum) AND momentum_max_hold_days have passed with
+    no stop/target/sentiment exit having fired - a time-based backstop so a
+    position that's going nowhere doesn't sit indefinitely (mirrors
+    reversion_max_hold_days below). 0 disables it. See
+    SentimentStrategy._momentum_time_exit_reason.
   * the -10% / +20% price exits are GTC bracket legs that fire at Alpaca;
     when they fire, the position simply "disappears" between cycles — caught
     by BotState.detect_exits() and logged to the closed-trade ledger from
@@ -766,6 +776,31 @@ class SentimentStrategy:
             severity="info" if pnl >= 0 else "warning",
         )
 
+    def _resolve_lot(self, symbol: str) -> Optional[dict]:
+        """The open-lot record for a held symbol, with a durable fallback -
+        Strategy v3 (see docs/sell-strategy.md). bot/state.py's open-lot
+        state is a plain local file that a Railway redeploy wipes; without
+        this, a position would silently lose its entry_path (a live
+        mean-reversion position falling back to the sentiment-exit rule
+        instead of its own RSI/max-hold rule) and its entry_time (the
+        momentum time-based exit could then never fire for it). Recovers
+        both from the most recent 'buy' row in the durable trades table
+        instead. Best-effort: returns None, the same as before this existed,
+        if the DB is unavailable or has no matching row (e.g. a
+        manually-opened position, or history predating the entry_path
+        column)."""
+        lot = self.state.peek_open(symbol)
+        if lot is not None:
+            return lot
+        last_buy = self.recorder.get_last_buy_trade(symbol)
+        if last_buy is None:
+            return None
+        buy_ts = last_buy.get("ts")
+        return {
+            "entry_path": last_buy.get("entry_path"),
+            "entry_time": buy_ts.timestamp() if isinstance(buy_ts, datetime) else None,
+        }
+
     def _process_symbol(self, symbol, acct, exposure, open_positions, pending,
                         sector_counts, new_entries_allowed, stats, market_regime=None) -> float:
         articles = self.news.fetch(
@@ -812,7 +847,7 @@ class SentimentStrategy:
         # open-lot data (state file lost, or a position predating v2) falls
         # back to 'sentiment_momentum', i.e. today's existing behavior.
         if holding:
-            lot = self.state.peek_open(symbol)
+            lot = self._resolve_lot(symbol)
             entry_path = (lot or {}).get("entry_path") or "sentiment_momentum"
 
             # Software trailing-stop layer (risk.trailing_stop_enabled) -
@@ -838,25 +873,27 @@ class SentimentStrategy:
                 return exposure
 
             # ---- SELL (sentiment leg) - sentiment-momentum positions ----
-            if sentiment.score < self.cfg.strategy.sell_threshold:
-                if sentiment.article_count < self.cfg.strategy.sell_min_headlines:
-                    logger.info("SELL %s skipped: only %d headlines (< %d); leaving price "
-                                "bracket to manage it", symbol, sentiment.article_count,
-                                self.cfg.strategy.sell_min_headlines,
-                                extra={"symbol": symbol, "decision": "sell_skipped",
-                                       "reason": "too_few_headlines"})
-                    self.recorder.record_decision(
-                        symbol=symbol, decision="sell_skipped", reason="too_few_headlines",
-                        sentiment_score=sentiment.score, sentiment_label=sentiment.label,
-                        headline_count=sentiment.article_count,
-                    )
-                    return exposure
-                if self._do_sell(symbol, sentiment,
-                                 reason=f"sentiment {sentiment.score:.1f} < {self.cfg.strategy.sell_threshold}",
+            sentiment_reason = self._sentiment_exit_reason(symbol, sentiment)
+            if sentiment_reason:
+                if self._do_sell(symbol, sentiment, reason=sentiment_reason,
                                  entry_path="sentiment_momentum"):
                     self.state.mark_exit(symbol)
                     sector_counts[sector_of(symbol)] -= 1
                     stats.sells += 1
+                return exposure
+
+            # ---- SELL (time-based backstop) - sentiment-momentum positions ----
+            # Nothing else fired this cycle (stop-loss/take-profit are the
+            # broker's own orders and would have already closed it if hit).
+            # A position that's neither a clear winner nor a clear loser
+            # shouldn't just sit forever occupying a position and sector
+            # slot - see _momentum_time_exit_reason.
+            time_exit_reason = self._momentum_time_exit_reason(lot)
+            if time_exit_reason and self._do_sell(symbol, sentiment, reason=time_exit_reason,
+                                                   entry_path="sentiment_momentum"):
+                self.state.mark_exit(symbol)
+                sector_counts[sector_of(symbol)] -= 1
+                stats.sells += 1
             return exposure
 
         # ---- BUY gates (cheap checks first, API calls last) - shared by both paths ----
@@ -1121,6 +1158,70 @@ class SentimentStrategy:
             held_days = (time.time() - entry_time) / 86400.0
             if held_days >= cfg.reversion_max_hold_days:
                 return f"max hold of {cfg.reversion_max_hold_days} day(s) reached ({held_days:.1f}d)"
+        return None
+
+    def _sentiment_exit_reason(self, symbol, sentiment) -> Optional[str]:
+        """Strategy v3, two-tier sentiment exit for a sentiment-momentum
+        position: a moderate reading (< sell_threshold) still needs
+        sell_min_headlines of coverage to trust it - one stray bearish
+        headline shouldn't end a position. A SEVERE reading
+        (<= sell_severe_threshold) is trusted sooner, on less confirmation,
+        since waiting for more headlines on an already-unambiguous story
+        just rides the loss longer (the gap a thin-coverage sell-off, e.g.
+        ORCL on 2026-09-22, exposed in the plain single-threshold rule). See
+        docs/sell-strategy.md for the full reasoning and why this stayed a
+        two-tier threshold rather than becoming a weighted composite score
+        like the buy side.
+
+        Returns a human-readable reason if the exit fires, else None -
+        logging/recording a 'sell_skipped' decision only for the case worth
+        recording (a bad-enough reading blocked by thin coverage), matching
+        _evaluate_reversion_path's convention above."""
+        cfg = self.cfg.strategy
+        if sentiment.score >= cfg.sell_threshold:
+            return None
+        thin_coverage = sentiment.article_count < cfg.sell_min_headlines
+        severe = sentiment.score <= cfg.sell_severe_threshold
+        if thin_coverage and not severe:
+            logger.info(
+                "SELL %s skipped: only %d headlines (< %d) and score %.1f isn't severe enough "
+                "(<= %.1f) to act on thin coverage; leaving price bracket to manage it",
+                symbol, sentiment.article_count, cfg.sell_min_headlines, sentiment.score,
+                cfg.sell_severe_threshold,
+                extra={"symbol": symbol, "decision": "sell_skipped", "reason": "too_few_headlines"},
+            )
+            self.recorder.record_decision(
+                symbol=symbol, decision="sell_skipped", reason="too_few_headlines",
+                sentiment_score=sentiment.score, sentiment_label=sentiment.label,
+                headline_count=sentiment.article_count,
+            )
+            return None
+        if thin_coverage:
+            return (f"sentiment {sentiment.score:.1f} <= {cfg.sell_severe_threshold} "
+                    f"(severe, only {sentiment.article_count} headline(s))")
+        return f"sentiment {sentiment.score:.1f} < {cfg.sell_threshold}"
+
+    def _momentum_time_exit_reason(self, lot) -> Optional[str]:
+        """Strategy v3 time-based backstop for a sentiment-momentum
+        position: mirrors _reversion_exit_reason's max-hold check above, for
+        the entry path that didn't have one. A position that never hits its
+        stop-loss, take-profit/trailing-stop, or the sentiment exit would
+        otherwise sit indefinitely, occupying a position slot and a sector
+        slot that a stronger signal elsewhere could be using.
+
+        `lot` may be None (open-lot state lost, and no durable entry_time
+        recoverable either - see _process_symbol) - fails open, no exit
+        signal, the same fail-open convention as every other rule in this
+        file. momentum_max_hold_days=0 disables this check entirely."""
+        cfg = self.cfg.strategy
+        if not cfg.momentum_max_hold_days:
+            return None
+        entry_time = (lot or {}).get("entry_time")
+        if not entry_time:
+            return None
+        held_days = (time.time() - entry_time) / 86400.0
+        if held_days >= cfg.momentum_max_hold_days:
+            return f"max hold of {cfg.momentum_max_hold_days} day(s) reached ({held_days:.1f}d)"
         return None
 
     def _maybe_resolve_shadow_position(self, symbol: str) -> None:

@@ -161,3 +161,47 @@ def test_decisions_prune_batch_size_below_one_is_rejected(monkeypatch, tmp_path)
     monkeypatch.setenv("RETENTION_PRUNE_BATCH_SIZE", "0")
     with pytest.raises(ValueError, match="prune_batch_size"):
         load_config(str(tmp_path / "nope.ini"))
+
+
+def test_sell_strategy_v3_defaults(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    cfg = load_config(str(tmp_path / "nope.ini"))
+    assert cfg.strategy.sell_severe_threshold == -8.0
+    assert cfg.strategy.momentum_max_hold_days == 10
+
+
+def test_sell_severe_threshold_less_negative_than_sell_threshold_is_rejected(monkeypatch, tmp_path):
+    """The severe tier is meant to fire on a MORE extreme reading than the
+    ordinary sell_threshold (-5.0 by default) - a less-negative severe
+    threshold would validate cleanly but make the severe tier fire on
+    milder news than the ordinary rule, inverting the intent."""
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("STRATEGY_SELL_SEVERE_THRESHOLD", "-3")
+    with pytest.raises(ValueError, match="sell_severe_threshold"):
+        load_config(str(tmp_path / "nope.ini"))
+
+
+def test_sell_severe_threshold_equal_to_sell_threshold_is_allowed(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("STRATEGY_SELL_SEVERE_THRESHOLD", "-5.0")
+    cfg = load_config(str(tmp_path / "nope.ini"))
+    assert cfg.strategy.sell_severe_threshold == -5.0
+
+
+def test_momentum_max_hold_days_negative_is_rejected(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("STRATEGY_MOMENTUM_MAX_HOLD_DAYS", "-1")
+    with pytest.raises(ValueError, match="momentum_max_hold_days"):
+        load_config(str(tmp_path / "nope.ini"))
+
+
+def test_momentum_max_hold_days_zero_disables_it_and_is_allowed(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("STRATEGY_MOMENTUM_MAX_HOLD_DAYS", "0")
+    cfg = load_config(str(tmp_path / "nope.ini"))
+    assert cfg.strategy.momentum_max_hold_days == 0

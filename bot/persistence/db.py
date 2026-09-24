@@ -489,17 +489,20 @@ class Recorder:
         """Read-only escape hatch - the only read path in this otherwise
         write-only module, kept narrowly scoped on purpose.
 
-        Used solely as a fallback by _log_auto_exit() in
-        bot/trading/strategy.py when the bot's own open-lot state
-        (bot/state.py's local JSON file) has been lost - most commonly
-        because Railway's ephemeral filesystem wiped it on a redeploy
-        before a position closed. Without this, that exit would be
-        silently dropped from closed_trades entirely (see that method's
-        docstring). Returns the most recent 'buy' row for `symbol` from
-        the trades table - the same table the dashboard's Portfolio page
-        Stop Loss column reads from - or None if the DB is unavailable or
-        has no matching row (e.g. a manually-opened position, or trade
-        history predating this table)."""
+        Used as a fallback in two places in bot/trading/strategy.py when
+        the bot's own open-lot state (bot/state.py's local JSON file) has
+        been lost - most commonly because Railway's ephemeral filesystem
+        wiped it on a redeploy: _log_auto_exit() (without this, that exit
+        would be silently dropped from closed_trades entirely - see that
+        method's docstring), and _process_symbol()'s holding branch, which
+        uses entry_path from this row so a live mean-reversion position
+        doesn't silently fall back to the sentiment-exit rule after a
+        redeploy, and ts as a durable entry_time for the momentum
+        time-based exit. Returns the most recent 'buy' row for `symbol`
+        from the trades table - the same table the dashboard's Portfolio
+        page Stop Loss column reads from - or None if the DB is
+        unavailable or has no matching row (e.g. a manually-opened
+        position, or trade history predating this table)."""
         if not self.enabled:
             return None
         try:
@@ -514,7 +517,8 @@ class Recorder:
                     cur.execute(
                         """
                         SELECT ts, qty, price, stop_price, take_profit, reason, rationale,
-                               sector, market_regime, sentiment_score, sentiment_label
+                               sector, market_regime, sentiment_score, sentiment_label,
+                               entry_path
                         FROM trades
                         WHERE symbol = %(symbol)s AND action = 'buy'
                         ORDER BY ts DESC LIMIT 1

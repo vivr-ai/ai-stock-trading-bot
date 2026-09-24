@@ -82,6 +82,19 @@ class StrategyConfig:
     sell_threshold: float
     min_headlines: int
     sell_min_headlines: int
+    # --- Strategy v3 sell refinements (see docs/sell-strategy.md and the
+    # "Sell Strategy Recommendation" doc): two independent, narrowly-scoped
+    # additions to the sentiment exit, not a rewrite of it. Deliberately NOT
+    # a weighted composite mirroring the buy score - see that doc for why. ---
+    # A severe reading (<= this) is trusted with less news behind it than
+    # sell_min_headlines normally requires - see SentimentStrategy's
+    # sentiment-leg sell block. Must be <= sell_threshold (more negative).
+    sell_severe_threshold: float
+    # A sentiment-momentum position that never hits its stop, take-profit/
+    # trailing-stop, or the sentiment exit gets closed after this many days
+    # regardless, so it doesn't sit indefinitely occupying a position/sector
+    # slot. 0 disables it. Mirrors reversion_max_hold_days below.
+    momentum_max_hold_days: int
     max_intraday_runup_pct: float
     market_filter_symbol: str
     market_filter_max_drop_pct: float
@@ -300,6 +313,12 @@ def load_config(path: str = "config.ini") -> Config:
             min_headlines=_get(parser, "strategy", "min_headlines", "STRATEGY_MIN_HEADLINES", 5, int),
             sell_min_headlines=_get(
                 parser, "strategy", "sell_min_headlines", "STRATEGY_SELL_MIN_HEADLINES", 3, int
+            ),
+            sell_severe_threshold=_get(
+                parser, "strategy", "sell_severe_threshold", "STRATEGY_SELL_SEVERE_THRESHOLD", -8.0, float
+            ),
+            momentum_max_hold_days=_get(
+                parser, "strategy", "momentum_max_hold_days", "STRATEGY_MOMENTUM_MAX_HOLD_DAYS", 10, int
             ),
             max_intraday_runup_pct=_get(
                 parser, "strategy", "max_intraday_runup_pct", "STRATEGY_MAX_INTRADAY_RUNUP_PCT", 8.0, float
@@ -550,6 +569,19 @@ def _validate(cfg: Config) -> None:
         raise ValueError("thresholds must satisfy -10 <= sell < buy <= 10")
     if cfg.logging.log_format not in ("text", "json"):
         raise ValueError("logging.log_format / LOG_FORMAT must be 'text' or 'json'")
+
+    # ---- Strategy v3: two-tier sentiment exit + momentum time-based exit --
+    if not (-10 <= cfg.strategy.sell_severe_threshold <= cfg.strategy.sell_threshold):
+        raise ValueError(
+            "strategy.sell_severe_threshold / STRATEGY_SELL_SEVERE_THRESHOLD must satisfy "
+            "-10 <= severe <= sell_threshold - it's meant to fire on a MORE extreme reading "
+            "than the ordinary sell threshold, with less news required to trust it."
+        )
+    if cfg.strategy.momentum_max_hold_days < 0:
+        raise ValueError(
+            "strategy.momentum_max_hold_days / STRATEGY_MOMENTUM_MAX_HOLD_DAYS must be >= 0 "
+            "(0 disables the time-based exit)."
+        )
 
     # ---- Strategy v2: Path A weighted composite -------------------------
     weight_sum = (cfg.strategy.sentiment_weight + cfg.strategy.headline_weight

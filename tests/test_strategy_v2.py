@@ -36,6 +36,8 @@ class _StrategyCfg:
     sell_threshold: float = -5.0
     min_headlines: int = 5
     sell_min_headlines: int = 3
+    sell_severe_threshold: float = -8.0
+    momentum_max_hold_days: int = 10
     max_intraday_runup_pct: float = 8.0
     require_price_above_sma: bool = True
     sma_period: int = 20
@@ -204,6 +206,150 @@ def test_reversion_no_exit_when_neither_condition_met():
     snap = _Snap(last=190.0, rsi=40.0)
     lot = {"entry_time": time.time() - 1 * 86400.0}  # held 1 day
     assert SentimentStrategy._reversion_exit_reason(fake, snap, lot) is None
+
+
+# ---- Strategy v3: two-tier sentiment exit + momentum time-based exit ----
+# See docs/sell-strategy.md ("Sell Strategy Recommendation"): a moderate
+# reading still needs sell_min_headlines of coverage to trust it; a SEVERE
+# reading is trusted sooner, on less confirmation. Regression coverage for
+# the 2026-09-22 ORCL incident (a bad-enough reading on thin coverage got no
+# software action at all) and the "position going nowhere forever" gap
+# momentum entries had but reversion entries didn't.
+
+class _RecordingRecorder:
+    """Like _NullRecorder, but keeps record_decision calls for assertions."""
+    def __init__(self):
+        self.decisions = []
+
+    def record_decision(self, **kwargs):
+        self.decisions.append(kwargs)
+
+    def __getattr__(self, _name):
+        return lambda *a, **k: None
+
+
+def test_sentiment_exit_fires_on_moderate_reading_with_enough_headlines():
+    fake = _FakeStrategy()
+    sentiment = _sentiment(score=-6.5, headlines=4)
+    reason = SentimentStrategy._sentiment_exit_reason(fake, "AAPL", sentiment)
+    assert reason is not None
+    assert "sentiment -6.5" in reason
+
+
+def test_sentiment_exit_skips_and_records_on_thin_coverage_moderate_reading():
+    """The ORCL case: -6.0 on 2 headlines (< the 3-headline minimum) isn't
+    severe enough (> -8.0) to bypass the coverage check."""
+    fake = _FakeStrategy()
+    fake.recorder = _RecordingRecorder()
+    sentiment = _sentiment(score=-6.0, headlines=2)
+    reason = SentimentStrategy._sentiment_exit_reason(fake, "ORCL", sentiment)
+    assert reason is None
+    assert fake.recorder.decisions[-1]["reason"] == "too_few_headlines"
+
+
+def test_sentiment_exit_fires_on_severe_reading_despite_thin_coverage():
+    """A severe reading (<= -8.0) is trusted even on just 1 headline -
+    the fix for the ORCL-style gap."""
+    fake = _FakeStrategy()
+    fake.recorder = _RecordingRecorder()
+    sentiment = _sentiment(score=-9.0, headlines=1)
+    reason = SentimentStrategy._sentiment_exit_reason(fake, "XYZ", sentiment)
+    assert reason is not None
+    assert "severe" in reason
+    assert fake.recorder.decisions == []  # no skip recorded - it fired
+
+
+def test_sentiment_exit_no_signal_above_threshold():
+    fake = _FakeStrategy()
+    sentiment = _sentiment(score=-2.0, headlines=5)
+    assert SentimentStrategy._sentiment_exit_reason(fake, "CALM", sentiment) is None
+
+
+def test_momentum_time_exit_fires_after_max_hold():
+    import time
+    fake = _FakeStrategy()
+    lot = {"entry_time": time.time() - 11 * 86400.0}  # held 11 days, max is 10
+    reason = SentimentStrategy._momentum_time_exit_reason(fake, lot)
+    assert reason is not None
+    assert "max hold" in reason
+
+
+def test_momentum_time_exit_no_exit_before_max_hold():
+    import time
+    fake = _FakeStrategy()
+    lot = {"entry_time": time.time() - 2 * 86400.0}  # held 2 days
+    assert SentimentStrategy._momentum_time_exit_reason(fake, lot) is None
+
+
+def test_momentum_time_exit_disabled_when_zero():
+    import time
+    fake = _FakeStrategy(cfg=_Cfg(strategy=_StrategyCfg(momentum_max_hold_days=0)))
+    lot = {"entry_time": time.time() - 999 * 86400.0}
+    assert SentimentStrategy._momentum_time_exit_reason(fake, lot) is None
+
+
+def test_momentum_time_exit_fails_open_with_no_lot():
+    """Open-lot state lost AND no durable entry_time recoverable (e.g. the
+    DB fallback in _process_symbol also came back empty) - fail open, same
+    convention as every other exit rule in this file."""
+    fake = _FakeStrategy()
+    assert SentimentStrategy._momentum_time_exit_reason(fake, None) is None
+    assert SentimentStrategy._momentum_time_exit_reason(fake, {}) is None
+
+
+# ---- _resolve_lot: durable fallback when local open-lot state is lost ---
+
+class _FakeState:
+    def __init__(self, lot=None):
+        self._lot = lot
+
+    def peek_open(self, symbol):
+        return self._lot
+
+
+class _FakeRecorderWithLastBuy:
+    def __init__(self, last_buy=None):
+        self._last_buy = last_buy
+
+    def get_last_buy_trade(self, symbol):
+        return self._last_buy
+
+    def __getattr__(self, _name):
+        return lambda *a, **k: None
+
+
+def test_resolve_lot_uses_local_state_when_present():
+    """The normal case: local open-lot state hasn't been lost - no DB
+    round-trip needed."""
+    fake = _FakeStrategy()
+    fake.state = _FakeState(lot={"entry_path": "mean_reversion", "entry_time": 123.0})
+    fake.recorder = _FakeRecorderWithLastBuy(last_buy={"entry_path": "sentiment_momentum"})
+    lot = SentimentStrategy._resolve_lot(fake, "AAPL")
+    assert lot == {"entry_path": "mean_reversion", "entry_time": 123.0}
+
+
+def test_resolve_lot_recovers_entry_path_and_time_from_durable_trades_row():
+    """Local state lost (e.g. a Railway redeploy) - recovers entry_path AND
+    entry_time from the trades table instead of coming back empty, so a
+    live mean-reversion position doesn't silently fall back to the
+    sentiment-exit rule after a redeploy."""
+    fake = _FakeStrategy()
+    fake.state = _FakeState(lot=None)
+    buy_ts = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    fake.recorder = _FakeRecorderWithLastBuy(
+        last_buy={"entry_path": "mean_reversion", "ts": buy_ts})
+    lot = SentimentStrategy._resolve_lot(fake, "NVDA")
+    assert lot["entry_path"] == "mean_reversion"
+    assert lot["entry_time"] == buy_ts.timestamp()
+
+
+def test_resolve_lot_returns_none_when_nothing_recoverable():
+    """State lost AND no matching trades row (e.g. a manually-opened
+    position) - fails open, same as before this fallback existed."""
+    fake = _FakeStrategy()
+    fake.state = _FakeState(lot=None)
+    fake.recorder = _FakeRecorderWithLastBuy(last_buy=None)
+    assert SentimentStrategy._resolve_lot(fake, "MANUAL") is None
 
 
 # ---- Path B shadow-position lifecycle (_maybe_resolve_shadow_position) --

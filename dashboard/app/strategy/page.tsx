@@ -226,9 +226,23 @@ export default function StrategyPage() {
             take-profit mode is active, and it&apos;s watching every position from the moment it&apos;s bought.
           </li>
           <li>
-            <span className="text-white">Sentiment-driven exit at -5 (Path A positions).</span> Independent of
-            price, if the news sentiment on a stock the bot holds turns sharply negative (score of -5 or worse),
-            it can sell early — it doesn&apos;t need to wait for the stop-loss to be hit.
+            <span className="text-white">Sentiment-driven exit at -5, or sooner if severe (Path A positions).</span>{" "}
+            Independent of price, if the news sentiment on a stock the bot holds turns negative (score of -5 or
+            worse) with at least 3 headlines behind it, the bot sells early — it doesn&apos;t need to wait for the
+            stop-loss to be hit. If the reading is <span className="text-white">severe (-8 or worse)</span>, the
+            bot trusts it with less confirmation — even a single headline is enough — since waiting for more
+            coverage on an already-unambiguous story just rides the loss longer. This exit is deliberately simpler
+            than the weighted buy score above: leaving means acting on one clear signal, not a blend of sentiment,
+            headlines, and volume. A moderate-but-thin reading (say -6 on 2 headlines — not severe, not enough
+            coverage) still gets no software action; the bot holds off and leaves the stop-loss/take-profit
+            bracket to manage the position instead.
+          </li>
+          <li>
+            <span className="text-white">Time-based exit after 10 days (Path A positions).</span> If a position
+            hasn&apos;t hit its stop-loss, take-profit/trailing-stop, or the sentiment exit within 10 trading days,
+            the bot closes it anyway, rather than letting a trade that&apos;s going nowhere sit indefinitely and
+            tie up a position slot and a sector slot that a stronger signal elsewhere could use. Mean-reversion
+            positions already had an equivalent (a 5-day version, described above).
           </li>
           <li>
             <span className="text-white">Daily loss limit of 4%.</span> If the whole portfolio drops 4% in a
@@ -310,9 +324,23 @@ export default function StrategyPage() {
             above the 0.60 bar. The bot buys, with a -10% stop-loss and +20% take-profit attached immediately.
           </ExampleCard>
           <ExampleCard type="sell" title="Path A: sentiment sours on a held position">
-            The bot holds a stock bought two weeks ago on a momentum signal. New headlines about a product
-            recall push sentiment to -6.5. The price hasn&apos;t yet dropped 10%, but because the sentiment rule
-            (-5 threshold) is triggered independently, the bot sells early rather than waiting for the stop-loss.
+            The bot holds a stock bought two weeks ago on a momentum signal. 4 new headlines about a product
+            recall push sentiment to -6.5 — enough coverage to clear the 3-headline confirmation bar. The price
+            hasn&apos;t yet dropped 10%, but because the sentiment rule (-5 threshold) is triggered independently,
+            the bot sells early rather than waiting for the stop-loss.
+          </ExampleCard>
+          <ExampleCard type="hold" title="Bearish news, but too thin to act on">
+            The bot holds a different stock bought on a momentum signal. A single downbeat headline pushes its
+            sentiment to -7.0 — well past the -5 sell threshold on its own — but with only 1 headline behind it,
+            that&apos;s too thin to trust as a genuine reversal rather than noise. -7.0 doesn&apos;t reach the -8
+            severe bar either, so the bot leaves the position alone rather than selling on it, falling back to
+            the stop-loss/take-profit bracket to manage it from here.
+          </ExampleCard>
+          <ExampleCard type="sell" title="Severe news acted on immediately, even on thin coverage">
+            A different held position gets hit with a single headline about a major lawsuit — sentiment drops
+            straight to -9.0. Normally 1 headline wouldn&apos;t be enough to trust the reading, but -9.0 clears
+            the -8 severe bar on its own, so the bot doesn&apos;t wait around for two more headlines to confirm
+            what&apos;s already an unambiguous story. It sells immediately.
           </ExampleCard>
           <ExampleCard type="sell" title="Trailing stop: letting a winner run, then locking it in">
             Bought at $100 with the trailing stop on, so no 20% flag was ever placed — just a distant $150
@@ -324,6 +352,13 @@ export default function StrategyPage() {
             without ever climbing further, the stop-loss alone would have sold it there for a loss, regardless
             of the trailing stop never having anything to trail from. And had the price instead kept climbing
             straight to $150 without ever pulling back 7%, the bot would have kept holding all the way there.
+          </ExampleCard>
+          <ExampleCard type="sell" title="A position going nowhere gets closed on day 10">
+            The bot buys a stock on a momentum signal at $50. Over the next 10 trading days it just drifts
+            between $48 and $52 — sentiment cools to neutral and never sours enough to trigger a sell, and the
+            price never gets close to either the stop-loss or the take-profit. Rather than let it sit there
+            indefinitely, tying up a position slot and a sector slot, the bot closes it at roughly breakeven on
+            day 10, freeing that slot for a stronger signal elsewhere.
           </ExampleCard>
           <ExampleCard type="hold" title="Path B: an oversold dip, logged not bought">
             A stock trading well above its 200-day average drops sharply over two days — RSI(2) reads 4.1, deep
