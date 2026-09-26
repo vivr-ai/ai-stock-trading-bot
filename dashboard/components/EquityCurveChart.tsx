@@ -50,6 +50,8 @@ export default function EquityCurveChart({
         />
         <Tooltip
           contentStyle={{ background: "#171f30", border: "1px solid #232c3f", borderRadius: 8, fontSize: 12 }}
+          labelStyle={{ color: "#ffffff", marginBottom: 4 }}
+          itemStyle={{ color: "#ffffff" }}
           labelFormatter={(v) => new Date(v).toLocaleString()}
           formatter={(v: number) => [fmtMoney(v), "Portfolio value"]}
         />

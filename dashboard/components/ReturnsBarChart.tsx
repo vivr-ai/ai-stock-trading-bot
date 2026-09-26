@@ -21,6 +21,8 @@ export default function ReturnsBarChart({
         />
         <Tooltip
           contentStyle={{ background: "#171f30", border: "1px solid #232c3f", borderRadius: 8, fontSize: 12 }}
+          labelStyle={{ color: "#ffffff", marginBottom: 4 }}
+          itemStyle={{ color: "#ffffff" }}
           formatter={(v: number) => [`${v >= 0 ? "+" : ""}${v.toFixed(2)}%`, "Return"]}
         />
         <Bar dataKey="pct" radius={[3, 3, 0, 0]}>

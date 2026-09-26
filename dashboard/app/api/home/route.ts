@@ -292,6 +292,21 @@ export async function GET() {
         ? (allTimeClosedTrades.filter((t) => Number(t.pnl) > 0).length / allTimeClosedTrades.length) * 100
         : null;
 
+    // ---- Lifetime P/L ----
+    // Realized (every closed trade ever, win or loss) + unrealized (today's
+    // open_positions snapshot) - same "realized + unrealized" shape as
+    // todaysPl above, just over the whole history instead of just today.
+    const lifetimeRealizedPl = allTimeClosedTrades.reduce((sum, t) => sum + Number(t.pnl), 0);
+    const lifetimePl = lifetimeRealizedPl + unrealizedNow;
+    const avgTradePl = allTimeClosedTrades.length > 0 ? lifetimeRealizedPl / allTimeClosedTrades.length : null;
+    let bestTrade: { symbol: string; pnl: number } | null = null;
+    let worstTrade: { symbol: string; pnl: number } | null = null;
+    for (const t of allTimeClosedTrades) {
+      const pnl = Number(t.pnl);
+      if (!bestTrade || pnl > bestTrade.pnl) bestTrade = { symbol: t.symbol, pnl };
+      if (!worstTrade || pnl < worstTrade.pnl) worstTrade = { symbol: t.symbol, pnl };
+    }
+
     // ---- Risk snapshot ----
     const startOfDayValue = todayFirstSnapshot?.portfolio_value ?? null;
     const dailyPnlPct =
@@ -390,6 +405,12 @@ export async function GET() {
           : null,
         tradesToday,
         winRatePct,
+      },
+      lifetime: {
+        pl: lifetimePl,
+        avgTradePl,
+        bestTrade,
+        worstTrade,
       },
       botStatusPanel: {
         running: botRunning,

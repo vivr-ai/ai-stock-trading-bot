@@ -43,6 +43,7 @@ import {
   Eye,
   Briefcase,
   HeartPulse,
+  History,
 } from "lucide-react";
 
 type HomeResponse = {
@@ -68,6 +69,12 @@ type HomeResponse = {
     lastTrade: { ts: string; action: string; symbol: string; qty: number | null; price: number | null } | null;
     tradesToday: number;
     winRatePct: number | null;
+  };
+  lifetime: {
+    pl: number;
+    avgTradePl: number | null;
+    bestTrade: { symbol: string; pnl: number } | null;
+    worstTrade: { symbol: string; pnl: number } | null;
   };
   botStatusPanel: {
     running: boolean;
@@ -216,7 +223,7 @@ export default function HomePage() {
               other fact on this page is one click away in a Panel below,
               not because it's unimportant, but because it's not what you
               open Home to check every 30 minutes. */}
-          <div className="mb-5 grid grid-cols-2 gap-4 lg:grid-cols-4">
+          <div className="mb-5 grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
             <StatCard
               size="lg"
               label="Portfolio Value"
@@ -230,6 +237,14 @@ export default function HomePage() {
               value={fmtMoney(data.portfolio.todaysPl)}
               tone={toneFor(data.portfolio.todaysPl)}
               icon={<TrendingUp size={15} />}
+            />
+            <StatCard
+              size="lg"
+              label="Lifetime P/L"
+              value={fmtMoney(data.lifetime.pl)}
+              tone={toneFor(data.lifetime.pl)}
+              sublabel="Realized + unrealized, all-time"
+              icon={<History size={15} />}
             />
             <StatCard
               size="lg"
@@ -250,126 +265,154 @@ export default function HomePage() {
 
           {/* ---- Everything else: grouped into a few compact panels of rows
               instead of one StatCard per fact - same information, far fewer
-              boxes and far less vertical space per fact. */}
-          <div className="mb-6 grid grid-cols-1 gap-5 lg:grid-cols-2">
-            <div className="flex flex-col gap-5">
-              <Panel title="Portfolio" icon={<Wallet size={14} className="text-accent" />}>
-                <InfoRow
-                  label="Cash Available"
-                  value={fmtMoney(data.portfolio.cash)}
-                  sublabel={data.portfolio.isAsOfLastActiveCycle ? "As of last active cycle" : undefined}
-                />
-                <InfoRow
-                  label="Weekly Return"
-                  value={fmtPct(data.portfolio.weeklyReturnPct)}
-                  tone={toneFor(data.portfolio.weeklyReturnPct)}
-                />
-                <InfoRow
-                  label="Monthly Return"
-                  value={fmtPct(data.portfolio.monthlyReturnPct)}
-                  tone={toneFor(data.portfolio.monthlyReturnPct)}
-                />
-                <InfoRow
-                  label="Lifetime Return"
-                  value={fmtPct(data.portfolio.lifetimeReturnPct)}
-                  tone={toneFor(data.portfolio.lifetimeReturnPct)}
-                />
-              </Panel>
+              boxes and far less vertical space per fact. A plain 4-up grid
+              (not two independently-stacked flex columns) so each panel
+              sits at its own natural height as a peer, rather than the left
+              and right "columns" needing matched total row-counts to look
+              aligned - each panel also gets its own accent color so the
+              page reads as 4 distinct zones, not a stack of identical gray
+              boxes. */}
+          <div className="mb-6 grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-4">
+            <Panel title="Portfolio" tone="accent" icon={<Wallet size={14} className="text-accent" />}>
+              <InfoRow
+                label="Cash Available"
+                value={fmtMoney(data.portfolio.cash)}
+                sublabel={data.portfolio.isAsOfLastActiveCycle ? "As of last active cycle" : undefined}
+              />
+              <InfoRow
+                label="Weekly Return"
+                value={fmtPct(data.portfolio.weeklyReturnPct)}
+                tone={toneFor(data.portfolio.weeklyReturnPct)}
+              />
+              <InfoRow
+                label="Monthly Return"
+                value={fmtPct(data.portfolio.monthlyReturnPct)}
+                tone={toneFor(data.portfolio.monthlyReturnPct)}
+              />
+              <InfoRow
+                label="Lifetime Return"
+                value={fmtPct(data.portfolio.lifetimeReturnPct)}
+                tone={toneFor(data.portfolio.lifetimeReturnPct)}
+              />
+              <InfoRow
+                label="Invested (Exposure)"
+                value={fmtPct(data.riskSnapshot.totalExposurePct, 1)}
+                sublabel={
+                  data.riskSnapshot.largestPosition
+                    ? `Largest: ${data.riskSnapshot.largestPosition.symbol}`
+                    : undefined
+                }
+              />
+            </Panel>
 
-              <Panel title="Trading Activity" icon={<Repeat size={14} className="text-accent" />}>
-                <InfoRow
-                  label="Last Executed Trade"
-                  value={
-                    data.tradingActivity.lastTrade
-                      ? `${data.tradingActivity.lastTrade.action.toUpperCase()} ${data.tradingActivity.lastTrade.symbol}`
-                      : "—"
-                  }
-                  sublabel={
-                    data.tradingActivity.lastTrade
-                      ? `${data.tradingActivity.lastTrade.qty ?? ""} @ ${fmtMoney(
-                          data.tradingActivity.lastTrade.price
-                        )} · ${timeAgo(data.tradingActivity.lastTrade.ts)}`
-                      : "No trades yet"
-                  }
-                />
-                <InfoRow label="Trades Today" value={data.tradingActivity.tradesToday} />
-                <InfoRow
-                  label="Win Rate (all-time)"
-                  value={data.tradingActivity.winRatePct != null ? `${data.tradingActivity.winRatePct.toFixed(1)}%` : "—"}
-                />
-              </Panel>
-            </div>
+            <Panel title="Trading Activity" tone="gain" icon={<Repeat size={14} className="text-gain" />}>
+              <InfoRow
+                label="Last Executed Trade"
+                value={
+                  data.tradingActivity.lastTrade
+                    ? `${data.tradingActivity.lastTrade.action.toUpperCase()} ${data.tradingActivity.lastTrade.symbol}`
+                    : "—"
+                }
+                sublabel={
+                  data.tradingActivity.lastTrade
+                    ? `${data.tradingActivity.lastTrade.qty ?? ""} @ ${fmtMoney(
+                        data.tradingActivity.lastTrade.price
+                      )} · ${timeAgo(data.tradingActivity.lastTrade.ts)}`
+                    : "No trades yet"
+                }
+              />
+              <InfoRow label="Trades Today" value={data.tradingActivity.tradesToday} />
+              <InfoRow
+                label="Win Rate (all-time)"
+                value={data.tradingActivity.winRatePct != null ? `${data.tradingActivity.winRatePct.toFixed(1)}%` : "—"}
+              />
+              <InfoRow
+                label="Avg P/L per Trade"
+                value={fmtMoney(data.lifetime.avgTradePl)}
+                tone={toneFor(data.lifetime.avgTradePl)}
+              />
+              <InfoRow
+                label="Best Trade (all-time)"
+                value={data.lifetime.bestTrade ? fmtMoney(data.lifetime.bestTrade.pnl) : "—"}
+                tone="gain"
+                sublabel={data.lifetime.bestTrade?.symbol}
+              />
+              <InfoRow
+                label="Worst Trade (all-time)"
+                value={data.lifetime.worstTrade ? fmtMoney(data.lifetime.worstTrade.pnl) : "—"}
+                tone="loss"
+                sublabel={data.lifetime.worstTrade?.symbol}
+              />
+            </Panel>
 
-            <div className="flex flex-col gap-5">
-              <Panel title="Bot & Market" icon={<Bot size={14} className="text-accent" />}>
-                <InfoRow
-                  label="Running / Paused"
-                  value={
-                    <StatusBadge status={data.botControl.isPaused ? "paused" : data.botStatusPanel.running ? "running" : "stopped"} />
-                  }
-                  sublabel={data.botStatusPanel.dryRun ? "Dry run (no real orders)" : "Live paper trading"}
-                />
-                <InfoRow
-                  label="Last Heartbeat"
-                  value={timeAgo(data.botStatusPanel.lastHeartbeat)}
-                  sublabel={data.botStatusPanel.lastHeartbeat ? new Date(data.botStatusPanel.lastHeartbeat).toLocaleString() : undefined}
-                />
-                <InfoRow label="Scheduler Status" value={data.botStatusPanel.schedulerStatus ?? "—"} />
-                <InfoRow
-                  label="Next Scheduled Run"
-                  value={new Date(data.botStatusPanel.nextScheduledRun).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                  sublabel="Estimate - doesn't account for market holidays"
-                />
-                <InfoRow
-                  label="Market Status"
-                  value={data.marketStatus.open == null ? "—" : data.marketStatus.open ? "Open" : "Closed"}
-                  tone={data.marketStatus.open ? "gain" : "neutral"}
-                />
-                <InfoRow label="Current Session" value={data.marketStatus.sessionLabel} />
-                <InfoRow
-                  label="Time Until Next Session"
-                  value={fmtMinutes(data.marketStatus.minutesUntilNextOpen)}
-                  sublabel={data.marketStatus.minutesUntilNextOpen == null ? "Already in session" : "Estimate - no holiday calendar"}
-                />
-              </Panel>
+            <Panel title="Bot & Market" tone="amber" icon={<Bot size={14} className="text-amber-400" />}>
+              <InfoRow
+                label="Running / Paused"
+                value={
+                  <StatusBadge status={data.botControl.isPaused ? "paused" : data.botStatusPanel.running ? "running" : "stopped"} />
+                }
+                sublabel={data.botStatusPanel.dryRun ? "Dry run (no real orders)" : "Live paper trading"}
+              />
+              <InfoRow
+                label="Last Heartbeat"
+                value={timeAgo(data.botStatusPanel.lastHeartbeat)}
+                sublabel={data.botStatusPanel.lastHeartbeat ? new Date(data.botStatusPanel.lastHeartbeat).toLocaleString() : undefined}
+              />
+              <InfoRow label="Scheduler Status" value={data.botStatusPanel.schedulerStatus ?? "—"} />
+              <InfoRow
+                label="Next Scheduled Run"
+                value={new Date(data.botStatusPanel.nextScheduledRun).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                sublabel="Estimate - doesn't account for market holidays"
+              />
+              <InfoRow
+                label="Market Status"
+                value={data.marketStatus.open == null ? "—" : data.marketStatus.open ? "Open" : "Closed"}
+                tone={data.marketStatus.open ? "gain" : "neutral"}
+              />
+              <InfoRow label="Current Session" value={data.marketStatus.sessionLabel} />
+              <InfoRow
+                label="Time Until Next Session"
+                value={fmtMinutes(data.marketStatus.minutesUntilNextOpen)}
+                sublabel={data.marketStatus.minutesUntilNextOpen == null ? "Already in session" : "Estimate - no holiday calendar"}
+              />
+            </Panel>
 
-              <Panel title="AI & Risk" icon={<Gauge size={14} className="text-accent2" />}>
-                <InfoRow
-                  label="Latest AI Decision"
-                  value={
-                    data.aiActivity.latestDecision
-                      ? `${data.aiActivity.latestDecision.decision.toUpperCase()} ${data.aiActivity.latestDecision.symbol}`
-                      : "—"
-                  }
-                  sublabel={data.aiActivity.latestDecision ? timeAgo(data.aiActivity.latestDecision.ts) : "No decisions yet"}
-                />
-                <InfoRow
-                  label="Confidence Score"
-                  value={
-                    data.aiActivity.latestDecision?.confidence != null
-                      ? data.aiActivity.latestDecision.confidence.toFixed(1)
-                      : "—"
-                  }
-                  sublabel="Sentiment score (-10 to +10), not a probability"
-                />
-                <InfoRow label="Strategy Version" value={data.aiActivity.activeStrategyVersion} />
-                <InfoRow label="Market Sentiment" value={data.aiActivity.marketSentimentLabel ?? "—"} />
-                <InfoRow
-                  label="Current Drawdown"
-                  value={fmtPct(data.riskSnapshot.drawdownPct != null ? -data.riskSnapshot.drawdownPct : null, 1)}
-                  tone={data.riskSnapshot.drawdownPct ? "loss" : "neutral"}
-                />
-                <InfoRow
-                  label="Largest Position"
-                  value={data.riskSnapshot.largestPosition?.symbol ?? "—"}
-                  sublabel={
-                    data.riskSnapshot.largestPosition
-                      ? fmtPct(data.riskSnapshot.largestPosition.allocationPct, 1)
-                      : undefined
-                  }
-                />
-              </Panel>
-            </div>
+            <Panel title="AI & Risk" tone="accent2" icon={<Gauge size={14} className="text-accent2" />}>
+              <InfoRow
+                label="Latest AI Decision"
+                value={
+                  data.aiActivity.latestDecision
+                    ? `${data.aiActivity.latestDecision.decision.toUpperCase()} ${data.aiActivity.latestDecision.symbol}`
+                    : "—"
+                }
+                sublabel={data.aiActivity.latestDecision ? timeAgo(data.aiActivity.latestDecision.ts) : "No decisions yet"}
+              />
+              <InfoRow
+                label="Confidence Score"
+                value={
+                  data.aiActivity.latestDecision?.confidence != null
+                    ? data.aiActivity.latestDecision.confidence.toFixed(1)
+                    : "—"
+                }
+                sublabel="Sentiment score (-10 to +10), not a probability"
+              />
+              <InfoRow label="Strategy Version" value={data.aiActivity.activeStrategyVersion} />
+              <InfoRow label="Market Sentiment" value={data.aiActivity.marketSentimentLabel ?? "—"} />
+              <InfoRow
+                label="Current Drawdown"
+                value={fmtPct(data.riskSnapshot.drawdownPct != null ? -data.riskSnapshot.drawdownPct : null, 1)}
+                tone={data.riskSnapshot.drawdownPct ? "loss" : "neutral"}
+              />
+              <InfoRow
+                label="Largest Position"
+                value={data.riskSnapshot.largestPosition?.symbol ?? "—"}
+                sublabel={
+                  data.riskSnapshot.largestPosition
+                    ? fmtPct(data.riskSnapshot.largestPosition.allocationPct, 1)
+                    : undefined
+                }
+              />
+            </Panel>
           </div>
 
           <div className="mb-8">
