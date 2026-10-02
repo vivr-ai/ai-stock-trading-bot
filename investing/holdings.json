@@ -1,0 +1,17 @@
+{
+  "_comment": "Snapshot of current holdings, not a transaction ledger. Each entry stores TODAY's shares and AC/share (average cost per share) exactly as shown on your Yahoo Finance Holdings tab - including dividend-reinvested shares, since AC/share there is already the weighted average across every purchase and every reinvestment. Whenever Yahoo's numbers change (a DRIP event, a manual buy/sell), update 'shares' and 'ac_share' here to match. No other fields need to change when that happens.",
+  "holdings": [
+    {"symbol": "IOT",     "exchange": "US",   "benchmark": "^GSPC", "shares": 150,   "ac_share": 34.43},
+    {"symbol": "LOC.NZ",  "exchange": "NZX",  "benchmark": "^NZ50", "shares": 19180, "ac_share": 0.09},
+    {"symbol": "VHY.AX",  "exchange": "ASX",  "benchmark": "^AXJO", "shares": 230,   "ac_share": 80.40},
+    {"symbol": "NVDA",    "exchange": "US",   "benchmark": "^GSPC", "shares": 100,   "ac_share": 38.08},
+    {"symbol": "VAS.AX",  "exchange": "ASX",  "benchmark": "^AXJO", "shares": 307,   "ac_share": 97.06},
+    {"symbol": "VEU.AX",  "exchange": "ASX",  "benchmark": "^AXJO", "shares": 138,   "ac_share": 84.07},
+    {"symbol": "VAP.AX",  "exchange": "ASX",  "benchmark": "^AXJO", "shares": 18,    "ac_share": 68.83},
+    {"symbol": "AGL.AX",  "exchange": "ASX",  "benchmark": "^AXJO", "shares": 302,   "ac_share": 9.36},
+    {"symbol": "FMG.AX",  "exchange": "ASX",  "benchmark": "^AXJO", "shares": 349,   "ac_share": 17.66},
+    {"symbol": "TER.AX",  "exchange": "ASX",  "benchmark": "^AXJO", "shares": 9000,  "ac_share": 0.65},
+    {"symbol": "LOC.AX",  "exchange": "ASX",  "benchmark": "^AXJO", "shares": 19180, "ac_share": 0.10,
+     "note": "UNCONFIRMED - the Yahoo screenshot this was seeded from had no last price/market value for this row. Verify this is a real, separate ASX-listed holding (distinct from LOC.NZ above) before trusting alerts on it; remove this entry if it's stale."}
+  ]
+}
