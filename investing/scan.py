@@ -12,6 +12,7 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
+from . import intraday
 from .config import Config, load_config
 from .indicators import Evaluation, evaluate
 from .telegram_client import TelegramNotifier
@@ -67,6 +68,11 @@ def run_scan(cfg: Optional[Config] = None) -> List[Evaluation]:
         )
 
     triggered = [ev for ev in evaluations if ev.triggered]
+
+    # Always set today's watch list - even when empty - so v2's intraday
+    # checks and EOD nudge never run against a stale list carried over
+    # from a previous day that triggered but today didn't.
+    intraday.set_todays_watchlist(triggered)
 
     if not triggered:
         logger.info("Scan complete at %s: nothing on today's watch list.", datetime.now(timezone.utc).isoformat())

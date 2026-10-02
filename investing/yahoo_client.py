@@ -20,7 +20,9 @@ limited) each time.
 
 Returns a full year of daily closes (+ volume) so the caller can compute a
 50-day moving average, a 52-week high, and a 1-month return all from one
-fetch - one network call per symbol, not three.
+fetch - one network call per symbol, not three. Also surfaces Yahoo's live
+intraday fields (day_low/day_high/current_volume) from the same response,
+used by v2's day-low tracking and volume caution flag - no extra call.
 """
 from __future__ import annotations
 
@@ -48,12 +50,17 @@ HEADERS = {
 }
 TIMEOUT = 10.0
 ATTEMPTS = 3
+# A 429 on the crumb endpoint means the IP itself is being throttled, not
+# just this one request - hammering it again immediately only adds to the
+# count against us. Cap how often we'll actually attempt a refresh.
+CRUMB_REFRESH_COOLDOWN_SECONDS = 60.0
 
 # One session (cookies persist across symbols) and one cached crumb per
-# process - refreshed lazily if a request comes back 401/429 with it set.
+# process - refreshed lazily, and no more than once per cooldown window.
 _session = requests.Session()
 _session.headers.update(HEADERS)
 _crumb: Optional[str] = None
+_last_crumb_attempt_ts: float = 0.0
 
 
 @dataclass
@@ -62,10 +69,27 @@ class PriceHistory:
     current_price: float
     closes: List[float]  # chronological, most recent last
     volumes: List[float]  # same order, aligned with closes
+    # Live intraday fields from Yahoo's `meta` block - used by v2's day-low
+    # tracking and volume caution flag. None if Yahoo didn't include them
+    # (e.g. outside market hours) - callers must handle that.
+    day_low: Optional[float] = None
+    day_high: Optional[float] = None
+    current_volume: Optional[float] = None
 
 
 def _refresh_crumb() -> Optional[str]:
-    global _crumb
+    """Attempt a crumb refresh, but never more than once per cooldown
+    window - a 429 here means the *IP* is rate-limited, so retrying this
+    call immediately just adds more requests against the same limit
+    instead of working around it. Within the cooldown, this is a no-op
+    that returns whatever's cached (possibly None)."""
+    global _crumb, _last_crumb_attempt_ts
+
+    now = time.monotonic()
+    if now - _last_crumb_attempt_ts < CRUMB_REFRESH_COOLDOWN_SECONDS:
+        return _crumb
+    _last_crumb_attempt_ts = now
+
     try:
         _session.get(CONSENT_URL, timeout=TIMEOUT)  # best-effort consent cookies
     except Exception as exc:  # noqa: BLE001
@@ -76,7 +100,11 @@ def _refresh_crumb() -> Optional[str]:
         if resp.status_code == 200 and text and "Too Many Requests" not in text:
             _crumb = text
             return _crumb
-        logger.warning("Could not obtain Yahoo crumb (HTTP %d): %s", resp.status_code, text[:200])
+        logger.warning(
+            "Could not obtain Yahoo crumb (HTTP %d) - likely IP-level throttling; "
+            "won't retry this for %.0fs.",
+            resp.status_code, CRUMB_REFRESH_COOLDOWN_SECONDS,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Yahoo crumb fetch failed: %s", exc)
     return None
@@ -95,6 +123,7 @@ def fetch_history(symbol: str, *, range_: str = "1y", interval: str = "1d") -> O
     url = CHART_URL.format(symbol=symbol)
 
     last_exc: Optional[Exception] = None
+    is_rate_limited = False
     for attempt in range(1, ATTEMPTS + 1):
         try:
             params = {"range": range_, "interval": interval}
@@ -102,14 +131,19 @@ def fetch_history(symbol: str, *, range_: str = "1y", interval: str = "1d") -> O
                 params["crumb"] = _crumb
             resp = _session.get(url, params=params, timeout=TIMEOUT)
 
-            if resp.status_code in (401, 429):
-                # Crumb likely expired/invalid - refresh once and retry.
-                logger.warning(
-                    "Yahoo fetch for %s got HTTP %d - refreshing crumb and retrying.",
-                    symbol, resp.status_code,
-                )
+            if resp.status_code == 429:
+                # IP-level throttling, not a missing/stale crumb - a fresh
+                # crumb attempt is subject to the same cooldown as above
+                # (so this is a no-op most of the time, not another request
+                # added to the pile). The real fix here is time, handled by
+                # the longer backoff below.
+                is_rate_limited = True
                 _refresh_crumb()
-                raise RuntimeError(f"HTTP {resp.status_code} (crumb refreshed, will retry)")
+                raise RuntimeError("HTTP 429 (rate limited)")
+            if resp.status_code == 401:
+                logger.warning("Yahoo fetch for %s got HTTP 401 - refreshing crumb.", symbol)
+                _refresh_crumb()
+                raise RuntimeError("HTTP 401 (crumb refreshed, will retry)")
             if resp.status_code != 200:
                 raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
 
@@ -143,21 +177,39 @@ def fetch_history(symbol: str, *, range_: str = "1y", interval: str = "1d") -> O
             if current_price is None:
                 current_price = closes[-1]
 
+            def _opt_float(key: str) -> Optional[float]:
+                v = meta.get(key)
+                return float(v) if v is not None else None
+
             return PriceHistory(
                 symbol=symbol,
                 current_price=float(current_price),
                 closes=closes,
                 volumes=volumes,
+                day_low=_opt_float("regularMarketDayLow"),
+                day_high=_opt_float("regularMarketDayHigh"),
+                current_volume=_opt_float("regularMarketVolume"),
             )
         except Exception as exc:  # noqa: BLE001 - best-effort data source
             last_exc = exc
             if attempt < ATTEMPTS:
-                delay = 2.0 * attempt
+                # Rate-limit backoff needs to be much longer than an
+                # ordinary transient-error backoff - a couple of seconds
+                # does nothing against an IP-level throttle window.
+                delay = (15.0 if is_rate_limited else 2.0) * attempt
                 logger.warning(
                     "Yahoo fetch for %s failed (attempt %d/%d): %s - retrying in %.1fs",
                     symbol, attempt, ATTEMPTS, exc, delay,
                 )
                 time.sleep(delay)
 
-    logger.error("Yahoo fetch for %s failed after %d attempts: %s", symbol, ATTEMPTS, last_exc)
+    if is_rate_limited:
+        logger.error(
+            "Yahoo fetch for %s rate-limited after %d attempts - this looks like "
+            "IP-level throttling, not a per-symbol issue. Wait a while (30-60+ min) "
+            "before retrying rather than re-running immediately.",
+            symbol, ATTEMPTS,
+        )
+    else:
+        logger.error("Yahoo fetch for %s failed after %d attempts: %s", symbol, ATTEMPTS, last_exc)
     return None

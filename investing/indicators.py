@@ -1,6 +1,10 @@
-"""Stage 1-3 of the locked indicator funnel (see the ClaudeTrader project's
-'Investment Portfolio Tracker' design doc). v1 only - stage 4/5 (intraday
-RSI, day-low tracking, volume flag) are v2 and not implemented here.
+"""Stages 1-3 of the locked indicator funnel (daily, cross-sectional - see
+the ClaudeTrader project's 'Investment Portfolio Tracker' design doc), plus
+the generic technical-indicator math (RSI, average volume) that stage 4/5
+need. The stage 4/5 trigger logic itself (thresholds, OR-promotion, message
+building) lives in intraday.py, which operates on just today's watch list
+rather than every holding - these two are generic enough to not belong to
+either stage specifically.
 
 Stages 1, 2, and 3 are combined with OR: any one is enough to put a holding
 on today's watch list. Stage 2's two trend checks (50-day MA, 52-week high)
@@ -57,6 +61,52 @@ def _one_month_return(closes: List[float]) -> Optional[float]:
     if len(closes) <= MONTH_TRADING_DAYS:
         return None
     return _pct_change(closes[-1], closes[-1 - MONTH_TRADING_DAYS])
+
+
+def compute_rsi(closes: List[float], period: int = 14) -> Optional[float]:
+    """Wilder's RSI over `closes` (chronological, most recent last).
+
+    Needs at least `period` + 1 closes (period deltas) to produce a value;
+    returns None otherwise rather than guessing from a short window. Uses
+    Wilder's own smoothing (an exponential moving average seeded by a simple
+    average of the first `period` deltas) - the standard RSI definition,
+    not a plain-average shortcut.
+    """
+    if len(closes) < period + 1:
+        return None
+
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [d if d > 0 else 0.0 for d in deltas]
+    losses = [-d if d < 0 else 0.0 for d in deltas]
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        # No losses at all over the smoothed window - maximally overbought,
+        # not a divide-by-zero to dodge.
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def average_volume(volumes: List[float], window: int = 20, exclude_last: bool = True) -> Optional[float]:
+    """Average of the trailing `window` daily volumes.
+
+    `exclude_last` defaults to True because the caller's own `volumes` list
+    commonly ends with *today's* still-accumulating volume (from the same
+    history fetch used for closes) - including it would understate the
+    historical baseline today's pace is compared against. Pass False if the
+    list you're handing in is already historical-only (e.g. you've sliced
+    off today yourself).
+    """
+    series = volumes[:-1] if exclude_last and volumes else volumes
+    if len(series) < window:
+        return None
+    return sum(series[-window:]) / window
 
 
 def evaluate(holding: Holding, history: PriceHistory, benchmark_history: Optional[PriceHistory]) -> Evaluation:

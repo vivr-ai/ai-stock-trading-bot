@@ -1,36 +1,54 @@
-# Investment portfolio tracker (v1)
+# Investment portfolio tracker (v1 + v2)
 
-A daily watch-list scan for Vivek's separate, long-term Yahoo-Finance-tracked
-investment portfolio - independent of the Alpaca trading bot in `bot/`. No
-shared imports or state with `bot/`; it's a second, small Railway service in
-the same project.
+A daily watch-list scan, plus intraday follow-up checks, for Vivek's
+separate, long-term Yahoo-Finance-tracked investment portfolio - independent
+of the Alpaca trading bot in `bot/`. No shared imports or state with `bot/`;
+it's a second, small Railway service in the same project.
 
 See the "Investment Portfolio Tracker" design doc in the ClaudeTrader project
-for the full rules/thresholds this implements. Quick summary: once daily,
-near market open, every holding in `holdings.json` is checked against three
-rules (cost basis, trend pullback, relative-to-index underperformance - any
-one is enough) and anything that trips gets sent as a single Telegram
-message. v2 (intraday RSI + day-low tracking, not built yet) will poll more
-often during the day for whatever's on that day's list.
+for the full rules/thresholds this implements. Quick summary:
+
+- **Daily scan** (v1, once near market open): every holding in
+  `holdings.json` is checked against three rules - cost basis, trend
+  pullback, relative-to-index underperformance (any one is enough, OR'd) -
+  and anything that trips becomes "today's watch list", sent as one
+  Telegram message.
+- **Intraday checks** (v2, every 30 min during market hours): only the
+  symbols on today's watch list are re-checked for RSI<35 (oversold) or a
+  new intraday low at least 0.3% below the last one already flagged today,
+  with a volume-pace caution note (>=1.7x the 20-day average) attached when
+  either of those fires. Quiet rounds send nothing.
+- **End-of-day nudge** (v2, once, 45 min before the ASX close): a reminder
+  for anything still on today's watch list that never got an intraday
+  alert, so it isn't missed just because nothing crossed the intraday
+  threshold.
 
 ## Files
 
 - `holdings.json` - your current holdings snapshot (symbol, exchange,
-  benchmark index, shares, AC/share). Seeded from your Yahoo Finance export;
-  **one row (`LOC.AX`) is flagged `"note"` as unconfirmed - check it before
-  relying on alerts for it.**
+  benchmark index, shares, AC/share). Seeded from your Yahoo Finance export.
 - `config.py` - reads env vars + `holdings.json`.
-- `yahoo_client.py` - fetches ~1y of daily closes/volume from Yahoo's
-  unofficial chart endpoint (works for ASX/NZX/US tickers alike).
-- `indicators.py` - the stage 1-3 rules and OR-promotion logic.
+- `yahoo_client.py` - fetches ~1y of daily closes/volume, plus today's
+  day_low/day_high/current_volume, from Yahoo's unofficial chart endpoint
+  (works for ASX/NZX/US tickers alike).
+- `indicators.py` - the stage 1-3 daily rules and OR-promotion logic, plus
+  the RSI/average-volume math stage 4-5 build on.
+- `intraday.py` - v2: holds today's watch list in memory (set once by
+  `scan.py` after the daily scan), and runs the intraday checks / EOD
+  nudge against just that list.
 - `telegram_client.py` - this feature's own Telegram sender (separate bot
   from the trading bot's).
-- `scan.py` - runs one scan; `python -m investing.scan` for a manual check.
-- `run_scheduler.py` - the long-running entrypoint: fires the scan once a
-  day, Mon-Fri, via APScheduler with `timezone="Australia/Sydney"` (the
-  same technique `bot/scheduler.py` already uses for the trading bot's own
-  schedule, just a different timezone/cadence) so it tracks the ASX open
-  correctly through AEST/AEDT daylight-saving changes automatically.
+- `scan.py` - runs one daily scan; `python -m investing.scan` for a manual
+  check. Also hands today's triggered holdings to `intraday.py`.
+- `run_scheduler.py` - the long-running entrypoint: one persistent worker
+  running three APScheduler cron jobs (daily scan, intraday check, EOD
+  nudge), all with `timezone="Australia/Sydney"` (the same technique
+  `bot/scheduler.py` already uses for the trading bot's own schedule) so
+  they track the ASX open/close correctly through AEST/AEDT daylight-saving
+  changes automatically. A single process is also what lets the intraday
+  job see today's watch list without a shared file or database - it's just
+  an in-memory module variable in `intraday.py`, set by the scan job and
+  read by the other two in the same process.
 
 ## Updating holdings.json
 
@@ -71,9 +89,18 @@ dashboard, not a change to either of them:
    check any time with `python -m investing.scan` via Railway's shell /
    a local run with the same env vars set.
 
-## What's NOT in v1 (deferred to v2)
+## v2: intraday checks and EOD nudge
 
-Intraday RSI, day's-low tracking, the volume caution flag, and the
-end-of-day "last call" nudge - all specified in the design doc but not
-implemented here. v1 is the daily cost-basis/trend/relative-performance
-scan and the Telegram ping only.
+Built on the same worker/service as v1 - no new Railway service, no new
+env vars. Nothing to configure beyond what's already in the table above;
+the intraday cadence (every 30 min, 10:00-15:30 Sydney) and the EOD nudge
+time (15:15 Sydney) are locked in `run_scheduler.py` rather than
+env-configurable, since there's no real reason for them to vary per
+deployment the way the daily scan's time might.
+
+One thing worth knowing operationally: v2 adds Yahoo requests on top of
+v1's - one fetch per watch-list symbol, every 30 minutes, only on days
+where the watch list isn't empty. On a quiet day (nothing triggers the
+daily scan) it adds nothing at all. If Yahoo's rate limiting (see
+`yahoo_client.py`'s module docstring) becomes an issue again, this is the
+first place extra request volume is coming from.
