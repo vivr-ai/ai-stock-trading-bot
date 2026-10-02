@@ -8,6 +8,7 @@ Run on a schedule via run_scheduler.py (the Railway worker entrypoint).
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -17,6 +18,11 @@ from .telegram_client import TelegramNotifier
 from .yahoo_client import PriceHistory, fetch_history
 
 logger = logging.getLogger("investing.scan")
+
+# A short pause between distinct symbols - a bit kinder to Yahoo's
+# unofficial endpoint than firing requests back-to-back, on top of the
+# crumb/cookie fix in yahoo_client.py.
+INTER_REQUEST_DELAY_SECONDS = 0.75
 
 
 def _format_message(evaluations: List[Evaluation]) -> str:
@@ -41,10 +47,12 @@ def run_scan(cfg: Optional[Config] = None) -> List[Evaluation]:
         benchmark_history[sym] = fetch_history(sym)
         if benchmark_history[sym] is None:
             logger.error("Could not fetch benchmark %s - stage 3 will be skipped for holdings using it.", sym)
+        time.sleep(INTER_REQUEST_DELAY_SECONDS)
 
     evaluations: List[Evaluation] = []
     for holding in cfg.holdings:
         history = fetch_history(holding.symbol)
+        time.sleep(INTER_REQUEST_DELAY_SECONDS)
         if history is None:
             logger.error("Skipping %s this scan - could not fetch price history.", holding.symbol)
             continue

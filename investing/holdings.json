@@ -10,8 +10,6 @@
     {"symbol": "VAP.AX",  "exchange": "ASX",  "benchmark": "^AXJO", "shares": 18,    "ac_share": 68.83},
     {"symbol": "AGL.AX",  "exchange": "ASX",  "benchmark": "^AXJO", "shares": 302,   "ac_share": 9.36},
     {"symbol": "FMG.AX",  "exchange": "ASX",  "benchmark": "^AXJO", "shares": 349,   "ac_share": 17.66},
-    {"symbol": "TER.AX",  "exchange": "ASX",  "benchmark": "^AXJO", "shares": 9000,  "ac_share": 0.65},
-    {"symbol": "LOC.AX",  "exchange": "ASX",  "benchmark": "^AXJO", "shares": 19180, "ac_share": 0.10,
-     "note": "UNCONFIRMED - the Yahoo screenshot this was seeded from had no last price/market value for this row. Verify this is a real, separate ASX-listed holding (distinct from LOC.NZ above) before trusting alerts on it; remove this entry if it's stale."}
+    {"symbol": "TER.AX",  "exchange": "ASX",  "benchmark": "^AXJO", "shares": 9000,  "ac_share": 0.65}
   ]
 }
