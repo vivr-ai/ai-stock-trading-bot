@@ -19,10 +19,13 @@ from .yahoo_client import PriceHistory, fetch_history
 
 logger = logging.getLogger("investing.scan")
 
-# A short pause between distinct symbols - a bit kinder to Yahoo's
-# unofficial endpoint than firing requests back-to-back, on top of the
-# crumb/cookie fix in yahoo_client.py.
-INTER_REQUEST_DELAY_SECONDS = 0.75
+# A pause between distinct symbols - a bit kinder to Yahoo's unofficial
+# endpoint than firing requests back-to-back, on top of the crumb/cookie
+# handling in yahoo_client.py. Yahoo's rate limiting turned out to be
+# IP-level (not just this endpoint being picky about anonymous requests),
+# so this alone won't fix an already-throttled IP - it just avoids making
+# a healthy one look like a scraper in the first place.
+INTER_REQUEST_DELAY_SECONDS = 1.5
 
 
 def _format_message(evaluations: List[Evaluation]) -> str:
