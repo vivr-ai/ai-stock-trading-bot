@@ -960,3 +960,94 @@ def test_cancel_orders_for_gives_up_after_timeout_without_raising():
     t0 = time_module.monotonic()
     broker.cancel_orders_for("GOOGL", settle_timeout_s=0.1, poll_interval_s=0.01)
     assert time_module.monotonic() - t0 < 1.0  # bounded; close_position then tries anyway
+
+
+# ---- AlpacaBroker.close_position outlasts a slow-clearing cancel ------
+# Regression test for the 2026-10-14 AMZN incident: Alpaca rejected
+# close_position with "insufficient qty available" (held_for_orders)
+# because the just-cancelled bracket order hadn't settled broker-side
+# yet, and the retry budget then used for this call (4 attempts, ~8s
+# total - the broker's generic default, shared with every other API
+# call) ran out before the shares freed up. The sentiment-exit sat
+# unfilled, and the position unprotected from further news-driven
+# moves, for a full 30-minute cycle until the next scheduled run
+# retried it successfully. These tests fail against that old
+# self._retry-based implementation and pass against the fix (a
+# dedicated call_with_retry budget of 5 attempts / 2s base delay / 30s
+# cap - roughly 30-37s instead of ~8s).
+
+class _HeldForOrdersError(Exception):
+    """Mirrors the shape of the real Alpaca APIError payload for a
+    close attempted while shares are still held_for_orders."""
+    def __init__(self, symbol, existing_qty):
+        super().__init__(
+            '{"available":"0","code":40310000,"existing_qty":"%s",'
+            '"held_for_orders":"%s","message":"insufficient qty available '
+            'for order (requested: %s, available: 0)","symbol":"%s"}'
+            % (existing_qty, existing_qty, existing_qty, symbol)
+        )
+
+
+class _FlakyCloseTradingClient:
+    """No open bracket legs left to cancel (cancel_orders_for returns
+    immediately), but close_position itself still races the cancel's
+    broker-side settlement for `fail_times` calls before the shares
+    free up and the close succeeds."""
+    def __init__(self, fail_times):
+        self.fail_times = fail_times
+        self.calls = 0
+
+    def get_orders(self, _req):
+        return []  # nothing open; cancel_orders_for returns right away
+
+    def cancel_order_by_id(self, _id):
+        pass
+
+    def close_position(self, symbol):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise _HeldForOrdersError(symbol, existing_qty=19)
+
+        class _Order:
+            id = "order-after-settle"
+            qty = "19"
+            status = "filled"
+            filled_avg_price = "256.35"
+
+        return _Order()
+
+
+def test_close_position_outlasts_slow_clearing_cancel(monkeypatch):
+    pytest = __import__("pytest")
+    pytest.importorskip("alpaca")
+    monkeypatch.setattr(time_module, "sleep", lambda *_a, **_k: None)
+
+    # Fails the first 4 attempts - the old budget's entire allowance -
+    # and only succeeds on the 5th, which used to be out of reach.
+    trading = _FlakyCloseTradingClient(fail_times=4)
+    broker = _bare_broker(trading)
+    broker.allow_submit = True
+
+    order = broker.close_position("AMZN")
+
+    assert order is not None
+    assert order.order_id == "order-after-settle"
+    assert trading.calls == 5
+
+
+def test_close_position_still_gives_up_eventually(monkeypatch):
+    """Not an infinite retry: exhausting the new budget still returns
+    None (close_position's own except-clause) rather than hanging or
+    raising out to the caller."""
+    pytest = __import__("pytest")
+    pytest.importorskip("alpaca")
+    monkeypatch.setattr(time_module, "sleep", lambda *_a, **_k: None)
+
+    trading = _FlakyCloseTradingClient(fail_times=10_000)  # never clears
+    broker = _bare_broker(trading)
+    broker.allow_submit = True
+
+    order = broker.close_position("AMZN")
+
+    assert order is None
+    assert trading.calls == 5  # bounded by the new budget, not unbounded

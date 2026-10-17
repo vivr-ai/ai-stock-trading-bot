@@ -788,7 +788,7 @@ class AlpacaBroker:
             status=str(order.status),
         )
 
-    def cancel_orders_for(self, symbol: str, settle_timeout_s: float = 10.0,
+    def cancel_orders_for(self, symbol: str, settle_timeout_s: float = 20.0,
                           poll_interval_s: float = 0.5) -> None:
         """Cancel any live orders for a symbol (the leftover bracket legs),
         then wait (up to settle_timeout_s) until Alpaca no longer reports any
@@ -839,7 +839,25 @@ class AlpacaBroker:
         # short position.
         self.cancel_orders_for(symbol)
         try:
-            order = self._retry(lambda: self._trading.close_position(symbol), f"close_position({symbol})")
+            # This call races against Alpaca settling the cancel just issued
+            # above: shares stay "held_for_orders" until the cancel fully
+            # clears broker-side, so close_position can fail with
+            # "insufficient qty available" even though cancel_orders_for
+            # already waited. Seen in production: AMZN failed permanently
+            # after the broker's generic 4-attempt/~8s retry budget on
+            # 2026-10-14's market-open cycle (held_for_orders hadn't
+            # cleared yet) and the sentiment-exit sat unfilled - and the
+            # position unprotected from further news-driven moves - for a
+            # full 30-minute cycle until the next run retried it. Give this
+            # specific operation a longer, dedicated retry budget (~30-37s
+            # vs. the broker's shared ~8s default) instead of the generic
+            # self._retry, so a slow-clearing cancel resolves within this
+            # same cycle rather than waiting for the next one.
+            order = call_with_retry(
+                lambda: self._trading.close_position(symbol),
+                attempts=5, base_delay=2.0, max_delay=30.0,
+                op_name=f"close_position({symbol})",
+            )
             return PlacedOrder(
                 order_id=str(order.id), symbol=symbol, side="sell",
                 qty=int(float(order.qty)) if order.qty else 0,
