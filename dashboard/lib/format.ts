@@ -28,3 +28,13 @@ export function toneFor(v: number | null | undefined): "gain" | "loss" | "neutra
   if (v == null || Number.isNaN(v) || v === 0) return "neutral";
   return v > 0 ? "gain" : "loss";
 }
+
+export function fmtDateTime(iso: string | null | undefined) {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}

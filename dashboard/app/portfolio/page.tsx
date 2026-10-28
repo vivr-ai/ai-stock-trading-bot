@@ -3,7 +3,8 @@
 import { useEffect, useState } from "react";
 import LoadingSkeleton from "@/components/LoadingSkeleton";
 import ErrorState from "@/components/ErrorState";
-import { fmtMoney, fmtPct, fmtNumber, timeAgo, toneFor } from "@/lib/format";
+import { fmtMoney, fmtPct, fmtNumber, fmtDateTime, timeAgo, toneFor } from "@/lib/format";
+import { nameFor } from "@/lib/symbolNames";
 
 type Position = {
   symbol: string;
@@ -105,10 +106,11 @@ export default function PortfolioPage() {
 
       {!loading && !error && data && data.positions.length > 0 && (
         <div className="overflow-x-auto rounded-xl border border-bg-border bg-bg-panel">
-          <table className="w-full min-w-[1150px] text-left text-sm">
+          <table className="w-full min-w-[1300px] text-left text-sm">
             <thead>
               <tr className="border-b border-bg-border text-xs uppercase tracking-wide text-muted">
                 <th className="px-4 py-3 font-medium">Symbol</th>
+                <th className="px-4 py-3 font-medium">Bought</th>
                 <th className="px-4 py-3 font-medium">Qty</th>
                 <th className="px-4 py-3 font-medium">Avg Entry</th>
                 <th className="px-4 py-3 font-medium">Current Price</th>
@@ -125,7 +127,15 @@ export default function PortfolioPage() {
                 const tone = toneFor(p.unrealized_pl);
                 return (
                   <tr key={p.symbol} className="border-b border-bg-border last:border-0">
-                    <td className="px-4 py-3 font-semibold text-white">{p.symbol}</td>
+                    <td className="px-4 py-3">
+                      <div className="font-semibold text-white">{p.symbol}</div>
+                      {nameFor(p.symbol) && (
+                        <div className="text-xs text-muted">{nameFor(p.symbol)}</div>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 whitespace-nowrap text-muted">
+                      {fmtDateTime(p.entry_time)}
+                    </td>
                     <td className="px-4 py-3 tabular-nums">{fmtNumber(p.qty)}</td>
                     <td className="px-4 py-3 tabular-nums">{fmtMoney(p.avg_entry_price)}</td>
                     <td className="px-4 py-3 tabular-nums">{fmtMoney(p.current_price)}</td>

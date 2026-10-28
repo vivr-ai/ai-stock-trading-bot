@@ -3,7 +3,8 @@
 import { useEffect, useMemo, useState } from "react";
 import LoadingSkeleton from "@/components/LoadingSkeleton";
 import ErrorState from "@/components/ErrorState";
-import { fmtMoney, fmtPct, toneFor } from "@/lib/format";
+import { fmtMoney, fmtPct, fmtDateTime, toneFor } from "@/lib/format";
+import { nameFor } from "@/lib/symbolNames";
 import { Search } from "lucide-react";
 
 type ClosedTrade = {
@@ -25,16 +26,6 @@ type TradesResponse = {
   trades: ClosedTrade[];
   hasEverRun: boolean;
 };
-
-function fmtDateTime(iso: string | null) {
-  if (!iso) return "—";
-  return new Date(iso).toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
 
 export default function TradeHistoryPage() {
   const [data, setData] = useState<TradesResponse | null>(null);
@@ -150,7 +141,12 @@ export default function TradeHistoryPage() {
                 const tone = toneFor(t.pnl);
                 return (
                   <tr key={t.id} className="border-b border-bg-border align-top last:border-0">
-                    <td className="px-4 py-3 font-semibold text-white">{t.symbol}</td>
+                    <td className="px-4 py-3">
+                      <div className="font-semibold text-white">{t.symbol}</div>
+                      {nameFor(t.symbol) && (
+                        <div className="text-xs text-muted">{nameFor(t.symbol)}</div>
+                      )}
+                    </td>
                     <td className="px-4 py-3 whitespace-nowrap text-muted">{fmtDateTime(t.entry_time)}</td>
                     <td className="px-4 py-3 whitespace-nowrap text-muted">{fmtDateTime(t.ts)}</td>
                     <td className="px-4 py-3 tabular-nums">{fmtMoney(t.entry_price)}</td>
