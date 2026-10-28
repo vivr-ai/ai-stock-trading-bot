@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import LoadingSkeleton from "@/components/LoadingSkeleton";
 import ErrorState from "@/components/ErrorState";
 import { fmtMoney, fmtPct, fmtNumber, fmtDateTime, timeAgo, toneFor } from "@/lib/format";
 import { nameFor } from "@/lib/symbolNames";
+import { ArrowUp, ArrowDown, ArrowUpDown } from "lucide-react";
 
 type Position = {
   symbol: string;
@@ -29,6 +30,95 @@ type PositionsResponse = {
   hasEverRun: boolean;
   updatedAt: string | null;
 };
+
+// Every column in the table is sortable by clicking its header - this is
+// the set of keys a click can sort by, each mapped to a comparable value
+// via sortValueFor() below (not always the same type as the Position field,
+// e.g. entry_time becomes a numeric timestamp so it sorts chronologically
+// rather than as a string).
+type SortKey =
+  | "symbol"
+  | "entry_time"
+  | "qty"
+  | "avg_entry_price"
+  | "current_price"
+  | "stop_loss_price"
+  | "trailing_peak_price"
+  | "unrealized_pl"
+  | "allocation_pct"
+  | "ai_confidence"
+  | "entry_reason";
+
+type SortDir = "asc" | "desc";
+type SortState = { key: SortKey; dir: SortDir };
+
+function sortValueFor(p: Position, key: SortKey): string | number | null {
+  switch (key) {
+    case "symbol":
+      return p.symbol.toLowerCase();
+    case "entry_time":
+      return p.entry_time ? new Date(p.entry_time).getTime() : null;
+    case "qty":
+      return p.qty;
+    case "avg_entry_price":
+      return p.avg_entry_price;
+    case "current_price":
+      return p.current_price;
+    case "stop_loss_price":
+      return p.stop_loss_price;
+    case "trailing_peak_price":
+      return p.trailing_peak_price;
+    case "unrealized_pl":
+      return p.unrealized_pl;
+    case "allocation_pct":
+      return p.allocation_pct;
+    case "ai_confidence":
+      return p.ai_confidence;
+    case "entry_reason":
+      return p.entry_reason ? p.entry_reason.toLowerCase() : null;
+  }
+}
+
+// Rows with no value for the active sort column always sink to the bottom,
+// in both directions - e.g. a position with no trailing peak yet shouldn't
+// jump to the top just because you clicked "descending".
+function compareSortValues(a: string | number | null, b: string | number | null, dir: SortDir) {
+  if (a == null && b == null) return 0;
+  if (a == null) return 1;
+  if (b == null) return -1;
+  const result =
+    typeof a === "string" && typeof b === "string" ? a.localeCompare(b) : (a as number) - (b as number);
+  return dir === "asc" ? result : -result;
+}
+
+function SortableHeader({
+  label,
+  sortKey,
+  sort,
+  onSort,
+}: {
+  label: string;
+  sortKey: SortKey;
+  sort: SortState | null;
+  onSort: (key: SortKey) => void;
+}) {
+  const active = sort?.key === sortKey;
+  const Icon = active ? (sort!.dir === "asc" ? ArrowUp : ArrowDown) : ArrowUpDown;
+  return (
+    <th className="px-4 py-3 font-medium">
+      <button
+        type="button"
+        onClick={() => onSort(sortKey)}
+        className={`flex items-center gap-1 whitespace-nowrap hover:text-white ${
+          active ? "text-white" : ""
+        }`}
+      >
+        {label}
+        <Icon size={12} className={active ? "opacity-90" : "opacity-40"} />
+      </button>
+    </th>
+  );
+}
 
 function ConfidenceBadge({ score }: { score: number | null }) {
   if (score == null) return <span className="text-muted">—</span>;
@@ -57,6 +147,22 @@ export default function PortfolioPage() {
   const [data, setData] = useState<PositionsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [sort, setSort] = useState<SortState | null>(null);
+
+  function handleSort(key: SortKey) {
+    setSort((prev) => {
+      if (!prev || prev.key !== key) return { key, dir: "asc" };
+      return { key, dir: prev.dir === "asc" ? "desc" : "asc" };
+    });
+  }
+
+  const sortedPositions = useMemo(() => {
+    const positions = data?.positions ?? [];
+    if (!sort) return positions;
+    return [...positions].sort((a, b) =>
+      compareSortValues(sortValueFor(a, sort.key), sortValueFor(b, sort.key), sort.dir)
+    );
+  }, [data, sort]);
 
   async function load() {
     try {
@@ -109,21 +215,21 @@ export default function PortfolioPage() {
           <table className="w-full min-w-[1300px] text-left text-sm">
             <thead>
               <tr className="border-b border-bg-border text-xs uppercase tracking-wide text-muted">
-                <th className="px-4 py-3 font-medium">Symbol</th>
-                <th className="px-4 py-3 font-medium">Bought</th>
-                <th className="px-4 py-3 font-medium">Qty</th>
-                <th className="px-4 py-3 font-medium">Avg Entry</th>
-                <th className="px-4 py-3 font-medium">Current Price</th>
-                <th className="px-4 py-3 font-medium">Stop Loss</th>
-                <th className="px-4 py-3 font-medium">Trailing Peak</th>
-                <th className="px-4 py-3 font-medium">Unrealized P/L</th>
-                <th className="px-4 py-3 font-medium">Allocation</th>
-                <th className="px-4 py-3 font-medium">AI Confidence</th>
-                <th className="px-4 py-3 font-medium">Entry Reason</th>
+                <SortableHeader label="Symbol" sortKey="symbol" sort={sort} onSort={handleSort} />
+                <SortableHeader label="Bought" sortKey="entry_time" sort={sort} onSort={handleSort} />
+                <SortableHeader label="Qty" sortKey="qty" sort={sort} onSort={handleSort} />
+                <SortableHeader label="Avg Entry" sortKey="avg_entry_price" sort={sort} onSort={handleSort} />
+                <SortableHeader label="Current Price" sortKey="current_price" sort={sort} onSort={handleSort} />
+                <SortableHeader label="Stop Loss" sortKey="stop_loss_price" sort={sort} onSort={handleSort} />
+                <SortableHeader label="Trailing Peak" sortKey="trailing_peak_price" sort={sort} onSort={handleSort} />
+                <SortableHeader label="Unrealized P/L" sortKey="unrealized_pl" sort={sort} onSort={handleSort} />
+                <SortableHeader label="Allocation" sortKey="allocation_pct" sort={sort} onSort={handleSort} />
+                <SortableHeader label="AI Confidence" sortKey="ai_confidence" sort={sort} onSort={handleSort} />
+                <SortableHeader label="Entry Reason" sortKey="entry_reason" sort={sort} onSort={handleSort} />
               </tr>
             </thead>
             <tbody>
-              {data.positions.map((p) => {
+              {sortedPositions.map((p) => {
                 const tone = toneFor(p.unrealized_pl);
                 return (
                   <tr key={p.symbol} className="border-b border-bg-border last:border-0">
