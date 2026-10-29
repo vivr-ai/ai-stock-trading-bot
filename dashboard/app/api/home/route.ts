@@ -280,10 +280,9 @@ export async function GET() {
         : null;
 
     const realizedToday = todaysClosedTrades?.total_pnl ? Number(todaysClosedTrades.total_pnl) : 0;
-    const unrealizedNow = openPositionsAgg[0]?.total_unrealized
-      ? Number(openPositionsAgg[0].total_unrealized)
-      : 0;
-    const todaysPl = realizedToday + unrealizedNow;
+    // Closed trades only (realized). Unrealized P/L on held positions moves
+    // with price and is shown on the Portfolio page's total row instead.
+    const todaysPl = realizedToday;
 
     // ---- Trading activity ----
     const tradesToday = todaysClosedTrades ? Number(todaysClosedTrades.count) : 0;
@@ -297,7 +296,7 @@ export async function GET() {
     // open_positions snapshot) - same "realized + unrealized" shape as
     // todaysPl above, just over the whole history instead of just today.
     const lifetimeRealizedPl = allTimeClosedTrades.reduce((sum, t) => sum + Number(t.pnl), 0);
-    const lifetimePl = lifetimeRealizedPl + unrealizedNow;
+    const lifetimePl = lifetimeRealizedPl; // closed trades only; see todaysPl note above
     const avgTradePl = allTimeClosedTrades.length > 0 ? lifetimeRealizedPl / allTimeClosedTrades.length : null;
     let bestTrade: { symbol: string; pnl: number } | null = null;
     let worstTrade: { symbol: string; pnl: number } | null = null;

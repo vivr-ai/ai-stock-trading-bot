@@ -5,7 +5,7 @@ import LoadingSkeleton from "@/components/LoadingSkeleton";
 import ErrorState from "@/components/ErrorState";
 import { fmtMoney, fmtPct, fmtDateTime, toneFor } from "@/lib/format";
 import { nameFor } from "@/lib/symbolNames";
-import { Search } from "lucide-react";
+import { Search, ArrowUp, ArrowDown, ArrowUpDown } from "lucide-react";
 
 type ClosedTrade = {
   id: number;
@@ -27,6 +27,68 @@ type TradesResponse = {
   hasEverRun: boolean;
 };
 
+type SortKey = "symbol" | "entry_time" | "ts" | "entry_price" | "exit_price" | "pnl" | "buy_reason" | "news_summary";
+type SortDir = "asc" | "desc";
+type SortState = { key: SortKey; dir: SortDir };
+
+function sortValueFor(t: ClosedTrade, key: SortKey): string | number | null {
+  switch (key) {
+    case "symbol":
+      return t.symbol.toLowerCase();
+    case "entry_time":
+      return t.entry_time ? new Date(t.entry_time).getTime() : null;
+    case "ts":
+      return t.ts ? new Date(t.ts).getTime() : null;
+    case "entry_price":
+      return Number(t.entry_price);
+    case "exit_price":
+      return Number(t.exit_price);
+    case "pnl":
+      return Number(t.pnl);
+    case "buy_reason":
+      return t.buy_reason ? t.buy_reason.toLowerCase() : null;
+    case "news_summary":
+      return t.news_summary ? t.news_summary.toLowerCase() : null;
+  }
+}
+
+// Rows with no value for the active sort column always sink to the bottom.
+function compareSortValues(a: string | number | null, b: string | number | null, dir: SortDir) {
+  if (a == null && b == null) return 0;
+  if (a == null) return 1;
+  if (b == null) return -1;
+  const result =
+    typeof a === "string" && typeof b === "string" ? a.localeCompare(b) : (a as number) - (b as number);
+  return dir === "asc" ? result : -result;
+}
+
+function SortableHeader({
+  label,
+  sortKey,
+  sort,
+  onSort,
+}: {
+  label: string;
+  sortKey: SortKey;
+  sort: SortState | null;
+  onSort: (key: SortKey) => void;
+}) {
+  const active = sort?.key === sortKey;
+  const Icon = active ? (sort!.dir === "asc" ? ArrowUp : ArrowDown) : ArrowUpDown;
+  return (
+    <th className="px-4 py-3 font-medium">
+      <button
+        type="button"
+        onClick={() => onSort(sortKey)}
+        className={`flex items-center gap-1 whitespace-nowrap hover:text-white ${active ? "text-white" : ""}`}
+      >
+        {label}
+        <Icon size={12} className={active ? "opacity-90" : "opacity-40"} />
+      </button>
+    </th>
+  );
+}
+
 export default function TradeHistoryPage() {
   const [data, setData] = useState<TradesResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -36,6 +98,22 @@ export default function TradeHistoryPage() {
   const [outcome, setOutcome] = useState<"all" | "win" | "loss">("all");
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
+  const [sort, setSort] = useState<SortState | null>(null);
+
+  function handleSort(key: SortKey) {
+    setSort((prev) => {
+      if (!prev || prev.key !== key) return { key, dir: "asc" };
+      return { key, dir: prev.dir === "asc" ? "desc" : "asc" };
+    });
+  }
+
+  const sortedTrades = useMemo(() => {
+    const trades = data?.trades ?? [];
+    if (!sort) return trades;
+    return [...trades].sort((a, b) =>
+      compareSortValues(sortValueFor(a, sort.key), sortValueFor(b, sort.key), sort.dir)
+    );
+  }, [data, sort]);
 
   const queryString = useMemo(() => {
     const params = new URLSearchParams();
@@ -126,18 +204,18 @@ export default function TradeHistoryPage() {
           <table className="w-full min-w-[1000px] text-left text-sm">
             <thead>
               <tr className="border-b border-bg-border text-xs uppercase tracking-wide text-muted">
-                <th className="px-4 py-3 font-medium">Symbol</th>
-                <th className="px-4 py-3 font-medium">Buy Time</th>
-                <th className="px-4 py-3 font-medium">Sell Time</th>
-                <th className="px-4 py-3 font-medium">Entry</th>
-                <th className="px-4 py-3 font-medium">Exit</th>
-                <th className="px-4 py-3 font-medium">P/L</th>
-                <th className="px-4 py-3 font-medium">AI Explanation</th>
-                <th className="px-4 py-3 font-medium">News That Triggered It</th>
+                <SortableHeader label="Symbol" sortKey="symbol" sort={sort} onSort={handleSort} />
+                <SortableHeader label="Buy Time" sortKey="entry_time" sort={sort} onSort={handleSort} />
+                <SortableHeader label="Sell Time" sortKey="ts" sort={sort} onSort={handleSort} />
+                <SortableHeader label="Entry" sortKey="entry_price" sort={sort} onSort={handleSort} />
+                <SortableHeader label="Exit" sortKey="exit_price" sort={sort} onSort={handleSort} />
+                <SortableHeader label="P/L" sortKey="pnl" sort={sort} onSort={handleSort} />
+                <SortableHeader label="AI Explanation" sortKey="buy_reason" sort={sort} onSort={handleSort} />
+                <SortableHeader label="News That Triggered It" sortKey="news_summary" sort={sort} onSort={handleSort} />
               </tr>
             </thead>
             <tbody>
-              {data.trades.map((t) => {
+              {sortedTrades.map((t) => {
                 const tone = toneFor(t.pnl);
                 return (
                   <tr key={t.id} className="border-b border-bg-border align-top last:border-0">

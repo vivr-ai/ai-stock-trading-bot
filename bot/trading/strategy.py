@@ -695,9 +695,13 @@ class SentimentStrategy:
         entry_price = float(last_buy["price"])
         qty = float(last_buy["qty"])
         full_reason = f"{exit_reason} (reconstructed - open-lot state was lost)"
+        # The buy row's ts IS the entry time - recover it instead of leaving
+        # entry_time NULL (which showed as a blank Buy Time on Trade History).
+        buy_ts = last_buy.get("ts")
+        entry_time = buy_ts.timestamp() if isinstance(buy_ts, datetime) else None
         pnl = self.closed_trade_logger.log(
             symbol, qty, entry_price, exit_price,
-            exit_reason=full_reason, entry_time=None,
+            exit_reason=full_reason, entry_time=entry_time,
         )
         logger.info(
             "Closed trade (reconstructed from trades table - open-lot state "
@@ -710,7 +714,7 @@ class SentimentStrategy:
         self.recorder.record_closed_trade(
             symbol=symbol, qty=qty, entry_price=entry_price, exit_price=exit_price,
             pnl=pnl, pnl_pct=pnl_pct, exit_reason=full_reason,
-            entry_time=None, buy_reason=last_buy.get("reason"),
+            entry_time=entry_time, buy_reason=last_buy.get("reason"),
             news_summary=last_buy.get("rationale"), sector=last_buy.get("sector"),
             confidence_score=last_buy.get("sentiment_score"),
             confidence_label=last_buy.get("sentiment_label"),

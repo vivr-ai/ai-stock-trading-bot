@@ -164,6 +164,14 @@ export default function PortfolioPage() {
     );
   }, [data, sort]);
 
+  const totals = useMemo(() => {
+    const positions = data?.positions ?? [];
+    const unrealized = positions.reduce((sum, p) => sum + Number(p.unrealized_pl || 0), 0);
+    const costBasis = positions.reduce((sum, p) => sum + Number(p.qty || 0) * Number(p.avg_entry_price || 0), 0);
+    const allocation = positions.reduce((sum, p) => sum + Number(p.allocation_pct || 0), 0);
+    return { unrealized, pct: costBasis > 0 ? (unrealized / costBasis) * 100 : null, allocation };
+  }, [data]);
+
   async function load() {
     try {
       const res = await fetch("/api/positions");
@@ -283,6 +291,26 @@ export default function PortfolioPage() {
                 );
               })}
             </tbody>
+            <tfoot>
+              <tr className="border-t border-bg-border bg-bg-panel2 font-semibold">
+                <td className="px-4 py-3 text-white">Total ({data.positions.length})</td>
+                <td colSpan={6}></td>
+                <td
+                  className={`px-4 py-3 tabular-nums ${
+                    toneFor(totals.unrealized) === "gain"
+                      ? "text-gain"
+                      : toneFor(totals.unrealized) === "loss"
+                      ? "text-loss"
+                      : ""
+                  }`}
+                >
+                  {fmtMoney(totals.unrealized)}{" "}
+                  {totals.pct != null && <span className="text-xs opacity-80">({fmtPct(totals.pct)})</span>}
+                </td>
+                <td className="px-4 py-3 tabular-nums">{totals.allocation.toFixed(1)}%</td>
+                <td colSpan={2}></td>
+              </tr>
+            </tfoot>
           </table>
         </div>
       )}

@@ -236,6 +236,7 @@ export default function HomePage() {
               label="Today's P/L"
               value={fmtMoney(data.portfolio.todaysPl)}
               tone={toneFor(data.portfolio.todaysPl)}
+              sublabel="Closed trades today (realized only)"
               icon={<TrendingUp size={15} />}
             />
             <StatCard
@@ -243,7 +244,7 @@ export default function HomePage() {
               label="Lifetime P/L"
               value={fmtMoney(data.lifetime.pl)}
               tone={toneFor(data.lifetime.pl)}
-              sublabel="Realized + unrealized, all-time"
+              sublabel="Closed trades, all-time (realized only)"
               icon={<History size={15} />}
             />
             <StatCard
