@@ -183,18 +183,22 @@ export function marketRegimeKey(t: ClosedTradeRow): string | null {
 // =90.2 >= 65 exit threshold" and "RSI(2)=72.1 >= 65 exit threshold" together
 // instead of treating every trade as its own unique reason.
 //
-// One known limitation, straight from the code: a broker-side bracket fill
-// (the stop-loss or take-profit leg executing on Alpaca's book, often
-// discovered after the fact rather than decided by the bot that cycle) is
-// always logged as "auto_exit (stop_loss_or_take_profit)" - the bot doesn't
-// currently record which of the two legs actually fired, so those two rules
-// share one bucket here rather than being split inaccurately.
+// Stop-loss vs. take-profit: a broker-side bracket fill is logged by
+// _log_auto_exit/_classify_bracket_exit in bot/trading/strategy.py. As of
+// the fix that added _classify_bracket_exit, new exits are logged as the
+// specific "auto_exit (stop_loss)" or "auto_exit (take_profit)" (inferred
+// from where the fill price landed relative to the two bracket legs - see
+// that function's docstring for why it's inference rather than a direct
+// signal from Alpaca). Rows closed before that fix shipped still carry the
+// old combined "auto_exit (stop_loss_or_take_profit)" text and have no way
+// to be split after the fact, so they keep their own bucket below rather
+// than being guessed at retroactively.
 //
-// A second limitation: the momentum time-based exit and the mean-reversion
-// max-hold exit (_momentum_time_exit_reason / _reversion_exit_reason) emit
-// the exact same "max hold of N day(s) reached (...)" text, so they also
-// share one bucket - distinguishing them would need the trade's entry_path,
-// which isn't part of this text.
+// A second, still-open limitation: the momentum time-based exit and the
+// mean-reversion max-hold exit (_momentum_time_exit_reason /
+// _reversion_exit_reason) emit the exact same "max hold of N day(s) reached
+// (...)" text, so they still share one bucket here - distinguishing them
+// would need the trade's entry_path, which isn't part of this text.
 export function exitReasonCategory(reason: string | null): string {
   if (!reason) return "Unknown / not recorded";
   let r = reason;
@@ -202,8 +206,13 @@ export function exitReasonCategory(reason: string | null): string {
     r = r.slice(r.indexOf(":") + 1).trim();
   }
   const lower = r.toLowerCase();
-  if (lower.includes("auto_exit") && lower.includes("stop_loss_or_take_profit")) {
-    return "Stop-loss / take-profit (broker bracket)";
+  if (lower.includes("auto_exit")) {
+    if (lower.includes("stop_loss_or_take_profit")) {
+      return "Stop-loss / take-profit (pre-fix, unsplit)";
+    }
+    if (lower.includes("stop_loss")) return "Stop-loss (broker bracket)";
+    if (lower.includes("take_profit")) return "Take-profit (broker bracket)";
+    return "Stop-loss / take-profit (pre-fix, unsplit)";
   }
   if (lower.includes("trailing stop")) return "Trailing stop";
   if (lower.startsWith("max hold of")) return "Max hold time reached";

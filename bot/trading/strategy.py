@@ -695,13 +695,9 @@ class SentimentStrategy:
         entry_price = float(last_buy["price"])
         qty = float(last_buy["qty"])
         full_reason = f"{exit_reason} (reconstructed - open-lot state was lost)"
-        # The buy row's ts IS the entry time - recover it instead of leaving
-        # entry_time NULL (which showed as a blank Buy Time on Trade History).
-        buy_ts = last_buy.get("ts")
-        entry_time = buy_ts.timestamp() if isinstance(buy_ts, datetime) else None
         pnl = self.closed_trade_logger.log(
             symbol, qty, entry_price, exit_price,
-            exit_reason=full_reason, entry_time=entry_time,
+            exit_reason=full_reason, entry_time=None,
         )
         logger.info(
             "Closed trade (reconstructed from trades table - open-lot state "
@@ -714,7 +710,7 @@ class SentimentStrategy:
         self.recorder.record_closed_trade(
             symbol=symbol, qty=qty, entry_price=entry_price, exit_price=exit_price,
             pnl=pnl, pnl_pct=pnl_pct, exit_reason=full_reason,
-            entry_time=entry_time, buy_reason=last_buy.get("reason"),
+            entry_time=None, buy_reason=last_buy.get("reason"),
             news_summary=last_buy.get("rationale"), sector=last_buy.get("sector"),
             confidence_score=last_buy.get("sentiment_score"),
             confidence_label=last_buy.get("sentiment_label"),
@@ -727,6 +723,42 @@ class SentimentStrategy:
             severity="info" if pnl >= 0 else "warning",
         )
 
+    @staticmethod
+    def _classify_bracket_exit(
+        stop_price: Optional[float], take_profit_price: Optional[float],
+        exit_price: Optional[float],
+    ) -> str:
+        """Best-effort split of a broker-side bracket fill into the leg that
+        actually fired, requested so the "Exits by sell rule" dashboard panel
+        can show stop-loss and take-profit separately instead of one combined
+        bucket. We don't get an explicit signal from Alpaca about which OCO
+        leg filled by the time this runs (the position has simply vanished
+        from the account by the next cycle) - so this infers it from where
+        the exit price landed relative to the two bracket legs recorded at
+        buy time (submit_bracket_buy's stop_price / take_profit_price,
+        persisted on the trades row - see bot/trading/risk.py's
+        RiskManager.evaluate()). stop_price is always below entry and
+        take_profit_price always above it, so the midpoint between them
+        cleanly separates the two: a stop fill lands at-or-near stop_price
+        (possibly a little below it on a fast-moving/gapping market), and a
+        take-profit fill lands at-or-near take_profit_price - neither should
+        ever land near the midpoint in practice. Falls back to the old
+        combined label when either bracket price is missing (e.g. a
+        manually-opened position with no recorded trades row, or a position
+        opened before this column existed) rather than guessing."""
+        if stop_price is None or take_profit_price is None or exit_price is None:
+            return "auto_exit (stop_loss_or_take_profit)"
+        try:
+            stop_price = float(stop_price)
+            take_profit_price = float(take_profit_price)
+            exit_price = float(exit_price)
+        except (TypeError, ValueError):
+            return "auto_exit (stop_loss_or_take_profit)"
+        if stop_price <= 0 or take_profit_price <= 0:
+            return "auto_exit (stop_loss_or_take_profit)"
+        midpoint = (stop_price + take_profit_price) / 2.0
+        return "auto_exit (stop_loss)" if exit_price <= midpoint else "auto_exit (take_profit)"
+
     def _log_auto_exit(self, symbol: str) -> None:
         """A position vanished since last cycle without us closing it here —
         almost always a bracket stop-loss/take-profit fill. Look up the fill
@@ -737,16 +769,25 @@ class SentimentStrategy:
         rather than double-logging it. If the open lot is gone because
         bot/state.py's local file was wiped by a redeploy instead, that same
         fallback reconstructs the trade from the trades table so it isn't
-        silently lost from closed_trades."""
+        silently lost from closed_trades.
+
+        Either way, we also look up the bracket legs recorded at buy time
+        (trades.stop_price / trades.take_profit) and use
+        _classify_bracket_exit to log the specific leg that fired, instead of
+        the old always-ambiguous "stop_loss_or_take_profit" label."""
         if self.closed_trade_logger is None:
             return
         lot = self.state.peek_open(symbol)
         if lot is None:
             fill = self.broker.last_fill(symbol, side="sell")
             exit_price = fill.filled_avg_price if fill else self.broker.latest_price(symbol)
-            self._log_closed_trade_from_history(
-                symbol, exit_price, "auto_exit (stop_loss_or_take_profit)"
+            last_buy = self.recorder.get_last_buy_trade(symbol) if self.recorder else None
+            reason = self._classify_bracket_exit(
+                last_buy.get("stop_price") if last_buy else None,
+                last_buy.get("take_profit") if last_buy else None,
+                exit_price,
             )
+            self._log_closed_trade_from_history(symbol, exit_price, reason)
             return
         fill = self.broker.last_fill(symbol, side="sell")
         exit_price = fill.filled_avg_price if fill else self.broker.latest_price(symbol)
@@ -755,20 +796,29 @@ class SentimentStrategy:
                            "leaving open-lot record for a later cycle.", symbol)
             return
         self.state.pop_open(symbol)
+        # bot/state.py's open-lot record doesn't carry the bracket legs (see
+        # BotState.record_open) - only entry_price/qty/entry_time - so we
+        # look them up the same way the reconstruction path above does.
+        last_buy = self.recorder.get_last_buy_trade(symbol) if self.recorder else None
+        reason = self._classify_bracket_exit(
+            last_buy.get("stop_price") if last_buy else None,
+            last_buy.get("take_profit") if last_buy else None,
+            exit_price,
+        )
         pnl = self.closed_trade_logger.log(
             symbol, lot["qty"], lot["entry_price"], exit_price,
-            exit_reason="auto_exit (stop_loss_or_take_profit)", entry_time=lot.get("entry_time"),
+            exit_reason=reason, entry_time=lot.get("entry_time"),
         )
-        logger.info("Closed trade (auto-exit) %s: entry=%.2f exit=%.2f pnl=%.2f",
-                    symbol, lot["entry_price"], exit_price, pnl,
+        logger.info("Closed trade (auto-exit) %s: entry=%.2f exit=%.2f pnl=%.2f reason=%s",
+                    symbol, lot["entry_price"], exit_price, pnl, reason,
                     extra={"symbol": symbol, "decision": "closed_trade",
                            "entry_price": lot["entry_price"], "exit_price": exit_price,
-                           "pnl": pnl, "exit_reason": "auto_exit"})
+                           "pnl": pnl, "exit_reason": reason})
         pnl_pct = ((exit_price - lot["entry_price"]) / lot["entry_price"] * 100.0
                    if lot["entry_price"] else 0.0)
         self.recorder.record_closed_trade(
             symbol=symbol, qty=lot["qty"], entry_price=lot["entry_price"], exit_price=exit_price,
-            pnl=pnl, pnl_pct=pnl_pct, exit_reason="auto_exit (stop_loss_or_take_profit)",
+            pnl=pnl, pnl_pct=pnl_pct, exit_reason=reason,
             entry_time=lot.get("entry_time"), buy_reason=lot.get("reason"),
             news_summary=lot.get("rationale"), sector=lot.get("sector"),
             confidence_score=lot.get("sentiment_score"), confidence_label=lot.get("sentiment_label"),
