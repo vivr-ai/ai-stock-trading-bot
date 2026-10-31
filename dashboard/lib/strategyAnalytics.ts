@@ -177,6 +177,46 @@ export function marketRegimeKey(t: ClosedTradeRow): string | null {
   return t.market_regime ?? "unknown";
 }
 
+// Normalizes the free-text exit_reason the bot writes at close time (see
+// bot/trading/strategy.py's _do_sell call sites and docs/sell-strategy.md)
+// into a stable set of sell-rule buckets, so a breakdown table groups "RSI(2)
+// =90.2 >= 65 exit threshold" and "RSI(2)=72.1 >= 65 exit threshold" together
+// instead of treating every trade as its own unique reason.
+//
+// One known limitation, straight from the code: a broker-side bracket fill
+// (the stop-loss or take-profit leg executing on Alpaca's book, often
+// discovered after the fact rather than decided by the bot that cycle) is
+// always logged as "auto_exit (stop_loss_or_take_profit)" - the bot doesn't
+// currently record which of the two legs actually fired, so those two rules
+// share one bucket here rather than being split inaccurately.
+//
+// A second limitation: the momentum time-based exit and the mean-reversion
+// max-hold exit (_momentum_time_exit_reason / _reversion_exit_reason) emit
+// the exact same "max hold of N day(s) reached (...)" text, so they also
+// share one bucket - distinguishing them would need the trade's entry_path,
+// which isn't part of this text.
+export function exitReasonCategory(reason: string | null): string {
+  if (!reason) return "Unknown / not recorded";
+  let r = reason;
+  if (r.toLowerCase().startsWith("dry_run:")) {
+    r = r.slice(r.indexOf(":") + 1).trim();
+  }
+  const lower = r.toLowerCase();
+  if (lower.includes("auto_exit") && lower.includes("stop_loss_or_take_profit")) {
+    return "Stop-loss / take-profit (broker bracket)";
+  }
+  if (lower.includes("trailing stop")) return "Trailing stop";
+  if (lower.startsWith("max hold of")) return "Max hold time reached";
+  if (lower.startsWith("rsi(")) return "Mean-reversion RSI exit";
+  if (lower.startsWith("sentiment ")) return "Sentiment reversal";
+  if (lower === "manual_pause" || lower === "adopted_legacy_position") return "Other / manual";
+  // Unmapped text shows verbatim rather than silently disappearing into an
+  // "Other" bucket - if a new exit path is added to the bot and this
+  // function isn't updated to match, you'll see its raw reason string here
+  // instead of it vanishing from the table.
+  return r;
+}
+
 // ---- equity-curve-based metrics (Sharpe / drawdown) ----------------------
 // Mirrors dashboard/app/api/performance/route.ts's math exactly, so the two
 // pages never disagree about what "Sharpe ratio" or "max drawdown" means.

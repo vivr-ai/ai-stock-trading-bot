@@ -5,7 +5,8 @@ import LoadingSkeleton from "@/components/LoadingSkeleton";
 import ErrorState from "@/components/ErrorState";
 import { fmtMoney, fmtPct, fmtDateTime, toneFor } from "@/lib/format";
 import { nameFor } from "@/lib/symbolNames";
-import { Search, ArrowUp, ArrowDown, ArrowUpDown } from "lucide-react";
+import { exitReasonCategory } from "@/lib/strategyAnalytics";
+import { Search } from "lucide-react";
 
 type ClosedTrade = {
   id: number;
@@ -27,66 +28,34 @@ type TradesResponse = {
   hasEverRun: boolean;
 };
 
-type SortKey = "symbol" | "entry_time" | "ts" | "entry_price" | "exit_price" | "pnl" | "buy_reason" | "news_summary";
-type SortDir = "asc" | "desc";
-type SortState = { key: SortKey; dir: SortDir };
+type ReasonBucket = {
+  rule: string;
+  count: number;
+  winRatePct: number;
+  totalPnl: number;
+  avgPnl: number;
+};
 
-function sortValueFor(t: ClosedTrade, key: SortKey): string | number | null {
-  switch (key) {
-    case "symbol":
-      return t.symbol.toLowerCase();
-    case "entry_time":
-      return t.entry_time ? new Date(t.entry_time).getTime() : null;
-    case "ts":
-      return t.ts ? new Date(t.ts).getTime() : null;
-    case "entry_price":
-      return Number(t.entry_price);
-    case "exit_price":
-      return Number(t.exit_price);
-    case "pnl":
-      return Number(t.pnl);
-    case "buy_reason":
-      return t.buy_reason ? t.buy_reason.toLowerCase() : null;
-    case "news_summary":
-      return t.news_summary ? t.news_summary.toLowerCase() : null;
+function breakdownByExitReason(trades: ClosedTrade[]): ReasonBucket[] {
+  const groups = new Map<string, ClosedTrade[]>();
+  for (const t of trades) {
+    const key = exitReasonCategory(t.exit_reason);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(t);
   }
-}
-
-// Rows with no value for the active sort column always sink to the bottom.
-function compareSortValues(a: string | number | null, b: string | number | null, dir: SortDir) {
-  if (a == null && b == null) return 0;
-  if (a == null) return 1;
-  if (b == null) return -1;
-  const result =
-    typeof a === "string" && typeof b === "string" ? a.localeCompare(b) : (a as number) - (b as number);
-  return dir === "asc" ? result : -result;
-}
-
-function SortableHeader({
-  label,
-  sortKey,
-  sort,
-  onSort,
-}: {
-  label: string;
-  sortKey: SortKey;
-  sort: SortState | null;
-  onSort: (key: SortKey) => void;
-}) {
-  const active = sort?.key === sortKey;
-  const Icon = active ? (sort!.dir === "asc" ? ArrowUp : ArrowDown) : ArrowUpDown;
-  return (
-    <th className="px-4 py-3 font-medium">
-      <button
-        type="button"
-        onClick={() => onSort(sortKey)}
-        className={`flex items-center gap-1 whitespace-nowrap hover:text-white ${active ? "text-white" : ""}`}
-      >
-        {label}
-        <Icon size={12} className={active ? "opacity-90" : "opacity-40"} />
-      </button>
-    </th>
-  );
+  const out: ReasonBucket[] = [];
+  for (const [rule, rows] of groups.entries()) {
+    const wins = rows.filter((r) => Number(r.pnl) > 0).length;
+    const totalPnl = rows.reduce((a, r) => a + Number(r.pnl), 0);
+    out.push({
+      rule,
+      count: rows.length,
+      winRatePct: (wins / rows.length) * 100,
+      totalPnl,
+      avgPnl: totalPnl / rows.length,
+    });
+  }
+  return out.sort((a, b) => b.count - a.count);
 }
 
 export default function TradeHistoryPage() {
@@ -98,22 +67,6 @@ export default function TradeHistoryPage() {
   const [outcome, setOutcome] = useState<"all" | "win" | "loss">("all");
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
-  const [sort, setSort] = useState<SortState | null>(null);
-
-  function handleSort(key: SortKey) {
-    setSort((prev) => {
-      if (!prev || prev.key !== key) return { key, dir: "asc" };
-      return { key, dir: prev.dir === "asc" ? "desc" : "asc" };
-    });
-  }
-
-  const sortedTrades = useMemo(() => {
-    const trades = data?.trades ?? [];
-    if (!sort) return trades;
-    return [...trades].sort((a, b) =>
-      compareSortValues(sortValueFor(a, sort.key), sortValueFor(b, sort.key), sort.dir)
-    );
-  }, [data, sort]);
 
   const queryString = useMemo(() => {
     const params = new URLSearchParams();
@@ -143,6 +96,11 @@ export default function TradeHistoryPage() {
     return () => clearTimeout(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [queryString]);
+
+  // Which sell rule actually closed each trade, over whatever date range the
+  // filters above are set to - e.g. set "From" to when Strategy v2 shipped
+  // to see the breakdown for just that period.
+  const reasonBreakdown = useMemo(() => breakdownByExitReason(data?.trades ?? []), [data]);
 
   return (
     <div>
@@ -200,22 +158,64 @@ export default function TradeHistoryPage() {
       )}
 
       {!loading && !error && data && data.trades.length > 0 && (
+        <div className="mb-6 overflow-x-auto rounded-xl border border-bg-border bg-bg-panel">
+          <div className="border-b border-bg-border px-4 py-3">
+            <h2 className="text-sm font-semibold text-white">Exits by sell rule</h2>
+            <p className="text-xs text-muted">
+              Which rule actually closed each trade below, over the current filters.
+            </p>
+          </div>
+          <table className="w-full min-w-[640px] text-left text-sm">
+            <thead>
+              <tr className="border-b border-bg-border text-xs uppercase tracking-wide text-muted">
+                <th className="px-4 py-3 font-medium">Sell rule</th>
+                <th className="px-4 py-3 font-medium">Count</th>
+                <th className="px-4 py-3 font-medium">Win Rate</th>
+                <th className="px-4 py-3 font-medium">Total P/L</th>
+                <th className="px-4 py-3 font-medium">Avg P/L</th>
+              </tr>
+            </thead>
+            <tbody>
+              {reasonBreakdown.map((b) => {
+                const tone = toneFor(b.totalPnl);
+                return (
+                  <tr key={b.rule} className="border-b border-bg-border last:border-0">
+                    <td className="px-4 py-3 text-white">{b.rule}</td>
+                    <td className="px-4 py-3 tabular-nums">{b.count}</td>
+                    <td className="px-4 py-3 tabular-nums">{b.winRatePct.toFixed(0)}%</td>
+                    <td
+                      className={`px-4 py-3 tabular-nums ${
+                        tone === "gain" ? "text-gain" : tone === "loss" ? "text-loss" : ""
+                      }`}
+                    >
+                      {fmtMoney(b.totalPnl)}
+                    </td>
+                    <td className="px-4 py-3 tabular-nums text-muted">{fmtMoney(b.avgPnl)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {!loading && !error && data && data.trades.length > 0 && (
         <div className="overflow-x-auto rounded-xl border border-bg-border bg-bg-panel">
           <table className="w-full min-w-[1000px] text-left text-sm">
             <thead>
               <tr className="border-b border-bg-border text-xs uppercase tracking-wide text-muted">
-                <SortableHeader label="Symbol" sortKey="symbol" sort={sort} onSort={handleSort} />
-                <SortableHeader label="Buy Time" sortKey="entry_time" sort={sort} onSort={handleSort} />
-                <SortableHeader label="Sell Time" sortKey="ts" sort={sort} onSort={handleSort} />
-                <SortableHeader label="Entry" sortKey="entry_price" sort={sort} onSort={handleSort} />
-                <SortableHeader label="Exit" sortKey="exit_price" sort={sort} onSort={handleSort} />
-                <SortableHeader label="P/L" sortKey="pnl" sort={sort} onSort={handleSort} />
-                <SortableHeader label="AI Explanation" sortKey="buy_reason" sort={sort} onSort={handleSort} />
-                <SortableHeader label="News That Triggered It" sortKey="news_summary" sort={sort} onSort={handleSort} />
+                <th className="px-4 py-3 font-medium">Symbol</th>
+                <th className="px-4 py-3 font-medium">Buy Time</th>
+                <th className="px-4 py-3 font-medium">Sell Time</th>
+                <th className="px-4 py-3 font-medium">Entry</th>
+                <th className="px-4 py-3 font-medium">Exit</th>
+                <th className="px-4 py-3 font-medium">P/L</th>
+                <th className="px-4 py-3 font-medium">AI Explanation</th>
+                <th className="px-4 py-3 font-medium">News That Triggered It</th>
               </tr>
             </thead>
             <tbody>
-              {sortedTrades.map((t) => {
+              {data.trades.map((t) => {
                 const tone = toneFor(t.pnl);
                 return (
                   <tr key={t.id} className="border-b border-bg-border align-top last:border-0">
