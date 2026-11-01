@@ -1,15 +1,36 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import LoadingSkeleton from "@/components/LoadingSkeleton";
 import ErrorState from "@/components/ErrorState";
 import { timeAgo } from "@/lib/format";
-import { CheckCircle2, XCircle, Sparkles, BrainCircuit, Loader2, FlaskConical, Rocket, TriangleAlert } from "lucide-react";
+import {
+  CheckCircle2, XCircle, Sparkles, BrainCircuit, Loader2, FlaskConical, Rocket, TriangleAlert,
+  Search, ArrowRight,
+} from "lucide-react";
 
 const SOURCE_LABEL: Record<string, string> = {
   manual: "Manual",
   pattern_discovery: "Pattern Discovery",
   ai_research_assistant: "AI Research Assistant",
+};
+
+// Mirrors dashboard/lib/patternDiscovery.ts's FindingCategory labels - kept
+// here rather than imported since this is a client component and that file
+// is pure server-side analysis; the category string itself is the only
+// thing that needs to round-trip.
+const CATEGORY_LABEL: Record<string, string> = {
+  confidence_threshold: "Confidence Thresholds",
+  sector: "Sector Performance",
+  holding_period: "Holding Period",
+  symbol_underperformance: "Underperforming Symbols",
+  stop_loss: "Stop-Loss Exits",
+  take_profit: "Take-Profit Exits",
+  volatility: "Volatility / Market Regime",
+  position_sizing: "Position Sizing",
+  sentiment_reasoning: "Sentiment / AI Reasoning",
+  news_source: "News Source",
 };
 
 type BacktestMetrics = {
@@ -53,6 +74,8 @@ type Recommendation = {
   review_notes: string | null;
   backtest_result: BacktestResult | null;
   deployed_as_version: string | null;
+  source_category: string | null;
+  pattern_discovery_finding_id: number | null;
 };
 
 const BACKTEST_REC_STYLE: Record<string, string> = {
@@ -209,6 +232,11 @@ function RecCard({
           {rec.status}
         </span>
         <span className="text-xs text-muted">{SOURCE_LABEL[rec.source] ?? rec.source.replace(/_/g, " ")}</span>
+        {rec.source === "pattern_discovery" && rec.source_category && (
+          <span className="flex items-center gap-1 rounded-full bg-accent/10 px-2 py-0.5 text-xs font-medium text-accent">
+            <Search size={11} /> {CATEGORY_LABEL[rec.source_category] ?? rec.source_category.replace(/_/g, " ")}
+          </span>
+        )}
         <span className="text-xs text-muted">· {timeAgo(rec.created_at)}</span>
         {rec.deployed_as_version && (
           <span className="rounded-full bg-accent/15 px-2 py-0.5 text-xs text-accent">
@@ -217,6 +245,15 @@ function RecCard({
         )}
       </div>
       <h3 className="mb-2 text-sm font-semibold text-white">{rec.title}</h3>
+
+      {rec.source === "pattern_discovery" && rec.source_category && (
+        <Link
+          href={`/pattern-discovery?category=${rec.source_category}`}
+          className="mb-2 inline-flex items-center gap-1 text-xs font-medium text-accent hover:underline"
+        >
+          View the finding this came from in Pattern Discovery <ArrowRight size={12} />
+        </Link>
+      )}
 
       <button onClick={() => setExpanded((e) => !e)} className="mb-2 text-xs text-accent">
         {expanded ? "Hide details" : "Show details"}

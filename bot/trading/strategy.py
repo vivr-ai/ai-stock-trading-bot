@@ -723,7 +723,8 @@ class SentimentStrategy:
             news_summary=last_buy.get("rationale"), sector=last_buy.get("sector"),
             confidence_score=last_buy.get("sentiment_score"),
             confidence_label=last_buy.get("sentiment_label"),
-            market_regime=last_buy.get("market_regime"), strategy_version=None,
+            market_regime=last_buy.get("market_regime"),
+            strategy_version=last_buy.get("strategy_version"),
         )
         self.recorder.record_notification(
             type_="trade_executed", title=f"{symbol} position closed (reconstructed)",
@@ -731,6 +732,12 @@ class SentimentStrategy:
                      f"reconstructed from trade history because open-lot state was lost"),
             severity="info" if pnl >= 0 else "warning",
         )
+        # Open-lot state was lost, so the normal clear_* calls in _do_sell
+        # never ran for this round-trip - clean up both durable per-position
+        # tables here too, same as _do_sell does on the normal path.
+        if self.recorder is not None:
+            self.recorder.clear_position_peak(symbol)
+            self.recorder.clear_stagnation_checkpoint(symbol)
 
     @staticmethod
     def _classify_bracket_exit(
@@ -838,6 +845,13 @@ class SentimentStrategy:
             message=f"entry={lot['entry_price']:.2f} exit={exit_price:.2f} pnl={pnl:.2f}",
             severity="info" if pnl >= 0 else "warning",
         )
+        # Bracket (stop-loss/take-profit) fill closed this position without
+        # going through _do_sell, so its own clear_* calls never ran for this
+        # round-trip - same tidy-up, so a future re-entry's reset_* calls
+        # aren't just overwriting a now-stale row.
+        if self.recorder is not None:
+            self.recorder.clear_position_peak(symbol)
+            self.recorder.clear_stagnation_checkpoint(symbol)
 
     def _resolve_lot(self, symbol: str) -> Optional[dict]:
         """The open-lot record for a held symbol, with a durable fallback -
@@ -862,6 +876,7 @@ class SentimentStrategy:
         return {
             "entry_path": last_buy.get("entry_path"),
             "entry_time": buy_ts.timestamp() if isinstance(buy_ts, datetime) else None,
+            "strategy_version": last_buy.get("strategy_version"),
         }
 
     def _process_symbol(self, symbol, acct, exposure, open_positions, pending,
@@ -951,7 +966,7 @@ class SentimentStrategy:
             # A position that's neither a clear winner nor a clear loser
             # shouldn't just sit forever occupying a position and sector
             # slot - see _momentum_time_exit_reason.
-            time_exit_reason = self._momentum_time_exit_reason(lot)
+            time_exit_reason = self._momentum_time_exit_reason(symbol, lot)
             if time_exit_reason and self._do_sell(symbol, sentiment, reason=time_exit_reason,
                                                    entry_path="sentiment_momentum"):
                 self.state.mark_exit(symbol)
@@ -1264,28 +1279,107 @@ class SentimentStrategy:
                     f"(severe, only {sentiment.article_count} headline(s))")
         return f"sentiment {sentiment.score:.1f} < {cfg.sell_threshold}"
 
-    def _momentum_time_exit_reason(self, lot) -> Optional[str]:
+    def _momentum_time_exit_reason(self, symbol: str, lot) -> Optional[str]:
         """Strategy v3 time-based backstop for a sentiment-momentum
-        position: mirrors _reversion_exit_reason's max-hold check above, for
-        the entry path that didn't have one. A position that never hits its
-        stop-loss, take-profit/trailing-stop, or the sentiment exit would
-        otherwise sit indefinitely, occupying a position slot and a sector
-        slot that a stronger signal elsewhere could be using.
+        position, gated by a "stagnation checkpoint" rather than firing on a
+        flat day-count: mirrors _reversion_exit_reason's max-hold check
+        above, for the entry path that didn't have one - but a position
+        that is still genuinely moving shouldn't be force-closed just
+        because a calendar window elapsed.
+
+        The checkpoint (position_stagnation_checkpoints, via Recorder)
+        marks the last point price was judged to have "moved" from; every
+        cycle we ratchet the high/low seen since that checkpoint
+        (update_stagnation_range), and once momentum_max_hold_days have
+        elapsed since the checkpoint was set, we check whether price ever
+        strayed more than momentum_stagnation_pct away from the checkpoint
+        price at any point in that window. If it did, the position was
+        never really stagnant - the checkpoint resets to the current
+        price/time (reset_stagnation_checkpoint) and the window starts
+        over. If it didn't, this is exactly the "going nowhere" case the
+        old flat time-exit was meant to catch, so we exit.
+
+        Independent of all that, momentum_hard_cap_days (measured from the
+        position's original entry_time, never reset) is an unconditional
+        outer bound: a stock will almost always exit via some other rule
+        long before this, so it exists only to guarantee a position can't
+        theoretically oscillate - genuinely moving, but always moving back
+        before a window closes - forever.
 
         `lot` may be None (open-lot state lost, and no durable entry_time
         recoverable either - see _process_symbol) - fails open, no exit
         signal, the same fail-open convention as every other rule in this
-        file. momentum_max_hold_days=0 disables this check entirely."""
+        file. momentum_max_hold_days=0 disables the whole feature, same as
+        before. If the stagnation checkpoint can't be read at all (DB
+        down), falls back to the pre-stagnation behavior: a flat exit after
+        momentum_max_hold_days, so a DB outage degrades to the simpler old
+        safety net rather than silently holding the position ungated."""
         cfg = self.cfg.strategy
         if not cfg.momentum_max_hold_days:
             return None
         entry_time = (lot or {}).get("entry_time")
         if not entry_time:
             return None
-        held_days = (time.time() - entry_time) / 86400.0
-        if held_days >= cfg.momentum_max_hold_days:
-            return f"max hold of {cfg.momentum_max_hold_days} day(s) reached ({held_days:.1f}d)"
-        return None
+        held_total_days = (time.time() - entry_time) / 86400.0
+
+        # Unconditional outer bound - checked first and independent of the
+        # stagnation checkpoint entirely, so it still works even if that
+        # table/DB is unavailable.
+        if cfg.momentum_hard_cap_days and held_total_days >= cfg.momentum_hard_cap_days:
+            return (f"hard cap of {cfg.momentum_hard_cap_days} day(s) since entry reached "
+                    f"({held_total_days:.1f}d) regardless of movement")
+
+        if self.recorder is None:
+            if held_total_days >= cfg.momentum_max_hold_days:
+                return f"max hold of {cfg.momentum_max_hold_days} day(s) reached ({held_total_days:.1f}d)"
+            return None
+
+        price = self.broker.latest_price(symbol)
+        if price is None:
+            # Can't ratchet the range or judge movement without a live
+            # price this cycle - fail open and retry next cycle, same as
+            # every other price-dependent rule in this file.
+            return None
+
+        # Ratchet the running high/low unconditionally - this also
+        # lazy-creates the checkpoint row (anchored at this price/now) the
+        # first time a position reaches this point, so a position opened
+        # before this feature existed still gets a checkpoint instead of
+        # never being evaluated.
+        self.recorder.update_stagnation_range(symbol, price)
+        checkpoint = self.recorder.get_stagnation_checkpoint(symbol)
+        checkpoint_ts = None
+        if checkpoint is not None:
+            checkpoint_time = checkpoint.get("checkpoint_time")
+            checkpoint_ts = checkpoint_time.timestamp() if isinstance(checkpoint_time, datetime) else None
+        if checkpoint is None or checkpoint_ts is None or not checkpoint.get("checkpoint_price"):
+            # DB unreadable (or garbled) even after the lazy-init attempt
+            # above - fall back to the old flat time-exit rather than
+            # holding forever ungated short of the hard cap.
+            if held_total_days >= cfg.momentum_max_hold_days:
+                return f"max hold of {cfg.momentum_max_hold_days} day(s) reached ({held_total_days:.1f}d)"
+            return None
+
+        held_since_checkpoint_days = (time.time() - checkpoint_ts) / 86400.0
+        if held_since_checkpoint_days < cfg.momentum_max_hold_days:
+            # Window hasn't closed yet - range is ratcheted above, nothing
+            # to decide this cycle.
+            return None
+
+        checkpoint_price = checkpoint["checkpoint_price"]
+        high = checkpoint["high_since_checkpoint"]
+        low = checkpoint["low_since_checkpoint"]
+        move_pct = max(abs(high - checkpoint_price), abs(checkpoint_price - low)) / checkpoint_price * 100.0
+
+        if move_pct > cfg.momentum_stagnation_pct:
+            # Genuinely moved at some point in this window - not stagnant.
+            # Reset-and-extend: the checkpoint restarts from here, so the
+            # next evaluation is momentum_max_hold_days further out.
+            self.recorder.reset_stagnation_checkpoint(symbol, price)
+            return None
+
+        return (f"stagnant for {held_since_checkpoint_days:.1f}d - moved only {move_pct:.1f}% "
+                f"since checkpoint, under the {cfg.momentum_stagnation_pct}% threshold")
 
     def _maybe_resolve_shadow_position(self, symbol: str) -> None:
         """Strategy v2, Path B, shadow mode: if a hypothetical reversion
@@ -1550,7 +1644,7 @@ class SentimentStrategy:
                 sentiment=sentiment, stop_price=plan.stop_price, take_profit=plan.take_profit_price,
                 reason=tagged_reason, rationale=sentiment.rationale, dry_run=True, order_id="",
                 status="dry_run", sector=sector_of(symbol), market_regime=market_regime,
-                entry_path=entry_path,
+                entry_path=entry_path, strategy_version=self.version_provider.current_version(),
             )
             self.recorder.record_decision(
                 symbol=symbol, decision="buy", reason=tagged_reason, sentiment_score=sentiment.score,
@@ -1595,6 +1689,7 @@ class SentimentStrategy:
                 reason=tagged_reason, rationale=sentiment.rationale, dry_run=False,
                 order_id=order.order_id, status=order.status,
                 sector=sector_of(symbol), market_regime=market_regime, entry_path=entry_path,
+                strategy_version=self.version_provider.current_version(),
             )
             self.recorder.record_decision(
                 symbol=symbol, decision="buy", reason=tagged_reason, sentiment_score=sentiment.score,
@@ -1626,6 +1721,11 @@ class SentimentStrategy:
         # risk.trailing_stop_enabled is off - _maybe_trailing_stop_exit
         # never reads this table in that case.
         self.recorder.reset_position_peak(symbol, plan.price)
+        # Same hard-reset logic, for the momentum-exit stagnation gate's
+        # checkpoint (see _momentum_time_exit_reason): a fresh entry must
+        # start its own clean checkpoint, never inherit a stale one left
+        # over from this symbol's prior holding period.
+        self.recorder.reset_stagnation_checkpoint(symbol, plan.price)
 
         open_positions[symbol] = plan.qty
         sector_counts[sector_of(symbol)] += 1
@@ -1690,6 +1790,7 @@ class SentimentStrategy:
             # would also fix this, but clearing here matches open_positions'
             # own delete-on-close housekeeping).
             self.recorder.clear_position_peak(symbol)
+            self.recorder.clear_stagnation_checkpoint(symbol)
             return True
 
         # Skip ONLY a position that _adopt_legacy_positions gave a brand-new
@@ -1748,6 +1849,7 @@ class SentimentStrategy:
         # Real close submitted - drop this symbol's trailing-stop peak (see
         # the dry-run branch above for why).
         self.recorder.clear_position_peak(symbol)
+        self.recorder.clear_stagnation_checkpoint(symbol)
 
         if self.closed_trade_logger is not None:
             exit_price = order.filled_avg_price or self.broker.latest_price(symbol)

@@ -112,7 +112,10 @@ CREATE TABLE IF NOT EXISTS trades (
     status              TEXT,
     sector              TEXT,        -- from bot/universe/static_universe.sector_of(), for Strategy Intelligence breakdowns
     market_regime       TEXT,        -- 'bull' | 'bear' | 'sideways' | 'high_volatility' | 'low_volatility', see strategy.py
-    entry_path          TEXT         -- 'sentiment_momentum' | 'mean_reversion' (Strategy v2) - which leg generated this trade
+    entry_path          TEXT,        -- 'sentiment_momentum' | 'mean_reversion' (Strategy v2) - which leg generated this trade
+    strategy_version    TEXT         -- which strategy_versions row was active at BUY time - the durable source
+                                      -- _resolve_lot/_log_closed_trade_from_history fall back to when bot/state.py's
+                                      -- local JSON (ephemeral - wiped on every Railway redeploy) is lost
 );
 CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades (ts DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades (symbol);
@@ -124,6 +127,10 @@ ALTER TABLE trades ADD COLUMN IF NOT EXISTS market_regime TEXT;
 
 -- Added by the Strategy v2 (weighted composite + mean-reversion leg) phase.
 ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry_path TEXT;
+
+-- Added so strategy_version survives a Railway redeploy wiping bot/state.py's
+-- local JSON - see trades.strategy_version above.
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy_version TEXT;
 
 -- ---------------------------------------------------------------------
 -- closed_trades: one row per completed round-trip (mirrors closed_trades.csv)
@@ -217,6 +224,35 @@ CREATE TABLE IF NOT EXISTS position_peaks (
 );
 
 -- ---------------------------------------------------------------------
+-- position_stagnation_checkpoints: the "has this position actually moved"
+-- gate on the momentum time-based exit (strategy.momentum_stagnation_pct -
+-- see SentimentStrategy._momentum_time_exit_reason). A checkpoint starts at
+-- entry (set in _do_buy, same lifecycle as position_peaks above) and is
+-- reset to the current price/time whenever a momentum_max_hold_days window
+-- closes with the price having moved more than momentum_stagnation_pct away
+-- from checkpoint_price at some point - a position that's doing something
+-- gets a fresh window instead of being force-closed on the calendar alone.
+-- high/low are tracked from the checkpoint, NOT from the original entry -
+-- resetting them alongside checkpoint_price/checkpoint_time at each window
+-- close is what makes a position that goes quiet again able to qualify as
+-- "stagnant" in a later window even after an earlier one saw real movement.
+-- Its own table rather than a column on position_peaks, same reasoning as
+-- that table's own docstring: open_positions is resynced every cycle before
+-- this is read, and position_peaks' own peak is anchored to true entry
+-- forever for a different purpose (trailing-stop pullback), which this must
+-- NOT inherit. Reset at buy time, removed at sell time, same as
+-- position_peaks.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS position_stagnation_checkpoints (
+    symbol                 TEXT PRIMARY KEY,
+    checkpoint_price       NUMERIC NOT NULL,
+    checkpoint_time        TIMESTAMPTZ NOT NULL,
+    high_since_checkpoint  NUMERIC NOT NULL,
+    low_since_checkpoint   NUMERIC NOT NULL,
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ---------------------------------------------------------------------
 -- notifications: alert history for the Notifications Centre.
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS notifications (
@@ -292,9 +328,11 @@ ON CONFLICT (version) DO NOTHING;
 
 -- ---------------------------------------------------------------------
 -- strategy_recommendations: the Approval Workflow. Pattern Discovery
--- (Phase 3) and the AI Research Assistant (Phase 4) INSERT rows here -
--- they never touch trading behaviour directly. A human (you, from the
--- dashboard) reviews each one and sets status to 'approved' or 'rejected'.
+-- (via the auto-draft bridge in app/api/pattern-discovery/route.ts -
+-- maybeCreateRecommendationsFromFindings) and the AI Research Assistant
+-- INSERT rows here - they never touch trading behaviour directly. A human
+-- (you, from the dashboard) still reviews each one and sets status to
+-- 'approved' or 'rejected' - the bridge only drafts, it never approves.
 -- Only an 'approved' recommendation can be turned into a new
 -- strategy_versions row (via "Deploy as new version" on the dashboard) -
 -- approval alone never changes what the bot does; creating the version
@@ -319,10 +357,18 @@ CREATE TABLE IF NOT EXISTS strategy_recommendations (
     reviewed_by             TEXT,
     review_notes            TEXT,
     backtest_result         JSONB,       -- populated by Phase 6 (Backtesting & Simulation), null until then
-    deployed_as_version     TEXT         -- set once an approved recommendation becomes a strategy_versions row
+    deployed_as_version     TEXT,        -- set once an approved recommendation becomes a strategy_versions row
+    source_category         TEXT         -- the FindingCategory this was drafted from (source='pattern_discovery' only)
+                                          -- - shown on the Recommendations card so multiple auto-drafted
+                                          -- recommendations never get confused with each other.
+                                          -- pattern_discovery_finding_id (the specific finding row this was drafted
+                                          -- from) is added below, via ALTER, once pattern_discovery_findings exists -
+                                          -- it can't be a column here since that table isn't created yet at this
+                                          -- point in the script.
 );
 CREATE INDEX IF NOT EXISTS idx_strategy_recommendations_status ON strategy_recommendations (status);
 CREATE INDEX IF NOT EXISTS idx_strategy_recommendations_created ON strategy_recommendations (created_at DESC);
+ALTER TABLE strategy_recommendations ADD COLUMN IF NOT EXISTS source_category TEXT;
 
 -- ---------------------------------------------------------------------
 -- pattern_discovery_findings: one row per statistical finding, per analysis
@@ -357,6 +403,14 @@ CREATE TABLE IF NOT EXISTS pattern_discovery_findings (
 );
 CREATE INDEX IF NOT EXISTS idx_pattern_findings_run ON pattern_discovery_findings (run_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pattern_findings_category ON pattern_discovery_findings (category);
+
+-- The Recommendations <-> Pattern Discovery auto-draft bridge's back-link
+-- (see strategy_recommendations.source_category above) - added here, after
+-- this table, rather than as an inline column on strategy_recommendations'
+-- own CREATE TABLE, since that statement runs earlier in this script and
+-- this table wouldn't exist yet on a fresh database.
+ALTER TABLE strategy_recommendations ADD COLUMN IF NOT EXISTS pattern_discovery_finding_id BIGINT
+    REFERENCES pattern_discovery_findings(id);
 
 -- ---------------------------------------------------------------------
 -- strategy_health_scores: one row per computation of the Phase 5 Strategy

@@ -45,7 +45,6 @@ import {
   Search,
   Gauge,
   FileClock,
-  FlaskConical,
   type LucideIcon,
 } from "lucide-react";
 
@@ -112,7 +111,6 @@ export const NAV_SECTIONS: NavSection[] = [
         pages: [
           { href: "/strategy", label: "Current Strategy", icon: BookOpen, description: "The rules currently trading" },
           { href: "/decisions", label: "AI Decisions", icon: Bot, description: "Every scan/buy/sell/skip this cycle" },
-          { href: "/shadow-comparison", label: "Shadow vs Live", icon: FlaskConical, description: "Path B's simulated signals vs what actually traded" },
         ],
       },
       {

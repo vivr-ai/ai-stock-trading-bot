@@ -1,8 +1,7 @@
-import Link from "next/link";
 import Term from "@/components/Term";
 import ExampleCard from "@/components/ExampleCard";
 import StrategyFlowDiagram from "@/components/StrategyFlowDiagram";
-import { ShieldCheck, Layers, Ban, FlaskConical, ArrowRight, TrendingUp, TrendingDown } from "lucide-react";
+import { ShieldCheck, Layers, Ban, TrendingUp, TrendingDown } from "lucide-react";
 import type { ReactNode } from "react";
 
 export const metadata = {
@@ -79,6 +78,12 @@ export default function StrategyPage() {
           <span className="text-loss">selling</span> — deciding whether to close one it already holds. They run on
           different rules, shown separately below.
         </p>
+        <p>
+          The bot currently trades a single entry signal — news-driven momentum, below. An earlier technical
+          mean-reversion signal (&quot;Path B&quot;) ran in shadow mode (logged only, never traded) for several
+          weeks; it didn&apos;t show enough edge over the live strategy to justify running it for real, so it has
+          been retired rather than kept around to track separately.
+        </p>
       </Section>
 
       <Section title="How one trade flows, end to end">
@@ -89,9 +94,9 @@ export default function StrategyPage() {
         tone="gain"
         icon={<TrendingUp size={18} />}
         title="Buying — when a position opens"
-        subtitle="Two independent signals look for an opportunity. Every real buy still has to clear the limits below it."
+        subtitle="One signal looks for an opportunity. Every real buy still has to clear the limits below it."
       >
-        <Rule title="Path A — news-driven momentum (the only path currently trading for real)">
+        <Rule title="News-driven momentum">
           Three things each earn partial credit toward one score out of 1.0: how positive the{" "}
           <Term definition="A number from -10 to +10 summarizing how positive or negative the recent news coverage is for a stock.">
             sentiment
@@ -108,28 +113,8 @@ export default function StrategyPage() {
           </Term>
           .
         </Rule>
-        <Rule title="Path B — technical mean-reversion">
-          <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-amber-400">
-            <FlaskConical size={13} /> Shadow mode — logged only, no order is placed
-          </div>
-          A different idea: instead of reacting to news, it looks for a stock that&apos;s healthy long-term but has
-          dropped sharply short-term (an oversold-bounce setup). All four must hold: above its 200-day average,{" "}
-          <Term definition="Relative Strength Index over a 2-day window: a 0-100 reading of how fast and far a stock has fallen short-term. Below 10 is an extreme, short-lived oversold reading.">
-            2-day RSI
-          </Term>{" "}
-          at 10 or below, volume at least 1.3x normal, and sentiment no worse than -5. It would exit on its own
-          rule too — RSI back above 65, or 5 days without reverting.
-          <div className="mt-2">
-            <Link
-              href="/shadow-comparison"
-              className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-400 hover:text-amber-300"
-            >
-              Compare Path B&apos;s shadow signals to what actually traded <ArrowRight size={12} />
-            </Link>
-          </div>
-        </Rule>
-        <Rule title="What can still block a buy, on either path">
-          The market itself down sharply or below its 50-day average (both paths pause), the portfolio already
+        <Rule title="What can still block a buy">
+          The market itself down sharply or below its 50-day average, the portfolio already
           down 4% today, the stock sold within the last 24 hours (
           <Term definition="A waiting period after selling a stock before the bot will consider buying it again, to avoid rapidly flip-flopping on noisy news.">
             cooldown
@@ -175,17 +160,19 @@ export default function StrategyPage() {
           : a distant 50% backstop, arming once the position is up 3%, then selling the moment price falls 7% from
           its <Term definition="The highest price a position has reached since it was bought.">peak</Term>.
         </Rule>
-        <Rule title="Sentiment reversal (Path A positions)">
+        <Rule title="Sentiment reversal">
           Independent of price: a moderate negative reading (-5 or worse) sells early, but only with 3+ headlines
           behind it. A <span className="text-loss">severe</span> reading (-8 or worse) is trusted with just 1
           headline — waiting for more confirmation on an already-unambiguous story just rides the loss longer.
           Moderate-but-thin readings get no software action; the stop-loss/take-profit bracket manages it instead.
         </Rule>
-        <Rule title="Time-based exit">
-          A position that hasn&apos;t hit any rule above closes anyway after{" "}
-          <span className="text-white">10 trading days</span> (Path A) or{" "}
-          <span className="text-white">5 days</span> (Path B, if it goes live) — freeing the position and sector
-          slot from a trade that&apos;s going nowhere.
+        <Rule title="Time-based exit (stagnation checkpoint)">
+          A position that hasn&apos;t hit any rule above is checked after{" "}
+          <span className="text-white">10 trading days</span>: if price hasn&apos;t moved more than{" "}
+          <span className="text-white">4%</span> away from its checkpoint at any point in that window, it&apos;s
+          closed as going nowhere. If it has moved, the checkpoint resets and the position gets another window
+          rather than being force-closed on the calendar alone. Either way, a position closes unconditionally
+          after <span className="text-white">30 days</span> regardless of movement, as a hard outer backstop.
         </Rule>
         <div className="grid gap-3 md:grid-cols-2">
           <ExampleCard type="sell" title="Sentiment sours, sells early">
@@ -203,10 +190,10 @@ export default function StrategyPage() {
             runs to a $140 peak, then slips to $130 (a 7% pullback) — sold there for a 30% gain, well past what
             the old flat +20% would have banked.
           </ExampleCard>
-          <ExampleCard type="sell" title="Going nowhere gets closed on day 10">
-            Bought at $50, then drifts $48-$52 for 10 trading days — never sours enough to trigger the sentiment
-            exit, never near the stop-loss or take-profit. Closed at roughly breakeven, freeing the slot rather
-            than sitting there indefinitely.
+          <ExampleCard type="sell" title="Going nowhere gets closed at the checkpoint">
+            Bought at $50, then drifts $48.50-$51 for 10 trading days — never sours enough to trigger the
+            sentiment exit, never near the stop-loss or take-profit, and never strays more than 4% from the $50
+            checkpoint. Closed at roughly breakeven, freeing the slot rather than sitting there indefinitely.
           </ExampleCard>
         </div>
       </Side>

@@ -236,19 +236,21 @@ class Recorder:
                       sentiment, stop_price: float, take_profit: float, reason: str, rationale: str,
                       dry_run: bool, order_id: str, status: str,
                       sector: Optional[str] = None, market_regime: Optional[str] = None,
-                      entry_path: Optional[str] = None) -> None:
+                      entry_path: Optional[str] = None,
+                      strategy_version: Optional[str] = None) -> None:
         self._execute(
             """
             INSERT INTO trades
                 (action, symbol, qty, price, notional, stop_price, take_profit,
                  sentiment_score, sentiment_label, headline_count, positive_headlines,
                  negative_headlines, reason, rationale, dry_run, order_id, status,
-                 sector, market_regime, entry_path)
+                 sector, market_regime, entry_path, strategy_version)
             VALUES
                 (%(action)s, %(symbol)s, %(qty)s, %(price)s, %(notional)s, %(stop_price)s,
                  %(take_profit)s, %(sentiment_score)s, %(sentiment_label)s, %(headline_count)s,
                  %(positive_headlines)s, %(negative_headlines)s, %(reason)s, %(rationale)s,
-                 %(dry_run)s, %(order_id)s, %(status)s, %(sector)s, %(market_regime)s, %(entry_path)s)
+                 %(dry_run)s, %(order_id)s, %(status)s, %(sector)s, %(market_regime)s, %(entry_path)s,
+                 %(strategy_version)s)
             """,
             dict(action=action, symbol=symbol, qty=qty, price=price, notional=notional,
                  stop_price=stop_price, take_profit=take_profit,
@@ -258,7 +260,8 @@ class Recorder:
                  positive_headlines=getattr(sentiment, "positive_count", None),
                  negative_headlines=getattr(sentiment, "negative_count", None),
                  reason=reason, rationale=rationale, dry_run=dry_run, order_id=order_id,
-                 status=status, sector=sector, market_regime=market_regime, entry_path=entry_path),
+                 status=status, sector=sector, market_regime=market_regime, entry_path=entry_path,
+                 strategy_version=strategy_version),
         )
 
     def record_closed_trade(self, *, symbol: str, qty: float, entry_price: float, exit_price: float,
@@ -518,7 +521,7 @@ class Recorder:
                         """
                         SELECT ts, qty, price, stop_price, take_profit, reason, rationale,
                                sector, market_regime, sentiment_score, sentiment_label,
-                               entry_path
+                               entry_path, strategy_version
                         FROM trades
                         WHERE symbol = %(symbol)s AND action = 'buy'
                         ORDER BY ts DESC LIMIT 1
@@ -824,6 +827,161 @@ class Recorder:
                     cur.execute("DELETE FROM position_peaks WHERE symbol = %(symbol)s", dict(symbol=symbol))
         except Exception as exc:  # noqa: BLE001
             logger.warning("Dashboard DB peak clear failed for %s: %s", symbol, exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def get_stagnation_checkpoint(self, symbol: str) -> Optional[dict]:
+        """Durable state for the momentum-exit stagnation gate (see
+        SentimentStrategy._momentum_time_exit_reason). The checkpoint
+        price/time mark the last point from which "has this genuinely
+        moved" is measured; high/low_since_checkpoint are a running
+        range ratcheted every cycle so the gate can tell, at window
+        close, whether price ever strayed far enough to count as
+        movement. None if never recorded (brand-new position, or a DB
+        problem) - the caller falls back to the old entry_time-based
+        behavior in that case, never treating it as an error."""
+        if not self.enabled:
+            return None
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB connect failed (stagnation lookup skipped for %s): %s", symbol, exc)
+            return None
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT checkpoint_price, checkpoint_time, high_since_checkpoint, low_since_checkpoint
+                        FROM position_stagnation_checkpoints WHERE symbol = %(symbol)s
+                        """,
+                        dict(symbol=symbol),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        return None
+                    return {
+                        "checkpoint_price": float(row[0]),
+                        "checkpoint_time": row[1],
+                        "high_since_checkpoint": float(row[2]),
+                        "low_since_checkpoint": float(row[3]),
+                    }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB stagnation lookup failed for %s: %s", symbol, exc)
+            return None
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def update_stagnation_range(self, symbol: str, price: float) -> None:
+        """Ratchet the running high/low since the current checkpoint -
+        never touches checkpoint_price/checkpoint_time. Called every
+        cycle with the live price so the window-close check can see
+        the full range reached, not just the price at that instant. If
+        no row exists yet (checkpoint never explicitly reset for this
+        symbol), lazy-inits one anchored at this price/now rather than
+        failing - a harmless fallback, since the normal path always
+        reset_stagnation_checkpoint's at buy time anyway. Best-effort:
+        a failure here just means the next cycle retries the same
+        ratchet, never something that should interrupt a trading
+        decision."""
+        if not self.enabled:
+            return
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB connect failed (stagnation range update dropped for %s): %s", symbol, exc)
+            return
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO position_stagnation_checkpoints
+                            (symbol, checkpoint_price, checkpoint_time, high_since_checkpoint, low_since_checkpoint, updated_at)
+                        VALUES (%(symbol)s, %(price)s, now(), %(price)s, %(price)s, now())
+                        ON CONFLICT (symbol) DO UPDATE SET
+                            high_since_checkpoint = GREATEST(position_stagnation_checkpoints.high_since_checkpoint, EXCLUDED.high_since_checkpoint),
+                            low_since_checkpoint = LEAST(position_stagnation_checkpoints.low_since_checkpoint, EXCLUDED.low_since_checkpoint),
+                            updated_at = now()
+                        """,
+                        dict(symbol=symbol, price=price),
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB stagnation range update failed for %s: %s", symbol, exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def reset_stagnation_checkpoint(self, symbol: str, price: float) -> None:
+        """Hard-overwrite the checkpoint price/time and both high/low to
+        `price`/now - used at buy time (so a fresh position starts its
+        own clean checkpoint, never inheriting a stale one from this
+        symbol's prior holding period) and again whenever the stagnation
+        gate itself decides price has genuinely moved since the last
+        checkpoint (the window resets and extends from here). Best-effort,
+        same posture as every other write here: a failure just means the
+        next cycle's update_stagnation_range lazy-inits a row instead."""
+        if not self.enabled:
+            return
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB connect failed (stagnation reset dropped for %s): %s", symbol, exc)
+            return
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO position_stagnation_checkpoints
+                            (symbol, checkpoint_price, checkpoint_time, high_since_checkpoint, low_since_checkpoint, updated_at)
+                        VALUES (%(symbol)s, %(price)s, now(), %(price)s, %(price)s, now())
+                        ON CONFLICT (symbol) DO UPDATE SET
+                            checkpoint_price = EXCLUDED.checkpoint_price,
+                            checkpoint_time = EXCLUDED.checkpoint_time,
+                            high_since_checkpoint = EXCLUDED.high_since_checkpoint,
+                            low_since_checkpoint = EXCLUDED.low_since_checkpoint,
+                            updated_at = now()
+                        """,
+                        dict(symbol=symbol, price=price),
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB stagnation reset failed for %s: %s", symbol, exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def clear_stagnation_checkpoint(self, symbol: str) -> None:
+        """Remove the stored checkpoint once a position closes - tidy-up,
+        not strictly required for correctness (reset_stagnation_checkpoint
+        at the next buy would fix a stale row anyway), but keeps this
+        table free of rows for positions that no longer exist, same
+        housekeeping as clear_position_peak."""
+        if not self.enabled:
+            return
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB connect failed (stagnation clear dropped for %s): %s", symbol, exc)
+            return
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM position_stagnation_checkpoints WHERE symbol = %(symbol)s", dict(symbol=symbol)
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dashboard DB stagnation clear failed for %s: %s", symbol, exc)
         finally:
             try:
                 conn.close()

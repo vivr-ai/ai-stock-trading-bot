@@ -95,6 +95,21 @@ class StrategyConfig:
     # regardless, so it doesn't sit indefinitely occupying a position/sector
     # slot. 0 disables it. Mirrors reversion_max_hold_days below.
     momentum_max_hold_days: int
+    # Gates the above: once momentum_max_hold_days have passed since the
+    # position's last "checkpoint" (reset at entry, and again whenever this
+    # gate itself finds genuine movement), only exit if price never moved
+    # more than this % away from the checkpoint price at any point in that
+    # window - a position that's actually doing something gets a fresh
+    # window instead of being force-closed on the calendar alone. 0 means
+    # exit at momentum_max_hold_days.
+    momentum_stagnation_pct: float
+    # Unconditional outer bound, independent of the stagnation gate above:
+    # even a position that keeps "genuinely moving" just enough to dodge the
+    # stagnation check every window still can't theoretically occupy a slot
+    # forever. Only matters when momentum_stagnation_pct > 0 - behaves the
+    # same as momentum_max_hold_days when it's 0. Measured from original
+    # entry, not the checkpoint. 0 disables it.
+    momentum_hard_cap_days: int
     max_intraday_runup_pct: float
     market_filter_symbol: str
     market_filter_max_drop_pct: float
@@ -319,6 +334,12 @@ def load_config(path: str = "config.ini") -> Config:
             ),
             momentum_max_hold_days=_get(
                 parser, "strategy", "momentum_max_hold_days", "STRATEGY_MOMENTUM_MAX_HOLD_DAYS", 10, int
+            ),
+            momentum_stagnation_pct=_get(
+                parser, "strategy", "momentum_stagnation_pct", "STRATEGY_MOMENTUM_STAGNATION_PCT", 4.0, float
+            ),
+            momentum_hard_cap_days=_get(
+                parser, "strategy", "momentum_hard_cap_days", "STRATEGY_MOMENTUM_HARD_CAP_DAYS", 30, int
             ),
             max_intraday_runup_pct=_get(
                 parser, "strategy", "max_intraday_runup_pct", "STRATEGY_MAX_INTRADAY_RUNUP_PCT", 8.0, float
@@ -581,6 +602,21 @@ def _validate(cfg: Config) -> None:
         raise ValueError(
             "strategy.momentum_max_hold_days / STRATEGY_MOMENTUM_MAX_HOLD_DAYS must be >= 0 "
             "(0 disables the time-based exit)."
+        )
+    if cfg.strategy.momentum_stagnation_pct < 0:
+        raise ValueError(
+            "strategy.momentum_stagnation_pct / STRATEGY_MOMENTUM_STAGNATION_PCT must be >= 0 "
+            "(0 means exit unconditionally at momentum_max_hold_days)."
+        )
+    if cfg.strategy.momentum_hard_cap_days < 0:
+        raise ValueError(
+            "strategy.momentum_hard_cap_days / STRATEGY_MOMENTUM_HARD_CAP_DAYS must be >= 0."
+        )
+    if (cfg.strategy.momentum_hard_cap_days and cfg.strategy.momentum_max_hold_days
+            and cfg.strategy.momentum_hard_cap_days < cfg.strategy.momentum_max_hold_days):
+        raise ValueError(
+            "strategy.momentum_hard_cap_days / STRATEGY_MOMENTUM_HARD_CAP_DAYS must be >= "
+            "momentum_max_hold_days - it's the outer backstop, not a shorter cutoff."
         )
 
     # ---- Strategy v2: Path A weighted composite -------------------------

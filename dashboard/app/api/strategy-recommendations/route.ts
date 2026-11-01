@@ -24,6 +24,8 @@ export type RecommendationRow = {
   review_notes: string | null;
   backtest_result: Record<string, unknown> | null;
   deployed_as_version: string | null;
+  source_category: string | null;
+  pattern_discovery_finding_id: number | null;
 };
 
 // GET: every recommendation, newest first. Pattern Discovery (Phase 3) and
@@ -40,7 +42,8 @@ export async function GET() {
     const rows = await query<RecommendationRow>(
       `SELECT id, created_at, source, title, observation, evidence, statistical_confidence,
               estimated_impact, risks, recommendation, priority, proposed_config_changes,
-              status, reviewed_at, reviewed_by, review_notes, backtest_result, deployed_as_version
+              status, reviewed_at, reviewed_by, review_notes, backtest_result, deployed_as_version,
+              source_category, pattern_discovery_finding_id
        FROM strategy_recommendations ORDER BY created_at DESC LIMIT 500`
     );
     return NextResponse.json({ recommendations: rows });

@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import LoadingSkeleton from "@/components/LoadingSkeleton";
 import ErrorState from "@/components/ErrorState";
 import { timeAgo } from "@/lib/format";
@@ -12,6 +13,12 @@ type FindingCategory =
   | "confidence_threshold" | "sector" | "holding_period" | "symbol_underperformance"
   | "stop_loss" | "take_profit" | "volatility" | "position_sizing"
   | "sentiment_reasoning" | "news_source";
+
+const VALID_CATEGORIES: FindingCategory[] = [
+  "confidence_threshold", "sector", "holding_period", "symbol_underperformance",
+  "stop_loss", "take_profit", "volatility", "position_sizing",
+  "sentiment_reasoning", "news_source",
+];
 
 type ConfidenceLevel = "insufficient" | "low" | "medium" | "high";
 
@@ -110,11 +117,29 @@ function FindingCard({ finding }: { finding: Finding }) {
   );
 }
 
+// Wrapped in Suspense below because useSearchParams() requires it under
+// Next's app router. The search param is how the Recommendations page's
+// "View the finding this came from" link pre-selects the right category
+// tab here, instead of landing on "All" and leaving the user to find it.
 export default function PatternDiscoveryPage() {
+  return (
+    <Suspense fallback={<LoadingSkeleton rows={4} />}>
+      <PatternDiscoveryPageInner />
+    </Suspense>
+  );
+}
+
+function PatternDiscoveryPageInner() {
+  const searchParams = useSearchParams();
+  const initialCategory = searchParams.get("category");
   const [data, setData] = useState<PatternDiscoveryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [categoryFilter, setCategoryFilter] = useState<"all" | FindingCategory>("all");
+  const [categoryFilter, setCategoryFilter] = useState<"all" | FindingCategory>(
+    initialCategory && (VALID_CATEGORIES as string[]).includes(initialCategory)
+      ? (initialCategory as FindingCategory)
+      : "all"
+  );
   const [showInsufficient, setShowInsufficient] = useState(false);
 
   async function load() {
