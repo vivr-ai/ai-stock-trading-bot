@@ -175,6 +175,11 @@ export default function StrategyPage() {
           after <span className="text-white">30 days</span> regardless of movement, as a hard outer backstop.
         </Rule>
         <div className="grid gap-3 md:grid-cols-2">
+          <ExampleCard type="sell" title="Hard stop-loss, no exceptions">
+            Bought at $80. A bad session with no particular news drops it straight to $71.80 — 10.25% below
+            entry. The stop-loss fires immediately and independently; it doesn&apos;t wait to see whether the
+            sentiment or stagnation rules would eventually have caught it too.
+          </ExampleCard>
           <ExampleCard type="sell" title="Sentiment sours, sells early">
             A stock bought two weeks ago on momentum gets 4 fresh headlines about a product recall — sentiment
             -6.5, clearing the 3-headline bar. Price hasn&apos;t dropped 10% yet, but the sentiment rule fires
@@ -194,6 +199,18 @@ export default function StrategyPage() {
             Bought at $50, then drifts $48.50-$51 for 10 trading days — never sours enough to trigger the
             sentiment exit, never near the stop-loss or take-profit, and never strays more than 4% from the $50
             checkpoint. Closed at roughly breakeven, freeing the slot rather than sitting there indefinitely.
+          </ExampleCard>
+          <ExampleCard type="hold" title="Genuine movement resets the clock">
+            Bought at $60. Over the next 10 days it touches both $57 (-5%) and $63 (+5%) before drifting back to
+            $60.80 right when the window closes — more than the 4% band at some point, even though it looks flat
+            again now. Nothing sells: the checkpoint resets to $60.80/today, and the position gets a fresh
+            10-day window instead of being force-closed on the calendar alone.
+          </ExampleCard>
+          <ExampleCard type="sell" title="30-day hard cap, no matter what">
+            A stock keeps just barely qualifying as &quot;moving&quot; every window — up to $55 by day 10 (resets),
+            back to $48 by day 20 (resets again), hovering near $52 by day 30. The 4% test never lets the
+            checkpoint call it stagnant, but day 30 since entry arrives regardless — the position closes
+            unconditionally, exactly the backstop this cap exists for.
           </ExampleCard>
         </div>
       </Side>

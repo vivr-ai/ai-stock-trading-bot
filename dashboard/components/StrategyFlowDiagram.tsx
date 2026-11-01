@@ -1,4 +1,4 @@
-import { ArrowDown, TrendingUp, TrendingDown, FlaskConical, RotateCcw } from "lucide-react";
+import { ArrowDown, TrendingUp, TrendingDown, RotateCcw } from "lucide-react";
 import type { ReactNode } from "react";
 
 function Box({
@@ -46,27 +46,12 @@ export default function StrategyFlowDiagram() {
       {/* BUY decision — green theme */}
       <div className="rounded-xl border border-gain/30 bg-gain/[0.03] p-3">
         <div className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-gain">
-          <TrendingUp size={13} /> Buy check
+          <TrendingUp size={13} /> Buy check — news-driven momentum
         </div>
-        <div className="grid gap-3 md:grid-cols-2">
-          <div className="rounded-lg border border-accent/30 bg-bg-panel2 p-2.5">
-            <div className="mb-2 text-[11px] font-semibold text-accent">Path A · news momentum</div>
-            <div className="space-y-1.5">
-              <MiniStep>Sentiment + headlines + volume → weighted score ≥ 0.60</MiniStep>
-              <MiniStep>Not already +8% today, price above 20-day average</MiniStep>
-            </div>
-          </div>
-          <div className="rounded-lg border border-amber-500/30 bg-bg-panel2 p-2.5">
-            <div className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold text-amber-400">
-              <FlaskConical size={11} /> Path B · mean-reversion
-              <span className="ml-auto rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[9px] font-semibold">
-                SHADOW
-              </span>
-            </div>
-            <div className="space-y-1.5">
-              <MiniStep>Above 200-day average, 2-day RSI ≤ 10, volume ≥ 1.3x</MiniStep>
-              <MiniStep>Logged only — no order placed yet</MiniStep>
-            </div>
+        <div className="mx-auto max-w-sm rounded-lg border border-accent/30 bg-bg-panel2 p-2.5">
+          <div className="space-y-1.5">
+            <MiniStep>Sentiment + headlines + volume → weighted score ≥ 0.60</MiniStep>
+            <MiniStep>Not already +8% today, price above 20-day average</MiniStep>
           </div>
         </div>
       </div>
@@ -81,11 +66,12 @@ export default function StrategyFlowDiagram() {
         <div className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-loss">
           <TrendingDown size={13} /> Sell check — any one rule firing is enough
         </div>
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
           <MiniStep>Stop-loss −10%</MiniStep>
           <MiniStep>Take-profit +20% or trailing pullback</MiniStep>
           <MiniStep>Sentiment −5 (or −8 severe)</MiniStep>
-          <MiniStep>10 trading days, going nowhere</MiniStep>
+          <MiniStep>10d window, moved &lt;4% from checkpoint</MiniStep>
+          <MiniStep>30d hard cap, regardless of movement</MiniStep>
         </div>
       </div>
       <Connector />
