@@ -677,7 +677,8 @@ class SentimentStrategy:
                 symbol, exit_price,
             )
             return
-        if self.recorder.has_logged_closed_trade_since(symbol, last_buy.get("ts")):
+        buy_ts = last_buy.get("ts")
+        if self.recorder.has_logged_closed_trade_since(symbol, buy_ts):
             logger.info(
                 "Exit for %s: already logged via the normal sell path for "
                 "this round-trip; skipping to avoid a duplicate closed_trades row.",
@@ -694,10 +695,18 @@ class SentimentStrategy:
         # place to have a second, unrelated failure mode.
         entry_price = float(last_buy["price"])
         qty = float(last_buy["qty"])
+        # buy_ts is already sitting right here (needed above for the
+        # duplicate-logging check) - converting it the same way
+        # _resolve_lot does, instead of hardcoding entry_time=None, is what
+        # actually fixes the blank "Entry" column/missing hold-duration data
+        # for every reconstructed trade (see Strategy Intelligence's
+        # avgHoldingPeriodDays, which silently drops any trade with no
+        # entry_time).
+        entry_time = buy_ts.timestamp() if isinstance(buy_ts, datetime) else None
         full_reason = f"{exit_reason} (reconstructed - open-lot state was lost)"
         pnl = self.closed_trade_logger.log(
             symbol, qty, entry_price, exit_price,
-            exit_reason=full_reason, entry_time=None,
+            exit_reason=full_reason, entry_time=entry_time,
         )
         logger.info(
             "Closed trade (reconstructed from trades table - open-lot state "
@@ -710,7 +719,7 @@ class SentimentStrategy:
         self.recorder.record_closed_trade(
             symbol=symbol, qty=qty, entry_price=entry_price, exit_price=exit_price,
             pnl=pnl, pnl_pct=pnl_pct, exit_reason=full_reason,
-            entry_time=None, buy_reason=last_buy.get("reason"),
+            entry_time=entry_time, buy_reason=last_buy.get("reason"),
             news_summary=last_buy.get("rationale"), sector=last_buy.get("sector"),
             confidence_score=last_buy.get("sentiment_score"),
             confidence_label=last_buy.get("sentiment_label"),
