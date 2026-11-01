@@ -1,12 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import LoadingSkeleton from "@/components/LoadingSkeleton";
 import ErrorState from "@/components/ErrorState";
 import { fmtMoney, fmtPct, fmtDateTime, toneFor } from "@/lib/format";
 import { nameFor } from "@/lib/symbolNames";
 import { exitReasonCategory } from "@/lib/strategyAnalytics";
-import { Search } from "lucide-react";
+import { Search, ChevronDown, ChevronRight } from "lucide-react";
 
 type ClosedTrade = {
   id: number;
@@ -34,6 +34,11 @@ type ReasonBucket = {
   winRatePct: number;
   totalPnl: number;
   avgPnl: number;
+  // Underlying trades for this bucket, sorted worst P/L first - expanding a
+  // row (see ExpandableBreakdownRow below) lists these directly, which is
+  // what actually lets you see e.g. which specific symbols/tiers make up a
+  // rule's losses instead of just the aggregate numbers above.
+  trades: ClosedTrade[];
 };
 
 function breakdownByExitReason(trades: ClosedTrade[]): ReasonBucket[] {
@@ -53,20 +58,76 @@ function breakdownByExitReason(trades: ClosedTrade[]): ReasonBucket[] {
       winRatePct: (wins / rows.length) * 100,
       totalPnl,
       avgPnl: totalPnl / rows.length,
+      trades: [...rows].sort((a, b) => Number(a.pnl) - Number(b.pnl)),
     });
   }
   return out.sort((a, b) => b.count - a.count);
+}
+
+function ExpandedRuleTrades({ trades }: { trades: ClosedTrade[] }) {
+  return (
+    <tr className="border-b border-bg-border last:border-0">
+      <td colSpan={5} className="bg-bg-panel2/40 px-4 py-3">
+        <table className="w-full min-w-[720px] text-left text-xs">
+          <thead>
+            <tr className="text-muted">
+              <th className="px-3 py-2 font-medium">Symbol</th>
+              <th className="px-3 py-2 font-medium">Entry</th>
+              <th className="px-3 py-2 font-medium">Exit</th>
+              <th className="px-3 py-2 font-medium">P/L</th>
+              <th className="px-3 py-2 font-medium">Exit Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            {trades.map((t) => {
+              const tone = toneFor(t.pnl);
+              return (
+                <tr key={t.id} className="border-t border-bg-border/60 align-top">
+                  <td className="whitespace-nowrap px-3 py-2 text-white">
+                    {t.symbol}
+                    {nameFor(t.symbol) && (
+                      <span className="ml-1 text-muted">({nameFor(t.symbol)})</span>
+                    )}
+                  </td>
+                  <td className="whitespace-nowrap px-3 py-2 text-muted">{fmtDateTime(t.entry_time)}</td>
+                  <td className="whitespace-nowrap px-3 py-2 text-muted">{fmtDateTime(t.ts)}</td>
+                  <td
+                    className={`whitespace-nowrap px-3 py-2 tabular-nums ${
+                      tone === "gain" ? "text-gain" : tone === "loss" ? "text-loss" : ""
+                    }`}
+                  >
+                    {fmtMoney(t.pnl)} <span className="opacity-80">({fmtPct(t.pnl_pct)})</span>
+                  </td>
+                  <td className="px-3 py-2 text-muted">{t.exit_reason ?? "—"}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </td>
+    </tr>
+  );
 }
 
 export default function TradeHistoryPage() {
   const [data, setData] = useState<TradesResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [expandedRules, setExpandedRules] = useState<Set<string>>(new Set());
 
   const [search, setSearch] = useState("");
   const [outcome, setOutcome] = useState<"all" | "win" | "loss">("all");
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
+
+  function toggleRule(rule: string) {
+    setExpandedRules((prev) => {
+      const next = new Set(prev);
+      if (next.has(rule)) next.delete(rule);
+      else next.add(rule);
+      return next;
+    });
+  }
 
   const queryString = useMemo(() => {
     const params = new URLSearchParams();
@@ -162,7 +223,8 @@ export default function TradeHistoryPage() {
           <div className="border-b border-bg-border px-4 py-3">
             <h2 className="text-sm font-semibold text-white">Exits by sell rule</h2>
             <p className="text-xs text-muted">
-              Which rule actually closed each trade below, over the current filters.
+              Which rule actually closed each trade below, over the current filters. Click a row to
+              see the individual trades behind it.
             </p>
           </div>
           <table className="w-full min-w-[640px] text-left text-sm">
@@ -178,20 +240,36 @@ export default function TradeHistoryPage() {
             <tbody>
               {reasonBreakdown.map((b) => {
                 const tone = toneFor(b.totalPnl);
+                const expanded = expandedRules.has(b.rule);
                 return (
-                  <tr key={b.rule} className="border-b border-bg-border last:border-0">
-                    <td className="px-4 py-3 text-white">{b.rule}</td>
-                    <td className="px-4 py-3 tabular-nums">{b.count}</td>
-                    <td className="px-4 py-3 tabular-nums">{b.winRatePct.toFixed(0)}%</td>
-                    <td
-                      className={`px-4 py-3 tabular-nums ${
-                        tone === "gain" ? "text-gain" : tone === "loss" ? "text-loss" : ""
-                      }`}
+                  <Fragment key={b.rule}>
+                    <tr
+                      onClick={() => toggleRule(b.rule)}
+                      className="cursor-pointer border-b border-bg-border last:border-0 hover:bg-bg-panel2/60"
                     >
-                      {fmtMoney(b.totalPnl)}
-                    </td>
-                    <td className="px-4 py-3 tabular-nums text-muted">{fmtMoney(b.avgPnl)}</td>
-                  </tr>
+                      <td className="px-4 py-3 text-white">
+                        <span className="flex items-center gap-1.5">
+                          {expanded ? (
+                            <ChevronDown size={14} className="text-muted" />
+                          ) : (
+                            <ChevronRight size={14} className="text-muted" />
+                          )}
+                          {b.rule}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 tabular-nums">{b.count}</td>
+                      <td className="px-4 py-3 tabular-nums">{b.winRatePct.toFixed(0)}%</td>
+                      <td
+                        className={`px-4 py-3 tabular-nums ${
+                          tone === "gain" ? "text-gain" : tone === "loss" ? "text-loss" : ""
+                        }`}
+                      >
+                        {fmtMoney(b.totalPnl)}
+                      </td>
+                      <td className="px-4 py-3 tabular-nums text-muted">{fmtMoney(b.avgPnl)}</td>
+                    </tr>
+                    {expanded && <ExpandedRuleTrades trades={b.trades} />}
+                  </Fragment>
                 );
               })}
             </tbody>
