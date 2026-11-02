@@ -739,7 +739,7 @@ class AlpacaBroker:
             status=str(order.status),
         )
 
-    def get_protected_symbols(self) -> Set[str]:
+    def get_protected_symbols(self) -> Optional[Set[str]]:
         """Symbols with a live BRACKET or OCO order working at the broker -
         i.e. already have a stop-loss/take-profit protecting them. A normal
         bot-initiated buy always shows up here (submit_bracket_buy always
@@ -747,7 +747,10 @@ class AlpacaBroker:
         broker but weren't bought through this bot (manually opened, or
         predate this codebase's trade tracking), which get no bracket by
         default. Used by SentimentStrategy._adopt_legacy_positions to decide
-        whether such a position still needs a protective order placed."""
+        whether such a position still needs a protective order placed.
+
+        Returns None (not an empty set) when the broker can't be queried, so
+        callers can tell "no protected positions" from "couldn't check"."""
         from alpaca.trading.requests import GetOrdersRequest
         from alpaca.trading.enums import QueryOrderStatus, OrderSide, OrderClass
 
@@ -763,8 +766,12 @@ class AlpacaBroker:
                 if getattr(o, "order_class", None) in (OrderClass.OCO, OrderClass.BRACKET)
             }
         except Exception as exc:  # noqa: BLE001
+            # Fail CLOSED: an API error means "unknown", not "nothing is
+            # protected". Returning an empty set here used to make
+            # _adopt_legacy_positions treat every held position as
+            # unprotected and submit a second protective order for each.
             logger.warning("Could not fetch protective-order status: %s", exc)
-            return set()
+            return None
 
     def submit_protective_exit(self, symbol: str, qty: float, stop_price: float,
                                take_profit_price: float, client_order_id: str = None) -> PlacedOrder:

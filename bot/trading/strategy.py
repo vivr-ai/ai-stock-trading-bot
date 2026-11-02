@@ -539,6 +539,14 @@ class SentimentStrategy:
             return
 
         protected = self.broker.get_protected_symbols()
+        if protected is None:
+            # Couldn't read open orders: we don't know which positions are
+            # protected, so do nothing this cycle rather than risk
+            # submitting duplicate protective orders. Existing broker orders
+            # are untouched; the next cycle retries.
+            logger.warning("Legacy-position adoption skipped this cycle: protective-order "
+                           "status unavailable (fail closed).")
+            return
 
         for symbol, pos in detailed.items():
             has_buy_row = self.recorder.get_last_buy_trade(symbol) is not None
