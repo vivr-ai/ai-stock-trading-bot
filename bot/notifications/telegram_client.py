@@ -25,7 +25,10 @@ MAX_MESSAGE_LEN = 3800
 
 class TelegramNotifier:
     def __init__(self, bot_token: str, chat_id: str, *, timeout: float = 8.0,
-                 attempts: int = 2):
+                 attempts: int = 2, label: str = ""):
+        # Optional environment label prefixed to every message (e.g.
+        # "[STAGING]") so staging alerts can never be mistaken for production.
+        self.label = label
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.timeout = timeout
@@ -49,7 +52,8 @@ class TelegramNotifier:
         prefix = {"critical": "\U0001F6A8 ", "warning": "⚠️ ", "info": ""}.get(
             severity, ""
         )
-        body = f"{prefix}{text}"
+        label = f"{self.label} " if self.label else ""
+        body = f"{prefix}{label}{text}"
         if len(body) > MAX_MESSAGE_LEN:
             body = body[: MAX_MESSAGE_LEN - 20] + "\n… (truncated)"
 

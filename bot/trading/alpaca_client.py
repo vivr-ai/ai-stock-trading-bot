@@ -298,6 +298,17 @@ class AlpacaBroker:
             )
             return fallback_open
 
+    def account_identity(self) -> Dict[str, object]:
+        """Which Alpaca account these keys belong to (used by
+        bot/deployment_guard.py at start-up). Raises on API failure - the
+        caller decides whether that is fatal."""
+        acct = self._retry(self._trading.get_account, "get_account(identity)")
+        return {
+            "account_number": str(getattr(acct, "account_number", "") or ""),
+            "status": str(getattr(acct, "status", "") or ""),
+            "paper": self.connects_to_paper,
+        }
+
     def account_snapshot(self) -> Dict[str, float]:
         """One call returns everything the cycle needs, with retries.
 

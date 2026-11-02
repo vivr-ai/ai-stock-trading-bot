@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from bot.config import load_config
 from bot.logging_utils import ClosedTradeLogger, DailySummaryLogger, TradeLogger
 from bot.news import get_news_provider
+from bot.deployment_guard import verify_account_identity
 from bot.notifications import NotificationService, TelegramNotifier
 from bot.notifications.summary import build_queued_summary
 from bot.persistence import Recorder
@@ -79,6 +80,13 @@ def _maybe_start_health_server(port) -> None:
     threading.Thread(target=_serve, daemon=True, name="health-server").start()
 
 
+def _env_label(cfg) -> str:
+    """'[STAGING]' / '[LOCAL]' prefix for alerts; empty in production so
+    production messages are unchanged."""
+    env = getattr(getattr(cfg, "deployment", None), "environment", "production")
+    return "" if env == "production" else f"[{env.upper()}]"
+
+
 def build(cfg):
     # Pick credentials for the account this mode actually connects to. PAPER
     # uses the existing ALPACA_API_KEY/SECRET_KEY; DRY_RUN and LIVE both
@@ -101,6 +109,11 @@ def build(cfg):
         api_key, secret_key, mode=cfg.trading.mode, allow_submit=allow_submit,
         retry_attempts=cfg.retry.max_attempts, retry_base_delay=cfg.retry.base_delay_seconds,
     )
+    # Refuse to run against the wrong Alpaca account (staging must prove it is
+    # on its own paper account; production is checked only if
+    # EXPECTED_ALPACA_ACCOUNT_NUMBER is set). Raises -> process exits before
+    # any cycle or order can run. See bot/deployment_guard.py.
+    verify_account_identity(cfg, broker)
     universe = get_universe_provider(cfg)
     news = get_news_provider(cfg)
     analyzer = get_sentiment_analyzer(cfg)
@@ -113,7 +126,9 @@ def build(cfg):
     state = BotState(cfg.logging.state_path)
     # Dashboard persistence: purely additive observability, no bearing on
     # trading decisions. No-ops automatically if DATABASE_URL isn't set.
-    telegram = TelegramNotifier(cfg.telegram.bot_token, cfg.telegram.chat_id) if cfg.telegram.enabled else TelegramNotifier("", "")
+    telegram = (TelegramNotifier(cfg.telegram.bot_token, cfg.telegram.chat_id,
+                                 label=_env_label(cfg))
+                if cfg.telegram.enabled else TelegramNotifier("", ""))
     recorder = NotificationService(Recorder(), telegram=telegram)
     reporter = PerformanceReporter(
         broker, cfg.logging.trade_log_path, cfg.logging.closed_trades_path, cfg.logging.report_dir,
@@ -148,6 +163,8 @@ def do_check(cfg) -> int:
             check_api_key, check_secret_key, mode=cfg.trading.mode, allow_submit=False,
             retry_attempts=cfg.retry.max_attempts, retry_base_delay=cfg.retry.base_delay_seconds,
         )
+        masked = verify_account_identity(cfg, broker)
+        log.info("[OK] Account identity (%s): %s", cfg.deployment.environment, masked)
         acct = broker.account_snapshot()
         is_open = broker.is_market_open()
         positions = broker.open_positions()
@@ -189,7 +206,7 @@ def do_check(cfg) -> int:
 
     # 4) Telegram (optional - only checked if credentials are configured)
     if cfg.telegram.enabled:
-        telegram = TelegramNotifier(cfg.telegram.bot_token, cfg.telegram.chat_id)
+        telegram = TelegramNotifier(cfg.telegram.bot_token, cfg.telegram.chat_id, label=_env_label(cfg))
         if telegram.test():
             log.info("[OK] Telegram | test message sent")
         else:
@@ -265,7 +282,7 @@ def main() -> int:
         # failed to build.
         NotificationService(
             Recorder(),
-            telegram=TelegramNotifier(cfg.telegram.bot_token, cfg.telegram.chat_id)
+            telegram=TelegramNotifier(cfg.telegram.bot_token, cfg.telegram.chat_id, label=_env_label(cfg))
             if cfg.telegram.enabled else TelegramNotifier("", ""),
         ).record_notification(
             type_="error", severity="critical", title="Bot failed to start",

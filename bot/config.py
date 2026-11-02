@@ -213,6 +213,25 @@ class DashboardConfig:
 
 
 @dataclass
+class DeploymentConfig:
+    # Which deployment this process is (BOT_ENVIRONMENT). Defaults to
+    # "production" so an unset variable keeps today's behaviour exactly.
+    # "staging" switches on extra start-up guards (see _validate and
+    # bot/deployment_guard.py) so a staging bot can never be pointed at the
+    # production account by a copy-pasted key.
+    environment: str
+    # Alpaca account number this process is allowed to trade
+    # (EXPECTED_ALPACA_ACCOUNT_NUMBER). Optional in production (empty = no
+    # check, today's behaviour); REQUIRED in staging. When set, the bot
+    # refuses to start if the API keys belong to any other account.
+    expected_account_number: str
+
+    @property
+    def is_staging(self) -> bool:
+        return self.environment == "staging"
+
+
+@dataclass
 class RetentionConfig:
     # How long decisions rows are kept before the daily prune job deletes
     # them (see bot/persistence/db.py's Recorder.prune_old_decisions and
@@ -241,6 +260,7 @@ class Config:
     trading: TradingConfig
     dashboard: DashboardConfig
     retention: RetentionConfig
+    deployment: DeploymentConfig = field(default_factory=lambda: DeploymentConfig("production", ""))
     project_root: str = field(default="")
     config_file_used: Optional[str] = field(default=None)
 
@@ -517,6 +537,12 @@ def load_config(path: str = "config.ini") -> Config:
                 parser, "retention", "prune_batch_size", "RETENTION_PRUNE_BATCH_SIZE", 5000, int
             ),
         ),
+        deployment=DeploymentConfig(
+            environment=_get(parser, "deployment", "environment", "BOT_ENVIRONMENT", "production").strip().lower(),
+            expected_account_number=_get(
+                parser, "deployment", "expected_account_number", "EXPECTED_ALPACA_ACCOUNT_NUMBER", ""
+            ).strip(),
+        ),
         project_root=project_root,
         config_file_used=path if parser is not None else None,
     )
@@ -555,6 +581,24 @@ def _validate(cfg: Config) -> None:
         raise ValueError("news.provider / NEWS_PROVIDER must be 'alpaca', 'newsapi', or 'finnhub'")
     if cfg.sentiment.provider not in ("lexicon", "claude", "openai"):
         raise ValueError("sentiment.provider / SENTIMENT_PROVIDER must be 'lexicon', 'claude', or 'openai'")
+
+    # ---- Deployment environment (production / staging / local) ------------
+    if cfg.deployment.environment not in ("production", "staging", "local"):
+        raise ValueError(
+            "BOT_ENVIRONMENT must be 'production', 'staging' or 'local' (got "
+            f"'{cfg.deployment.environment}')."
+        )
+    if cfg.deployment.is_staging:
+        problems = []
+        if cfg.trading.mode != "paper":
+            problems.append(f"TRADING_MODE must be 'paper' in staging (got '{cfg.trading.mode}')")
+        if cfg.trading.live_api_key or cfg.trading.live_secret_key:
+            problems.append("ALPACA_LIVE_API_KEY / ALPACA_LIVE_SECRET_KEY must NOT be set in staging")
+        if not cfg.deployment.expected_account_number:
+            problems.append("EXPECTED_ALPACA_ACCOUNT_NUMBER must be set in staging (the staging "
+                            "paper account's number, from the Alpaca dashboard)")
+        if problems:
+            raise ValueError("Unsafe staging configuration - refusing to start: " + "; ".join(problems) + ".")
 
     # ---- Operating mode: PAPER / DRY_RUN / LIVE --------------------------
     # This replaces the old hard-coded "refuses to run against a live
