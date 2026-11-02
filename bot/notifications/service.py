@@ -45,6 +45,10 @@ class NotificationService:
         )
         self._last_db_alert_ts: float = 0.0
         self._db_alert_active: bool = False
+        # Set True when a bot/reliability/db_gate.DbHealthGate owns DB-outage
+        # alerting (it repeats hourly and reports recovery + reconciliation),
+        # so the same outage isn't announced twice.
+        self.external_db_alerts: bool = False
 
     # ---- proxy every other Recorder method unchanged -------------------
     def __getattr__(self, name: str):
@@ -62,6 +66,8 @@ class NotificationService:
     # ---- DB outage detection --------------------------------------------
     def _check_db_health(self) -> None:
         recorder = self._recorder
+        if self.external_db_alerts:
+            return  # the DB health gate alerts instead
         if not getattr(recorder, "enabled", False):
             return  # no DATABASE_URL configured at all - not an "outage"
         healthy = getattr(recorder, "healthy", True)
@@ -71,8 +77,8 @@ class NotificationService:
                 self._last_db_alert_ts = now
                 self._db_alert_active = True
                 self.telegram.send(
-                    "Database write failing — dashboard persistence is degraded. "
-                    f"Trading continues unaffected. Last error: "
+                    "Database write failing - dashboard persistence is degraded and "
+                    "DB-dependent safety checks may be impaired. Last error: "
                     f"{getattr(recorder, 'last_error', 'unknown')}",
                     severity="critical",
                 )

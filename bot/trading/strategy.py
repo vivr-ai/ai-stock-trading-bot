@@ -100,7 +100,8 @@ class _NullRecorder:
 class SentimentStrategy:
     def __init__(self, cfg, broker, universe, news, analyzer, risk,
                  trade_logger, summary_logger, state, closed_trade_logger=None,
-                 recorder=None, version_provider=None, bot_control_provider=None):
+                 recorder=None, version_provider=None, bot_control_provider=None,
+                 db_gate=None):
         self.cfg = cfg
         self.broker = broker
         self.universe = universe
@@ -153,12 +154,25 @@ class SentimentStrategy:
         # order, which is every held position, since each one always carries
         # its standing protective order. Reset at the top of each adoption pass.
         self._protected_this_cycle: Set[str] = set()
+        # Stage 2 DB health gate (bot/reliability/db_gate.py). None = no gate
+        # (tests / tools), which keeps the previous behaviour exactly.
+        self.db_gate = db_gate
+        # Broker position detail (avg entry price etc.), read at most once per
+        # cycle and only when the DB can't supply what an exit rule needs.
+        self._position_details_cache = None
+        # In-memory trailing-stop peaks, so a DB outage can't reset a peak:
+        # the effective peak is max(DB peak, this, current price).
+        self._mem_peaks = {}
 
     def run_cycle(self, force: bool = False, scheduler_status: str = "scheduled") -> None:
         market_open = self.broker.is_market_open()
         self._maybe_notify_clock_degraded()
         if not force and not market_open:
             logger.info("Market closed; skipping cycle.")
+            if self.db_gate is not None:
+                # Still check the DB outside market hours, so an overnight or
+                # weekend outage is alerted (and reconciled) before the open.
+                self.db_gate.check()
             self.recorder.record_heartbeat(
                 status="running", scheduler_status=scheduler_status, market_open=False,
                 dry_run=self.cfg.risk.dry_run, message="market closed; cycle skipped",
@@ -267,6 +281,21 @@ class SentimentStrategy:
                         + (f" Today's change: {loss_pct:.2f}%." if loss_pct is not None else "")
                     ),
                 )
+
+        # Stage 2: DB health gate. Runs every cycle (even if entries are
+        # already blocked for another reason) so outages are detected,
+        # alerted and reconciled promptly. Blocks NEW entries only; exits and
+        # broker protective orders are unaffected.
+        self._position_details_cache = None
+        if self.db_gate is not None:
+            db_ok = self.db_gate.check()
+            if not db_ok and new_entries_allowed:
+                new_entries_allowed = False
+                logger.warning("DB health gate: new entries blocked this cycle (%s).",
+                               self.db_gate.last_reason,
+                               extra={"decision": "block_new_entries", "reason": "db_unavailable"})
+                self.recorder.record_decision(symbol="*", decision="block_new_entries",
+                                              reason="db_unavailable")
 
         # Market filter 1: if the broad market is down hard today, don't open longs.
         if new_entries_allowed and self.cfg.strategy.market_filter_max_drop_pct > 0:
@@ -1613,6 +1642,13 @@ class SentimentStrategy:
                 sector_counts, stats, market_regime=None,
                 entry_path: str = "sentiment_momentum", reason: Optional[str] = None) -> float:
         if price is None or price <= 0:
+            return exposure
+        if self.db_gate is not None and not self.db_gate.entries_allowed():
+            # A DB write failed earlier in this cycle - don't open a position
+            # whose records can't be stored.
+            logger.warning("BUY %s blocked: database unavailable (%s)", symbol, self.db_gate.last_reason,
+                           extra={"symbol": symbol, "decision": "buy_blocked", "reason": "db_unavailable"})
+            stats.blocked += 1
             return exposure
 
         decision = self.risk.evaluate(

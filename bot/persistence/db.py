@@ -56,6 +56,9 @@ class Recorder:
         # reported as failing.
         self.healthy = True
         self.last_error: Optional[str] = None
+        # Optional bot/reliability/journal.Journal: failed writes are appended
+        # there instead of being dropped (set by main.build).
+        self.journal = None
         if self.enabled:
             try:
                 import psycopg2  # noqa: F401
@@ -73,15 +76,85 @@ class Recorder:
                         "(bot still runs normally on CSV/JSON logs only).")
 
     # ---- internals ---------------------------------------------------
+    def _journal_failed_write(self, sql: str, params: Dict[str, Any]) -> None:
+        if self.journal is None:
+            return
+        first = " ".join(sql.split())[:80]
+        self.journal.append("db_write", {"statement": first, "sql": sql, "params": params,
+                                         "error": self.last_error})
+
+    def health_check(self) -> bool:
+        """Cheap connectivity check (connect + SELECT 1), run once per cycle
+        by bot/reliability/db_gate.py. Updates `healthy`/`last_error`.
+        Returns True when no DATABASE_URL is configured (nothing to check)."""
+        if not self.enabled:
+            return True
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            self.healthy, self.last_error = False, str(exc)
+            return False
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+            self.healthy, self.last_error = True, None
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.healthy, self.last_error = False, str(exc)
+            return False
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def replay_journal(self, entries) -> Optional[int]:
+        """Copy journal entries into journal_events with their original
+        timestamps (idempotent: the entry id is the primary key). Returns how
+        many entries are now stored, or None if the DB couldn't be written."""
+        if not self.enabled:
+            return 0
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            self.healthy, self.last_error = False, str(exc)
+            return None
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    for e in entries:
+                        cur.execute(
+                            """
+                            INSERT INTO journal_events (id, journaled_at, kind, payload)
+                            VALUES (%(id)s, %(ts)s, %(kind)s, %(payload)s::jsonb)
+                            ON CONFLICT (id) DO NOTHING
+                            """,
+                            dict(id=e["id"], ts=e["ts"], kind=e["kind"],
+                                 payload=json.dumps(e.get("payload"), default=str)),
+                        )
+            return len(entries)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Journal replay failed: %s", exc)
+            self.healthy, self.last_error = False, str(exc)
+            return None
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
     def _execute(self, sql: str, params: Dict[str, Any]) -> None:
         if not self.enabled:
             return
         try:
             conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Dashboard DB connect failed (row dropped): %s", exc)
+            logger.warning("Dashboard DB connect failed (row journaled locally): %s", exc)
             self.healthy = False
             self.last_error = str(exc)
+            self._journal_failed_write(sql, params)
             return
         try:
             with conn:
@@ -90,9 +163,10 @@ class Recorder:
             self.healthy = True
             self.last_error = None
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Dashboard DB write failed (row dropped): %s", exc)
+            logger.warning("Dashboard DB write failed (row journaled locally): %s", exc)
             self.healthy = False
             self.last_error = str(exc)
+            self._journal_failed_write(sql, params)
         finally:
             try:
                 conn.close()

@@ -27,6 +27,10 @@ from bot.config import load_config
 from bot.logging_utils import ClosedTradeLogger, DailySummaryLogger, TradeLogger
 from bot.news import get_news_provider
 from bot.deployment_guard import verify_account_identity
+from bot.reliability.db_gate import DbHealthGate
+from bot.reliability.journal import Journal
+from bot.reliability.reconcile import make_reconciler
+from bot.reliability.watchdog import CycleWatchdog
 from bot.notifications import NotificationService, TelegramNotifier
 from bot.notifications.summary import build_queued_summary
 from bot.persistence import Recorder
@@ -129,15 +133,31 @@ def build(cfg):
     telegram = (TelegramNotifier(cfg.telegram.bot_token, cfg.telegram.chat_id,
                                  label=_env_label(cfg))
                 if cfg.telegram.enabled else TelegramNotifier("", ""))
-    recorder = NotificationService(Recorder(), telegram=telegram)
+    base_recorder = Recorder()
+    # Stage 2: failed DB writes go to a local append-only journal instead of
+    # being dropped (copied into journal_events on recovery).
+    journal = Journal(os.path.join(os.path.dirname(cfg.logging.state_path) or "logs", "journal"))
+    base_recorder.journal = journal
+    recorder = NotificationService(base_recorder, telegram=telegram)
+    # Stage 2: DB health gate - blocks NEW entries while the DB is down or
+    # until reconciliation succeeds (incl. after every restart), alerts
+    # directly via Telegram, and never touches broker orders.
+    db_gate = DbHealthGate(
+        base_recorder,
+        alert=lambda text, severity: telegram.send(text, severity=severity),
+        reconcile=make_reconciler(base_recorder, broker, journal),
+    )
+    if db_gate.enabled:
+        recorder.external_db_alerts = True  # the gate owns DB-outage alerts
     reporter = PerformanceReporter(
         broker, cfg.logging.trade_log_path, cfg.logging.closed_trades_path, cfg.logging.report_dir,
         recorder=recorder,
     )
     strategy = SentimentStrategy(
         cfg, broker, universe, news, analyzer, risk, trade_logger, summary_logger, state,
-        closed_trade_logger=closed_trade_logger, recorder=recorder,
+        closed_trade_logger=closed_trade_logger, recorder=recorder, db_gate=db_gate,
     )
+    strategy.telegram = telegram
     return broker, summary_logger, reporter, strategy, recorder
 
 
@@ -456,11 +476,21 @@ def main() -> int:
         strategy.run_cycle(scheduler_status="one_shot")
         return 0
 
+    # Stage 2: alert if scheduled cycles stop running during market hours.
+    watchdog_telegram = getattr(strategy, "telegram", None)
+    watchdog = CycleWatchdog(
+        alert=(lambda text, severity: watchdog_telegram.send(text, severity=severity))
+        if watchdog_telegram is not None else (lambda text, severity: None),
+        timezone=cfg.schedule.market_timezone,
+    )
+    watchdog.start()
+
     def run_cycle_safely():
         # Guards against a bug in a single cycle taking the scheduler job
         # down silently (APScheduler swallows exceptions from jobs on its
         # own). Per-symbol errors are already isolated inside run_cycle();
         # this is the outer net for anything else (e.g. summary logging).
+        watchdog.mark()
         try:
             strategy.run_cycle(scheduler_status="scheduled")
         except Exception as exc:  # noqa: BLE001

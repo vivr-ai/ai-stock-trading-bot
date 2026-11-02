@@ -549,3 +549,21 @@ CREATE TABLE IF NOT EXISTS account_activities (
 );
 CREATE INDEX IF NOT EXISTS idx_account_activities_date ON account_activities (activity_date);
 CREATE INDEX IF NOT EXISTS idx_account_activities_type ON account_activities (activity_type);
+
+
+-- ---------------------------------------------------------------------
+-- journal_events: writes the bot could not make while Postgres was
+-- unreachable, copied in on recovery from the local append-only journal
+-- (bot/reliability/journal.py) with their ORIGINAL timestamps. Additive
+-- audit trail only - never re-executed against business tables; trade
+-- history is reconciled from Alpaca fills instead. Idempotent: id is the
+-- journal entry's UUID.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS journal_events (
+    id            UUID PRIMARY KEY,
+    journaled_at  TIMESTAMPTZ NOT NULL,
+    kind          TEXT NOT NULL,
+    payload       JSONB,
+    replayed_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_journal_events_journaled_at ON journal_events (journaled_at);
