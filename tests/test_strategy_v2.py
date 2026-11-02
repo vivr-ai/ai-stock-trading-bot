@@ -8,6 +8,7 @@ methods called unbound against a lightweight fake `self`.
 """
 import os
 import sys
+from collections import Counter
 import time as time_module
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -91,12 +92,25 @@ class _NullRecorder:
         return lambda *a, **k: None
 
 
+class _NoFillBroker:
+    """Broker with no fill history / positions (the pre-Stage-2 situation)."""
+    def last_fill(self, symbol, side=None):
+        return None
+
+    def open_positions_detailed(self):
+        return {}
+
+
 class _FakeStrategy:
     """Duck-typed stand-in for SentimentStrategy providing only what the
     methods under test touch (self.cfg, self.recorder)."""
+    _lot_from_broker = SentimentStrategy._lot_from_broker
+    _broker_entry_price = SentimentStrategy._broker_entry_price
+
     def __init__(self, cfg=None):
         self.cfg = cfg or _Cfg()
         self.recorder = _NullRecorder()
+        self.broker = _NoFillBroker()
 
 
 def _sentiment(score, headlines):
@@ -428,6 +442,38 @@ def test_resolve_lot_returns_none_when_nothing_recoverable():
     assert SentimentStrategy._resolve_lot(fake, "MANUAL") is None
 
 
+def test_resolve_lot_falls_back_to_broker_fill_when_db_has_nothing():
+    """Stage 2: DB unavailable / no row - entry time comes from Alpaca's
+    most recent filled BUY order so the time exit keeps working."""
+    from types import SimpleNamespace
+
+    class _Broker:
+        def last_fill(self, symbol, side=None):
+            assert side == "buy"
+            return SimpleNamespace(filled_at="2026-10-20T14:00:05Z")
+
+    fake = _FakeStrategy()
+    fake.state = _FakeState(lot=None)
+    fake.recorder = _FakeRecorderWithLastBuy(last_buy=None)
+    fake.broker = _Broker()
+    lot = SentimentStrategy._resolve_lot(fake, "AAPL")
+    assert lot["entry_source"] == "broker_fill"
+    assert lot["entry_path"] == "sentiment_momentum"
+    assert lot["entry_time"] == datetime(2026, 10, 20, 14, 0, 5, tzinfo=timezone.utc).timestamp()
+
+
+def test_resolve_lot_broker_lookup_failure_fails_open():
+    class _Broker:
+        def last_fill(self, symbol, side=None):
+            raise ConnectionError("alpaca down")
+
+    fake = _FakeStrategy()
+    fake.state = _FakeState(lot=None)
+    fake.recorder = _FakeRecorderWithLastBuy(last_buy=None)
+    fake.broker = _Broker()
+    assert SentimentStrategy._resolve_lot(fake, "AAPL") is None
+
+
 # ---- Path B shadow-position lifecycle (_maybe_resolve_shadow_position) --
 # These exercise the durable Postgres-backed shadow tracking added alongside
 # the Shadow vs Live dashboard page: get_open_shadow_position (see
@@ -681,8 +727,15 @@ class _FakeTrailingRecorder:
 
 
 class _FakeTrailingBroker:
-    def __init__(self, price="unset"):
+    def __init__(self, price="unset", avg_entry=None):
         self._price = price
+        self._avg_entry = avg_entry
+
+    def open_positions_detailed(self):
+        if self._avg_entry is None:
+            return {}
+        from types import SimpleNamespace
+        return {"AAPL": SimpleNamespace(avg_entry_price=self._avg_entry)}
 
     def latest_price(self, symbol):
         if self._price == "unset":
@@ -699,6 +752,8 @@ class _FakeTrailingState:
 
 
 class _FakeTrailingStrategy:
+    _broker_entry_price = SentimentStrategy._broker_entry_price
+
     def __init__(self, cfg=None, recorder=None, broker=None, sell_succeeds=True):
         self.cfg = cfg or _Cfg()
         self.recorder = recorder
@@ -741,10 +796,9 @@ def test_trailing_stop_fails_open_when_price_unavailable():
     assert fake.sells == []
 
 
-def test_trailing_stop_fails_open_when_no_durable_buy_row():
-    """No trades-table row for this symbol (e.g. a manually-adopted
-    position with no history) - must not fall back to any other price
-    source or raise, just skip this cycle's check."""
+def test_trailing_stop_fails_open_when_no_entry_price_anywhere():
+    """No trades-table row AND no broker entry price - nothing to measure
+    against, so skip this cycle's check without raising (fail open)."""
     fake = _FakeTrailingStrategy(cfg=_trailing_cfg(trailing_stop_enabled=True),
                                   recorder=_FakeTrailingRecorder(last_buy=None),
                                   broker=_FakeTrailingBroker(110.0))
@@ -752,6 +806,32 @@ def test_trailing_stop_fails_open_when_no_durable_buy_row():
         fake, "AAPL", _sentiment(5.0, 4), "sentiment_momentum", {}, CycleStats())
     assert fired is False
     assert fake.sells == []
+
+
+def test_trailing_stop_uses_broker_entry_price_when_db_row_missing():
+    """Stage 2: DB can't supply the entry price - Alpaca's avg entry price
+    is used so the trailing stop is NOT silently disabled. Entry 100, peak
+    120 (held in memory), now 110: up 10%, 8.3% below peak -> fires."""
+    fake = _FakeTrailingStrategy(cfg=_trailing_cfg(trailing_stop_enabled=True),
+                                  recorder=_FakeTrailingRecorder(last_buy=None),
+                                  broker=_FakeTrailingBroker(110.0, avg_entry=100.0))
+    fake._mem_peaks = {"AAPL": 120.0}
+    fired = SentimentStrategy._maybe_trailing_stop_exit(
+        fake, "AAPL", _sentiment(5.0, 4), "sentiment_momentum", Counter({"tech": 1}), CycleStats())
+    assert fired is True
+    assert len(fake.sells) == 1
+
+
+def test_trailing_stop_memory_peak_survives_db_peak_loss():
+    """DB returns no peak (outage) but this process saw 120 earlier: the
+    pullback is measured from 120, not reset to the current price."""
+    fake = _FakeTrailingStrategy(cfg=_trailing_cfg(trailing_stop_enabled=True),
+                                  recorder=_FakeTrailingRecorder(last_buy={"price": 100.0}),
+                                  broker=_FakeTrailingBroker(110.0))
+    fake._mem_peaks = {"AAPL": 120.0}
+    fired = SentimentStrategy._maybe_trailing_stop_exit(
+        fake, "AAPL", _sentiment(5.0, 4), "sentiment_momentum", Counter({"tech": 1}), CycleStats())
+    assert fired is True
 
 
 def test_trailing_stop_not_armed_below_activation_but_still_tracks_peak():

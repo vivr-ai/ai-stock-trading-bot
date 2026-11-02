@@ -774,6 +774,7 @@ class SentimentStrategy:
         # tables here too, same as _do_sell does on the normal path.
         if self.recorder is not None:
             self.recorder.clear_position_peak(symbol)
+            self.__dict__.setdefault("_mem_peaks", {}).pop(symbol, None)
             self.recorder.clear_stagnation_checkpoint(symbol)
 
     @staticmethod
@@ -888,6 +889,7 @@ class SentimentStrategy:
         # aren't just overwriting a now-stale row.
         if self.recorder is not None:
             self.recorder.clear_position_peak(symbol)
+            self.__dict__.setdefault("_mem_peaks", {}).pop(symbol, None)
             self.recorder.clear_stagnation_checkpoint(symbol)
 
     def _resolve_lot(self, symbol: str) -> Optional[dict]:
@@ -908,13 +910,49 @@ class SentimentStrategy:
             return lot
         last_buy = self.recorder.get_last_buy_trade(symbol)
         if last_buy is None:
-            return None
+            # Stage 2: DB unavailable (or no row) - fall back to the broker's
+            # own fill history so the time-based exit can still measure the
+            # holding period. Entry path defaults to sentiment_momentum
+            # (Path B is retired).
+            return self._lot_from_broker(symbol)
         buy_ts = last_buy.get("ts")
         return {
             "entry_path": last_buy.get("entry_path"),
             "entry_time": buy_ts.timestamp() if isinstance(buy_ts, datetime) else None,
             "strategy_version": last_buy.get("strategy_version"),
         }
+
+    def _lot_from_broker(self, symbol: str) -> Optional[dict]:
+        """Entry time from Alpaca's most recent filled BUY order for `symbol`
+        (broker is the source of truth). None if that can't be read either -
+        the time exit then fails open exactly as before."""
+        try:
+            fill = self.broker.last_fill(symbol, side="buy")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Broker fill lookup failed for %s: %s", symbol, exc)
+            return None
+        if fill is None or not fill.filled_at:
+            return None
+        try:
+            ts = datetime.fromisoformat(str(fill.filled_at).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        logger.info("Using broker fill time for %s entry (DB row unavailable): %s", symbol, ts.isoformat())
+        return {"entry_path": "sentiment_momentum", "entry_time": ts.timestamp(),
+                "entry_source": "broker_fill"}
+
+    def _broker_entry_price(self, symbol: str) -> Optional[float]:
+        """Alpaca's average entry price for a held position, read once per
+        cycle (cached) and only when the DB can't supply the entry price."""
+        if getattr(self, "_position_details_cache", None) is None:
+            try:
+                self._position_details_cache = self.broker.open_positions_detailed() or {}
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Broker position detail unavailable: %s", exc)
+                self._position_details_cache = {}
+        pos = self._position_details_cache.get(symbol)
+        price = getattr(pos, "avg_entry_price", None) if pos is not None else None
+        return float(price) if price else None
 
     def _process_symbol(self, symbol, acct, exposure, open_positions, pending,
                         sector_counts, new_entries_allowed, stats, market_regime=None) -> float:
@@ -1591,6 +1629,14 @@ class SentimentStrategy:
             return False
         entry_price = buy.get("price") if buy else None
         if not entry_price or entry_price <= 0:
+            # Stage 2: DB row unavailable - use Alpaca's average entry price
+            # instead of silently skipping the trailing check.
+            entry_price = self._broker_entry_price(symbol)
+            if entry_price:
+                logger.info("Trailing stop for %s using broker entry price %.2f (DB unavailable)",
+                            symbol, entry_price)
+        if not entry_price or entry_price <= 0:
+            logger.warning("Trailing-stop check skipped for %s: no entry price from DB or broker", symbol)
             return False
         # Recorder.get_last_buy_trade() already normalizes NUMERIC columns
         # to float (see db.py's _row_to_dict), but this cast stays here too
@@ -1604,6 +1650,11 @@ class SentimentStrategy:
         # was first turned on in production.
         entry_price = float(entry_price)
 
+        # In-memory peak survives a DB outage within this process; the DB
+        # peak survives restarts. The effective peak is the max of both.
+        mem_peaks = self.__dict__.setdefault("_mem_peaks", {})
+        mem_peaks[symbol] = max(mem_peaks.get(symbol, price), price)
+
         gain_pct = (price - entry_price) / entry_price * 100.0
         if gain_pct < self.cfg.risk.trailing_stop_activation_pct:
             # Not armed yet. Still ratchet the peak so it's already
@@ -1615,7 +1666,8 @@ class SentimentStrategy:
         peak = self.recorder.get_position_peak(symbol)
         if peak is None or peak < price:
             peak = price
-        self.recorder.update_position_peak(symbol, price)
+        peak = max(peak, mem_peaks.get(symbol, price))
+        self.recorder.update_position_peak(symbol, peak)
 
         pullback_pct = (peak - price) / peak * 100.0 if peak > 0 else 0.0
         if pullback_pct < self.cfg.risk.trailing_stop_pct:
@@ -1765,6 +1817,7 @@ class SentimentStrategy:
         # risk.trailing_stop_enabled is off - _maybe_trailing_stop_exit
         # never reads this table in that case.
         self.recorder.reset_position_peak(symbol, plan.price)
+        self.__dict__.setdefault("_mem_peaks", {})[symbol] = plan.price
         # Same hard-reset logic, for the momentum-exit stagnation gate's
         # checkpoint (see _momentum_time_exit_reason): a fresh entry must
         # start its own clean checkpoint, never inherit a stale one left
@@ -1834,6 +1887,7 @@ class SentimentStrategy:
             # would also fix this, but clearing here matches open_positions'
             # own delete-on-close housekeeping).
             self.recorder.clear_position_peak(symbol)
+            self.__dict__.setdefault("_mem_peaks", {}).pop(symbol, None)
             self.recorder.clear_stagnation_checkpoint(symbol)
             return True
 
@@ -1893,6 +1947,7 @@ class SentimentStrategy:
         # Real close submitted - drop this symbol's trailing-stop peak (see
         # the dry-run branch above for why).
         self.recorder.clear_position_peak(symbol)
+        self.__dict__.setdefault("_mem_peaks", {}).pop(symbol, None)
         self.recorder.clear_stagnation_checkpoint(symbol)
 
         if self.closed_trade_logger is not None:
