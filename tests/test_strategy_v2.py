@@ -56,6 +56,8 @@ class _StrategyCfg:
     reversion_min_volume_ratio: float = 1.3
     reversion_sentiment_veto: float = -5.0
     reversion_max_hold_days: int = 5
+    momentum_stagnation_pct: float = 4.0
+    momentum_hard_cap_days: int = 30
 
 
 @dataclass
@@ -265,36 +267,110 @@ def test_sentiment_exit_no_signal_above_threshold():
     assert SentimentStrategy._sentiment_exit_reason(fake, "CALM", sentiment) is None
 
 
-def test_momentum_time_exit_fires_after_max_hold():
-    import time
-    fake = _FakeStrategy()
-    lot = {"entry_time": time.time() - 11 * 86400.0}  # held 11 days, max is 10
-    reason = SentimentStrategy._momentum_time_exit_reason(fake, lot)
+class _PriceBroker:
+    def __init__(self, price=100.0):
+        self.price = price
+
+    def latest_price(self, symbol):
+        return self.price
+
+
+class _StagnationRecorder:
+    """In-memory stand-in for the Recorder's stagnation-checkpoint methods
+    (position_stagnation_checkpoints). `fail=True` mimics an unreachable DB:
+    reads return None, writes are dropped."""
+    def __init__(self, checkpoint=None, fail=False):
+        self.cp = checkpoint
+        self.fail = fail
+        self.resets = []
+
+    def update_stagnation_range(self, symbol, price):
+        if self.fail:
+            return
+        if self.cp is None:
+            self.cp = {"checkpoint_price": price, "checkpoint_time": datetime.now(timezone.utc),
+                       "high_since_checkpoint": price, "low_since_checkpoint": price}
+        else:
+            self.cp["high_since_checkpoint"] = max(self.cp["high_since_checkpoint"], price)
+            self.cp["low_since_checkpoint"] = min(self.cp["low_since_checkpoint"], price)
+
+    def get_stagnation_checkpoint(self, symbol):
+        return None if self.fail else self.cp
+
+    def reset_stagnation_checkpoint(self, symbol, price):
+        self.resets.append(price)
+        self.cp = {"checkpoint_price": price, "checkpoint_time": datetime.now(timezone.utc),
+                   "high_since_checkpoint": price, "low_since_checkpoint": price}
+
+    def __getattr__(self, _name):
+        return lambda *a, **k: None
+
+
+def _time_exit_fake(cfg=None, checkpoint=None, fail=False, price=100.0):
+    fake = _FakeStrategy(cfg=cfg)
+    fake.recorder = _StagnationRecorder(checkpoint=checkpoint, fail=fail)
+    fake.broker = _PriceBroker(price)
+    return fake
+
+
+def _checkpoint(days_ago, price=100.0, high=None, low=None):
+    return {"checkpoint_price": price,
+            "checkpoint_time": datetime.now(timezone.utc) - timedelta(days=days_ago),
+            "high_since_checkpoint": high if high is not None else price,
+            "low_since_checkpoint": low if low is not None else price}
+
+
+def test_momentum_time_exit_fires_after_max_hold_when_db_unreadable():
+    """Checkpoint table unreadable -> falls back to the flat max-hold exit
+    (documented fail-safe in _momentum_time_exit_reason)."""
+    fake = _time_exit_fake(fail=True)
+    lot = {"entry_time": time_module.time() - 11 * 86400.0}  # held 11 days, max is 10
+    reason = SentimentStrategy._momentum_time_exit_reason(fake, "TEST", lot)
     assert reason is not None
     assert "max hold" in reason
 
 
 def test_momentum_time_exit_no_exit_before_max_hold():
-    import time
-    fake = _FakeStrategy()
-    lot = {"entry_time": time.time() - 2 * 86400.0}  # held 2 days
-    assert SentimentStrategy._momentum_time_exit_reason(fake, lot) is None
+    fake = _time_exit_fake(checkpoint=_checkpoint(days_ago=2))
+    lot = {"entry_time": time_module.time() - 2 * 86400.0}  # held 2 days
+    assert SentimentStrategy._momentum_time_exit_reason(fake, "TEST", lot) is None
 
 
 def test_momentum_time_exit_disabled_when_zero():
-    import time
-    fake = _FakeStrategy(cfg=_Cfg(strategy=_StrategyCfg(momentum_max_hold_days=0)))
-    lot = {"entry_time": time.time() - 999 * 86400.0}
-    assert SentimentStrategy._momentum_time_exit_reason(fake, lot) is None
+    fake = _time_exit_fake(cfg=_Cfg(strategy=_StrategyCfg(momentum_max_hold_days=0)))
+    lot = {"entry_time": time_module.time() - 999 * 86400.0}
+    assert SentimentStrategy._momentum_time_exit_reason(fake, "TEST", lot) is None
 
 
 def test_momentum_time_exit_fails_open_with_no_lot():
     """Open-lot state lost AND no durable entry_time recoverable (e.g. the
     DB fallback in _process_symbol also came back empty) - fail open, same
     convention as every other exit rule in this file."""
-    fake = _FakeStrategy()
-    assert SentimentStrategy._momentum_time_exit_reason(fake, None) is None
-    assert SentimentStrategy._momentum_time_exit_reason(fake, {}) is None
+    fake = _time_exit_fake()
+    assert SentimentStrategy._momentum_time_exit_reason(fake, "TEST", None) is None
+    assert SentimentStrategy._momentum_time_exit_reason(fake, "TEST", {}) is None
+
+
+def test_stagnation_exit_fires_when_price_stayed_within_band():
+    fake = _time_exit_fake(checkpoint=_checkpoint(days_ago=10.5, price=100.0, high=102.0, low=98.5))
+    lot = {"entry_time": time_module.time() - 10.5 * 86400.0}
+    reason = SentimentStrategy._momentum_time_exit_reason(fake, "TEST", lot)
+    assert reason is not None and "stagnant" in reason
+
+
+def test_stagnation_window_resets_when_price_moved_more_than_threshold():
+    fake = _time_exit_fake(checkpoint=_checkpoint(days_ago=10.5, price=100.0, high=106.0, low=99.0),
+                           price=105.0)
+    lot = {"entry_time": time_module.time() - 10.5 * 86400.0}
+    assert SentimentStrategy._momentum_time_exit_reason(fake, "TEST", lot) is None
+    assert fake.recorder.resets == [105.0]
+
+
+def test_hard_cap_fires_regardless_of_movement():
+    fake = _time_exit_fake(checkpoint=_checkpoint(days_ago=1, price=100.0, high=120.0, low=90.0))
+    lot = {"entry_time": time_module.time() - 31 * 86400.0}
+    reason = SentimentStrategy._momentum_time_exit_reason(fake, "TEST", lot)
+    assert reason is not None and "hard cap" in reason
 
 
 # ---- _resolve_lot: durable fallback when local open-lot state is lost ---
