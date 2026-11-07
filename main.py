@@ -32,6 +32,7 @@ from bot.reliability.db_gate import DbHealthGate
 from bot.reliability.heartbeat_ping import ExternalHeartbeat
 from bot.reliability.journal import Journal
 from bot.reliability.lease import InstanceLease, PgLeaseStore
+from bot.reliability.protection import ProtectionManager
 from bot.reliability.reconcile import make_reconciler
 from bot.reliability.watchdog import CycleWatchdog
 from bot.notifications import NotificationService, TelegramNotifier
@@ -217,6 +218,22 @@ def build(cfg):
         strategy.lease = lease
         strategy.entry_blockers.append(lease.entry_blocker)
         logging.getLogger("main").info("Trading lease enabled: name=%s instance=%s", lease.name, lease.holder)
+    # Reliability v3 (2H): protection sweep + restore, and its entry gate.
+    import threading as _threading
+
+    strategy.order_lock = _threading.RLock()
+    strategy.protection = None
+    if rel.protection_sweep_enabled:
+        strategy.protection = ProtectionManager(
+            broker, cfg.risk, "s" if cfg.deployment.is_staging else "p", alerts,
+            lock=strategy.order_lock, dry_run=cfg.risk.dry_run,
+            on_protected=lambda sym: strategy.__dict__.setdefault(
+                "_protected_this_cycle", set()).add(sym),
+            sweep_s=rel.protection_sweep_seconds, market_tz=cfg.schedule.market_timezone,
+        )
+        strategy.entry_blockers.append(strategy.protection.entry_blocker)
+        if strategy.lease is not None:
+            strategy.protection.active = lambda: strategy.lease.can_submit("protect")[0]
     return broker, summary_logger, reporter, strategy, recorder
 
 
@@ -561,6 +578,10 @@ def main() -> int:
     # Reliability v3 (2E): outside monitor, pinged only after a genuinely
     # successful cycle. Disabled until EXTERNAL_HEARTBEAT_URL is set.
     heartbeat = ExternalHeartbeat(cfg.reliability.heartbeat_url)
+    if getattr(strategy, "protection", None) is not None:
+        strategy.protection.heartbeat = heartbeat
+        strategy.protection.start()
+    order_lock = getattr(strategy, "order_lock", None)
 
     def run_cycle_safely():
         # Guards against a bug in a single cycle taking the scheduler job
@@ -569,7 +590,11 @@ def main() -> int:
         # this is the outer net for anything else (e.g. summary logging).
         watchdog.mark()
         try:
-            strategy.run_cycle(scheduler_status="scheduled")
+            if order_lock is not None:
+                with order_lock:   # the protection sweep never runs mid-cycle
+                    strategy.run_cycle(scheduler_status="scheduled")
+            else:
+                strategy.run_cycle(scheduler_status="scheduled")
         except Exception as exc:  # noqa: BLE001
             log.exception("Critical error in scheduled cycle: %s", exc)
             recorder.notify_critical_error("scheduled cycle", str(exc))

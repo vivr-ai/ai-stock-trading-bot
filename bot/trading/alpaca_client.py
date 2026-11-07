@@ -26,6 +26,80 @@ from ..utils.retry import call_with_retry
 logger = logging.getLogger(__name__)
 
 
+class BrokerReadError(RuntimeError):
+    """A broker read failed: the state is UNKNOWN (not empty)."""
+
+
+@dataclass
+class BrokerSnapshot:
+    ok: bool
+    data: object
+    error: str = ""
+
+
+WORKING_STATUSES = {"new", "accepted", "pending_new", "held", "partially_filled",
+                    "pending_replace", "accepted_for_bidding", "calculated"}
+TERMINAL_STATUSES = {"filled", "canceled", "expired", "rejected", "replaced", "done_for_day",
+                     "stopped", "suspended"}
+
+
+def http_status(exc) -> Optional[int]:
+    code = getattr(exc, "status_code", None)
+    if code is None:
+        resp = getattr(exc, "response", None)
+        code = getattr(resp, "status_code", None)
+    try:
+        return int(code) if code is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def classify_submit_error(exc) -> str:
+    """'rejected' = Alpaca answered with a definite 4xx (nothing placed, or
+    a duplicate ID); 'uncertain' = timeout, connection error or 5xx (the
+    order may or may not exist - look it up, never blindly resubmit)."""
+    code = http_status(exc)
+    if code is not None and 400 <= code < 500 and code not in (408, 429):
+        return "rejected"
+    return "uncertain"
+
+
+def flatten_orders(rows) -> List[dict]:
+    """Raw order JSON -> flat list; legs get parent_id. Keeps group_id /
+    group_role when Alpaca sends them (None otherwise)."""
+    out: List[dict] = []
+    for o in rows or []:
+        if not isinstance(o, dict):
+            continue
+        out.append(_order_view(o, None))
+        for leg in o.get("legs") or []:
+            if isinstance(leg, dict):
+                out.append(_order_view(leg, o.get("id")))
+    return out
+
+
+def _f(v) -> float:
+    try:
+        return float(v) if v not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _order_view(o: dict, parent_id) -> dict:
+    return {
+        "id": o.get("id"), "client_order_id": o.get("client_order_id") or "",
+        "symbol": o.get("symbol"), "side": (o.get("side") or "").lower(),
+        "type": (o.get("type") or o.get("order_type") or "").lower(),
+        "order_class": (o.get("order_class") or "").lower(),
+        "status": (o.get("status") or "").lower(),
+        "qty": _f(o.get("qty")), "filled_qty": _f(o.get("filled_qty")),
+        "limit_price": _f(o.get("limit_price")) or None, "stop_price": _f(o.get("stop_price")) or None,
+        "group_id": o.get("group_id"), "group_role": o.get("group_role"),
+        "replaces": o.get("replaces"), "replaced_by": o.get("replaced_by"),
+        "parent_id": parent_id, "created_at": o.get("created_at"),
+    }
+
+
 class OrderBlockedError(RuntimeError):
     """An order action was refused before reaching Alpaca (e.g. this process
     doesn't hold the trading lease). Nothing was sent to the broker."""
@@ -387,8 +461,11 @@ class AlpacaBroker:
             )
             return {o.symbol for o in orders}
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not fetch open orders: %s", exc)
-            return set()
+            # v3 2H: fail CLOSED. An API error is "unknown", never "no
+            # pending orders" - run_cycle treats this as a failed account
+            # snapshot and places no orders this cycle (alerted).
+            logger.warning("Could not fetch open orders (state UNKNOWN): %s", exc)
+            raise BrokerReadError(f"open orders unknown: {exc}") from exc
 
     def latest_price(self, symbol: str) -> Optional[float]:
         from alpaca.data.requests import StockLatestTradeRequest
@@ -699,6 +776,103 @@ class AlpacaBroker:
             except (TypeError, ValueError) as exc:
                 logger.warning("Skipping malformed account activity: %s", exc)
         return out
+
+    # ---- Reliability v3 (2H): raw, three-state broker reads -------------
+    # Alpaca added fields (e.g. group_id / group_role, Oct 2026) that the
+    # installed alpaca-py doesn't model, so these read the raw JSON. Every
+    # read returns a BrokerSnapshot: ok=False means UNKNOWN - never "empty".
+    RAW_TIMEOUT_S = 10.0
+
+    def _raw(self, method: str, path: str, data=None, retry: bool = True):
+        """One raw HTTP call to the Trading API (with a timeout). GETs are
+        retried with the broker's backoff; writes (POST/PATCH/DELETE) are
+        attempted exactly once - the caller resolves uncertain outcomes by
+        looking the order up, never by blind resubmission."""
+        t = self._trading
+        url = t._base_url + "/" + t._api_version + path
+        opts = {"headers": t._get_default_headers(), "allow_redirects": False,
+                "timeout": self.RAW_TIMEOUT_S}
+        if method.upper() in ("GET", "DELETE"):
+            opts["params"] = data
+        else:
+            opts["json"] = data
+        call = lambda: t._one_request(method, url, opts, 0)  # noqa: E731
+        if retry and method.upper() == "GET":
+            return self._retry(call, f"{method} {path}")
+        return call()
+
+    def open_orders_snapshot(self) -> "BrokerSnapshot":
+        """All open orders (bracket/OCO legs flattened, each with its
+        parent_id), up to 500. ok=False if the read failed."""
+        try:
+            rows = self._raw("GET", "/orders", {"status": "open", "limit": 500, "nested": "true"})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Open-orders read failed (state UNKNOWN): %s", exc)
+            return BrokerSnapshot(False, None, str(exc))
+        return BrokerSnapshot(True, flatten_orders(rows or []), "")
+
+    def positions_snapshot(self) -> "BrokerSnapshot":
+        """{symbol: {qty, qty_available, avg_entry_price, current_price, side}}."""
+        try:
+            rows = self._raw("GET", "/positions")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Positions read failed (state UNKNOWN): %s", exc)
+            return BrokerSnapshot(False, None, str(exc))
+        out = {}
+        for p in rows or []:
+            try:
+                out[p["symbol"]] = {
+                    "qty": float(p.get("qty") or 0), "side": p.get("side"),
+                    "qty_available": float(p.get("qty_available") if p.get("qty_available") is not None
+                                           else p.get("qty") or 0),
+                    "avg_entry_price": float(p.get("avg_entry_price") or 0),
+                    "current_price": float(p["current_price"]) if p.get("current_price") else None,
+                }
+            except (KeyError, TypeError, ValueError) as exc:
+                return BrokerSnapshot(False, None, f"malformed position row: {exc}")
+        return BrokerSnapshot(True, out, "")
+
+    def symbol_orders_snapshot(self, symbol: str, after_iso: Optional[str] = None) -> "BrokerSnapshot":
+        """Every order (any status) for one symbol, newest first, legs
+        flattened. Used to count earlier attempts of a deterministic ID."""
+        params = {"status": "all", "symbols": symbol, "limit": 500, "nested": "true",
+                  "direction": "desc"}
+        if after_iso:
+            params["after"] = after_iso
+        try:
+            rows = self._raw("GET", "/orders", params)
+        except Exception as exc:  # noqa: BLE001
+            return BrokerSnapshot(False, None, str(exc))
+        return BrokerSnapshot(True, flatten_orders(rows or []), "")
+
+    def order_by_client_id(self, client_order_id: str) -> "BrokerSnapshot":
+        """ok=True + data=order dict (found), ok=True + data=None (Alpaca says
+        404 not found), ok=False (couldn't tell)."""
+        try:
+            row = self._raw("GET", "/orders:by_client_order_id", {"client_order_id": client_order_id})
+            return BrokerSnapshot(True, row, "")
+        except Exception as exc:  # noqa: BLE001
+            if http_status(exc) == 404:
+                return BrokerSnapshot(True, None, "not found")
+            return BrokerSnapshot(False, None, str(exc))
+
+    def submit_oco_once(self, symbol: str, qty: float, stop_price: float, take_profit_price: float,
+                        client_order_id: str) -> dict:
+        """Protective stop + take-profit OCO, ONE attempt, no automatic
+        retry. Raises on any failure; use classify_submit_error() and the
+        uncertain-submission protocol to decide what happened."""
+        if not self.allow_submit:
+            raise RuntimeError(f"submit_oco_once({symbol}) blocked: submission disabled ({self.mode})")
+        self._guard("protect", f"submit_oco_once({symbol})")
+        body = {
+            "symbol": symbol, "qty": str(qty), "side": "sell", "type": "limit",
+            "time_in_force": "gtc", "order_class": "oco",
+            "limit_price": str(round(take_profit_price, 2)),
+            "take_profit": {"limit_price": str(round(take_profit_price, 2))},
+            "stop_loss": {"stop_price": str(round(stop_price, 2))},
+            "client_order_id": client_order_id,
+        }
+        return self._raw("POST", "/orders", body, retry=False)
 
     # ---- order placement -----------------------------------------------
     def _guard(self, kind: str, what: str) -> None:

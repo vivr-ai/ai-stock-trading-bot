@@ -238,6 +238,15 @@ class SentimentStrategy:
             unrealized_pl=None, open_positions=len(open_positions), exposure=exposure,
         )
         self._sync_open_positions_snapshot(acct.get("portfolio_value"))
+        # Reliability v3 (2H): fresh protection sweep before any exit or entry
+        # decision (restores confirmed-missing protection; never acts on
+        # UNKNOWN). Its entry blocker is consulted below.
+        protection = getattr(self, "protection", None)
+        if protection is not None:
+            try:
+                protection.sweep()
+            except Exception as exc:  # noqa: BLE001 - blocker below fails closed
+                logger.error("Protection sweep failed: %s", exc)
         self._adopt_legacy_positions()
 
         exited = self.state.detect_exits(list(open_positions.keys()))
@@ -630,6 +639,11 @@ class SentimentStrategy:
 
             protected_now = not needs_protection  # already had a bracket/OCO before this cycle
             protect_order_id = ""
+            if needs_protection and getattr(self, "protection", None) is not None:
+                # v3 2H: the protection manager owns restoring protection
+                # (deterministic IDs, uncertainty handling, escalation);
+                # adoption only backfills the trades row below.
+                needs_protection = False
             if needs_protection:
                 if self.cfg.risk.dry_run:
                     logger.info(
