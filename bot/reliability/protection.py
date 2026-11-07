@@ -101,6 +101,7 @@ class Track:
     confirm_due: Optional[float] = None
     uncertain: Optional[dict] = None                      # {cid, at, qty, stop, tp}
     escalated: bool = False
+    emergency: Optional[dict] = None                      # {cid, at} once an emergency exit was sent
 
 
 class ProtectionManager:
@@ -124,6 +125,10 @@ class ProtectionManager:
         self.global_unknown_since: Optional[float] = None
         self.last_ok_sweep: Optional[float] = None
         self.next_sweep_at = 0.0
+        # Emergency exit for a confirmed position already below its stop level
+        # (review 7 Nov). Part of the Stage 6 exit manager: follows
+        # EXIT_MANAGER_ENABLED, off by default -> escalate only.
+        self.emergency_exit_enabled = False
         # Only the instance allowed to trade sweeps in the background (set to
         # the lease check by main.py); a standby instance stays silent.
         self.active: Callable[[], bool] = lambda: True
@@ -202,7 +207,10 @@ class ProtectionManager:
                                    "warning", 0)
 
     def _clear(self, sym: str, why: str) -> None:
-        self.tracks.pop(sym, None)
+        t = self.tracks.pop(sym, None)
+        if t is not None and t.emergency is not None:
+            self.alerts.resolve(f"prot_emergency:{sym}", f"{sym}: emergency exit confirmed - position "
+                                                         "no longer held at the broker.", "critical")
         for key in (f"prot_missing:{sym}", f"prot_failed:{sym}", f"prot_manual:{sym}",
                     f"prot_unknown:{sym}"):
             self.alerts.resolve(key, None)
@@ -251,9 +259,9 @@ class ProtectionManager:
             return
         if now < t.missing_since + ATTEMPT_OFFSETS_S[n_done]:
             return
-        self._restore(sym, t, now, pos)
+        self._restore(sym, t, now, pos, orders)
 
-    def _restore(self, sym: str, t: Track, now: float, pos: dict) -> None:
+    def _restore(self, sym: str, t: Track, now: float, pos: dict, orders: Optional[List[dict]] = None) -> None:
         qty, covered = pos.get("qty") or 0.0, t.covered
         uncovered = round(qty - covered, 6)
         avail = pos.get("qty_available")
@@ -273,9 +281,7 @@ class ProtectionManager:
             self._attempt_failed(sym, t, "entry or current price unavailable")
             return
         if price <= stop:
-            self._escalate(sym, t, now, f"price {price:.2f} is already at or below the stop level "
-                                        f"{stop:.2f}; a stop would trigger at once (automatic exit is "
-                                        "part of the Stage 6 exit manager)")
+            self._emergency_exit(sym, t, now, pos, orders or [], uncovered, price, stop)
             return
         fill = self.broker.last_fill(sym, side="buy")
         ref = position_ref(getattr(fill, "order_id", None), pos)
@@ -323,6 +329,67 @@ class ProtectionManager:
                        sym, cid, uncovered, stop, tp)
         t.attempts.append({"at": now, "cid": cid, "outcome": "submitted"})
         t.confirm_due = now + CONFIRM_AFTER_S
+        self.on_protected(sym)
+
+    def _emergency_exit(self, sym: str, t: Track, now: float, pos: dict, orders: List[dict],
+                        uncovered: float, price: float, stop: float) -> None:
+        """Position CONFIRMED (fresh positions and orders reads) and already at
+        or below the level its stop should be at, so a stop would fire at once.
+        Policy (review 7 Nov):
+          1. only with the exit manager enabled; otherwise escalate;
+          2. the lease must be valid and fresh;
+          3. no working sell order may already be acting on the symbol (never a
+             duplicate sell) and the uncovered shares must be available;
+          4. one deterministic X order for the uncovered quantity, single attempt;
+          5. anything uncertain or refused -> escalate immediately, no retry.
+        UNKNOWN broker state never reaches here (no orders on UNKNOWN)."""
+        why = (f"price {price:.2f} is at or below the stop level {stop:.2f}; a protective stop "
+               "would trigger at once")
+        if t.emergency is not None:
+            # One attempt per position. Still held after 60 s: escalate.
+            if now - t.emergency["at"] >= 60:
+                self._escalate(sym, t, now, f"emergency exit {t.emergency['cid']} sent but the "
+                                            "position is still open")
+            return
+        if not self.emergency_exit_enabled:
+            self._escalate(sym, t, now, why + " (emergency exit is disabled until the Stage 6 exit "
+                                              "manager is enabled)")
+            return
+        guard = getattr(self.broker, "order_guard", None)
+        if guard is not None:
+            ok, reason = guard("exit")
+            if not ok:
+                self._escalate(sym, t, now, why + f"; emergency exit not allowed: {reason}")
+                return
+        conflicting = [o for o in orders if o.get("symbol") == sym and o.get("side") == "sell"
+                       and o.get("status") in WORKING_STATUSES]
+        if conflicting:
+            self._escalate(sym, t, now, why + f"; {len(conflicting)} sell order(s) already working "
+                                              f"({', '.join(o.get('client_order_id') or o.get('id') or '?' for o in conflicting)}) "
+                                              "- not adding another")
+            return
+        avail = pos.get("qty_available")
+        if avail is None or avail + EPS < uncovered:
+            self._escalate(sym, t, now, why + f"; only {avail} of {uncovered:g} shares available")
+            return
+        cid = self.broker._next_exit_client_id("X", sym, pos)
+        if cid is None:
+            self._escalate(sym, t, now, why + f"; {getattr(self.broker, 'last_order_problem', '')}")
+            return
+        body = {"symbol": sym, "qty": str(uncovered), "side": "sell", "type": "market",
+                "time_in_force": "day", "client_order_id": cid}
+        try:
+            self.broker.submit_order_once(body, "exit", f"emergency_exit({sym})")
+        except Exception as exc:  # noqa: BLE001 - rejected, unknown or blocked: escalate, never retry
+            t.emergency = {"cid": cid, "at": now}
+            self._escalate(sym, t, now, why + f"; emergency exit {cid} failed: {exc}")
+            return
+        t.emergency = {"cid": cid, "at": now}
+        t.attempts.append({"at": now, "cid": cid, "outcome": "emergency exit submitted"})
+        logger.error("EMERGENCY EXIT %s: %g sh market sell %s (%s)", sym, uncovered, cid, why)
+        self.alerts.raise_(f"prot_emergency:{sym}",
+                           f"EMERGENCY EXIT submitted for {sym}: {uncovered:g} shares, market sell "
+                           f"{cid}. Reason: {why}. Confirming at the broker.", "critical", 0)
         self.on_protected(sym)
 
     def _resolve_uncertain(self, sym: str, t: Track, now: float, pos: dict, orders: List[dict]) -> None:

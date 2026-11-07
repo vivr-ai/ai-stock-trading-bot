@@ -233,6 +233,7 @@ def build(cfg):
             sweep_s=rel.protection_sweep_seconds, market_tz=cfg.schedule.market_timezone,
         )
         strategy.entry_blockers.append(strategy.protection.entry_blocker)
+        strategy.protection.emergency_exit_enabled = rel.exit_manager_enabled
         if strategy.lease is not None:
             strategy.protection.active = lambda: strategy.lease.can_submit("protect")[0]
     return broker, summary_logger, reporter, strategy, recorder

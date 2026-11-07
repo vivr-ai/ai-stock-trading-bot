@@ -372,3 +372,109 @@ def test_adoption_defers_protection_to_manager():
     s.protection = object()
     s._adopt_legacy_positions()
     assert calls == []
+
+
+# ---- emergency exit below the stop level (review 7 Nov) ------------------------------------
+class EBroker(FakeBroker):
+    def __init__(self):
+        super().__init__()
+        self.orders = []
+        self.price = 85.0                         # stop level is 90
+        self.guard = (True, "lease held")
+        self.exits = []
+        self.exit_behaviour = "ok"
+        self.order_guard = lambda kind: self.guard
+        self.last_order_problem = None
+
+    def _next_exit_client_id(self, kind, sym, pos):
+        return f"s{kind}-{sym}-3f2a9c1e5b7d-1"
+
+    def submit_order_once(self, body, kind, what):
+        self.exits.append(body)
+        if isinstance(self.exit_behaviour, Exception):
+            raise self.exit_behaviour
+        return {"id": "x1", "status": "accepted"}
+
+
+def emgr(enabled=True):
+    m, b, a, c, hb = mgr(EBroker())
+    m.emergency_exit_enabled = enabled
+    return m, b, a, c, hb
+
+
+def test_emergency_exit_closes_uncovered_quantity_once():
+    m, b, a, c, _ = emgr()
+    m.sweep()
+    assert len(b.exits) == 1 and b.submits == []          # no stop placed below the market
+    e = b.exits[0]
+    assert (e["side"], e["type"], e["qty"], e["client_order_id"]) == ("sell", "market", "10.0",
+                                                                       "sX-AAPL-3f2a9c1e5b7d-1")
+    assert "prot_emergency:AAPL" in keys(a, "critical")
+    c.t += 15; m.sweep()
+    assert len(b.exits) == 1                               # never a second sell
+    b.positions = {}
+    c.t += 15; m.sweep()
+    assert m.tracks == {} and "prot_emergency:AAPL" in a.resolved
+
+
+def test_emergency_exit_disabled_escalates_only():
+    m, b, a, c, hb = emgr(enabled=False)
+    m.sweep()
+    assert b.exits == [] and "prot_manual:AAPL" in keys(a, "critical") and hb.fails
+
+
+def test_emergency_exit_requires_fresh_lease():
+    m, b, a, c, _ = emgr()
+    b.guard = (False, "trading lease not confirmed for 75s")
+    m.sweep()
+    assert b.exits == [] and "prot_manual:AAPL" in keys(a, "critical")
+
+
+def test_emergency_exit_never_duplicates_a_working_sell():
+    m, b, a, c, _ = emgr()
+    b.orders = [{"id": "tp", "client_order_id": "sX-AAPL-old-1", "symbol": "AAPL", "side": "sell",
+                 "type": "market", "status": "accepted", "qty": 10, "filled_qty": 0}]
+    m.sweep()
+    assert b.exits == [] and "prot_manual:AAPL" in keys(a, "critical")
+
+
+def test_emergency_exit_needs_available_shares():
+    m, b, a, c, _ = emgr()
+    b.positions["AAPL"]["qty_available"] = 0.0
+    m.sweep()
+    assert b.exits == []
+
+
+def test_emergency_exit_unknown_outcome_escalates_without_retry():
+    from bot.trading.alpaca_client import OrderOutcomeUnknown
+
+    m, b, a, c, _ = emgr()
+    b.exit_behaviour = OrderOutcomeUnknown("response lost; NOT resubmitted")
+    m.sweep()
+    c.t += 120; m.sweep()
+    assert len(b.exits) == 1 and "prot_manual:AAPL" in keys(a, "critical")
+
+
+def test_emergency_exit_still_open_after_60s_escalates():
+    m, b, a, c, _ = emgr()
+    m.sweep()
+    c.t += 61; m.sweep()
+    assert len(b.exits) == 1 and "prot_manual:AAPL" in keys(a, "critical")
+
+
+def test_unknown_state_never_reaches_emergency_exit():
+    m, b, a, c, _ = emgr()
+    b.orders_ok = False
+    m.sweep()
+    assert b.exits == [] and b.submits == []
+
+
+def test_under_protected_below_stop_with_working_stop_escalates_instead_of_selling():
+    """A stop leg is still working for 6 shares below its own level (it should
+    be triggering). Selling the other 4 next to it is not attempted: any
+    working sell on the symbol means escalate, never add another sell."""
+    m, b, a, c, _ = emgr()
+    b.orders = [stop_leg("AAPL", 6)]
+    b.positions["AAPL"]["qty_available"] = 4.0
+    m.sweep()
+    assert b.exits == [] and "prot_manual:AAPL" in keys(a, "critical")
