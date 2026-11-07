@@ -25,6 +25,11 @@ from ..utils.retry import call_with_retry
 
 logger = logging.getLogger(__name__)
 
+
+class OrderBlockedError(RuntimeError):
+    """An order action was refused before reaching Alpaca (e.g. this process
+    doesn't hold the trading lease). Nothing was sent to the broker."""
+
 # Standard NYSE/Nasdaq regular-session hours. Deliberately not calendar-aware
 # (early closes - e.g. the day after Thanksgiving - aren't accounted for);
 # on those rare days this over-estimates remaining session time, which makes
@@ -245,6 +250,9 @@ class AlpacaBroker:
         # In dry_run mode, submission is never allowed regardless of what's
         # passed in - this is not configurable, on purpose.
         self.allow_submit = bool(allow_submit) and mode != "dry_run"
+        # Reliability v3 (2I): optional pre-order check (the trading lease).
+        # Callable(kind) -> (ok, reason). None = no extra check (today).
+        self.order_guard = None
 
         self._trading = TradingClient(api_key, secret_key, paper=self.connects_to_paper)
         self._data = StockHistoricalDataClient(api_key, secret_key)
@@ -693,6 +701,17 @@ class AlpacaBroker:
         return out
 
     # ---- order placement -----------------------------------------------
+    def _guard(self, kind: str, what: str) -> None:
+        """Raise OrderBlockedError if the trading lease (or another guard)
+        says this process must not touch orders right now."""
+        guard = getattr(self, "order_guard", None)
+        if guard is None:
+            return
+        ok, why = guard(kind)
+        if not ok:
+            logger.error("%s blocked: %s", what, why)
+            raise OrderBlockedError(f"{what} blocked: {why}")
+
     def submit_bracket_buy(self, symbol: str, qty: int, stop_price: float,
                            take_profit_price: float, client_order_id: str = None) -> PlacedOrder:
         """Market BUY with attached stop-loss (-10%) and take-profit (+20%) legs.
@@ -715,6 +734,7 @@ class AlpacaBroker:
                 f"mode={self.mode}. This should never be reached in normal operation - the "
                 "strategy layer checks this first; this is the second line of defense."
             )
+        self._guard("entry", f"submit_bracket_buy({symbol})")
         from alpaca.trading.requests import (
             MarketOrderRequest,
             StopLossRequest,
@@ -789,6 +809,7 @@ class AlpacaBroker:
                 f"mode={self.mode}. This should never be reached in normal operation - the "
                 "strategy layer checks this first; this is the second line of defense."
             )
+        self._guard("protect", f"submit_protective_exit({symbol})")
         from alpaca.trading.requests import LimitOrderRequest, StopLossRequest, TakeProfitRequest
         from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
@@ -827,6 +848,10 @@ class AlpacaBroker:
             return [o for o in orders if o.symbol == symbol]
 
         try:
+            self._guard("cancel", f"cancel_orders_for({symbol})")
+        except OrderBlockedError:
+            return
+        try:
             open_orders = _open_for_symbol()
             for o in open_orders:
                 self._retry(lambda o=o: self._trading.cancel_order_by_id(o.id),
@@ -852,6 +877,10 @@ class AlpacaBroker:
                 f"mode={self.mode}. This should never be reached in normal operation - the "
                 "strategy layer checks this first; this is the second line of defense."
             )
+        try:
+            self._guard("exit", f"close_position({symbol})")
+        except OrderBlockedError:
+            return None   # caller treats as a failed sell; nothing was cancelled
         # Cancel the open bracket legs FIRST. Otherwise, after we flatten, a
         # leftover stop or limit leg can still execute and open an unintended
         # short position.

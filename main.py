@@ -31,6 +31,7 @@ from bot.reliability.alerts import AlertDeduper
 from bot.reliability.db_gate import DbHealthGate
 from bot.reliability.heartbeat_ping import ExternalHeartbeat
 from bot.reliability.journal import Journal
+from bot.reliability.lease import InstanceLease, PgLeaseStore
 from bot.reliability.reconcile import make_reconciler
 from bot.reliability.watchdog import CycleWatchdog
 from bot.notifications import NotificationService, TelegramNotifier
@@ -131,7 +132,7 @@ def build(cfg):
     # on its own paper account; production is checked only if
     # EXPECTED_ALPACA_ACCOUNT_NUMBER is set). Raises -> process exits before
     # any cycle or order can run. See bot/deployment_guard.py.
-    verify_account_identity(cfg, broker)
+    account_masked = verify_account_identity(cfg, broker)
     universe = get_universe_provider(cfg)
     news = get_news_provider(cfg)
     analyzer = get_sentiment_analyzer(cfg)
@@ -191,6 +192,24 @@ def build(cfg):
     strategy.telegram = telegram
     strategy.alerts = alerts
     strategy.journal = journal
+    strategy.entry_blockers = []
+    # Reliability v3 (2I): single-instance trading lease. Only the holder may
+    # submit, replace or cancel orders (broker.order_guard), and a new holder
+    # reconciles with the broker before its first order.
+    strategy.lease = None
+    if rel.lease_enabled:
+        if not base_recorder.enabled:
+            raise ValueError("INSTANCE_LEASE_ENABLED=true requires DATABASE_URL (the lease lives in Postgres).")
+        lease = InstanceLease(
+            PgLeaseStore(base_recorder.database_url), name=f"trader:{account_masked}",
+            reconcile=make_reconciler(base_recorder, broker, journal), alerts=alerts,
+            ttl_s=rel.lease_ttl_seconds, renew_every_s=rel.lease_renew_seconds,
+            max_age_s=rel.lease_max_age_seconds,
+        )
+        broker.order_guard = lease.can_submit
+        strategy.lease = lease
+        strategy.entry_blockers.append(lease.entry_blocker)
+        logging.getLogger("main").info("Trading lease enabled: name=%s instance=%s", lease.name, lease.holder)
     return broker, summary_logger, reporter, strategy, recorder
 
 
@@ -523,6 +542,15 @@ def main() -> int:
         timezone=cfg.schedule.market_timezone,
     )
     watchdog.start()
+    # Reliability v3 (2I): renew the trading lease every 20 s in the
+    # background; release it on a clean shutdown so a new deployment can
+    # take over at once instead of waiting for it to expire.
+    if getattr(strategy, "lease", None) is not None:
+        import atexit
+
+        strategy.lease.try_acquire()
+        strategy.lease.start()
+        atexit.register(strategy.lease.release)
     # Reliability v3 (2E): outside monitor, pinged only after a genuinely
     # successful cycle. Disabled until EXTERNAL_HEARTBEAT_URL is set.
     heartbeat = ExternalHeartbeat(cfg.reliability.heartbeat_url)

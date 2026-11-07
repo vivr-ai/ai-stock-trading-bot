@@ -567,3 +567,29 @@ CREATE TABLE IF NOT EXISTS journal_events (
     replayed_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_journal_events_journaled_at ON journal_events (journaled_at);
+
+-- ---------------------------------------------------------------------
+-- Reliability v3 (2I): single-instance trading lease. One row per Alpaca
+-- account. Only the holder may submit, replace or cancel orders. All time
+-- comparisons use the database clock. `epoch` increments on every change of
+-- holder (fencing number). See bot/reliability/lease.py.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS bot_lease (
+    name         TEXT PRIMARY KEY,
+    holder       TEXT NOT NULL,
+    epoch        BIGINT NOT NULL,
+    acquired_at  TIMESTAMPTZ NOT NULL,
+    renewed_at   TIMESTAMPTZ NOT NULL,
+    expires_at   TIMESTAMPTZ NOT NULL
+);
+-- Evidence log for the soak (acquired / reconciled / lost / released).
+CREATE TABLE IF NOT EXISTS bot_lease_events (
+    id      BIGSERIAL PRIMARY KEY,
+    ts      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    name    TEXT NOT NULL,
+    holder  TEXT NOT NULL,
+    epoch   BIGINT,
+    event   TEXT NOT NULL,
+    detail  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_bot_lease_events_ts ON bot_lease_events (ts);
