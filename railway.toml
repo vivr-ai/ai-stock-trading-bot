@@ -16,7 +16,11 @@ startCommand = "python main.py"
 #      notification, separate from bot_restart/scheduler notifications so a
 #      genuine deploy is distinguishable from a crash-restart.
 # Both no-op safely (exit 0) if DATABASE_URL / TELEGRAM_* aren't set.
-releaseCommand = "python scripts/apply_schema.py && python scripts/notify_deploy.py"
+# Railway's config-as-code key is preDeployCommand ("releaseCommand" is not a
+# Railway setting and was silently ignored: production only ran this because
+# it was also set by hand in the dashboard, and a new staging service started
+# with an empty database). Same command production already runs.
+preDeployCommand = ["python scripts/apply_schema.py && python scripts/notify_deploy.py"]
 # If the process does exit unexpectedly, Railway restarts it. The bot itself
 # also self-heals from most transient failures (see bot/utils/retry.py and
 # bot/scheduler.py's supervisor loop) — this is a last-resort safety net, not

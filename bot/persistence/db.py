@@ -44,6 +44,12 @@ def _row_to_dict(cols, row) -> Dict[str, Any]:
     return {c: (float(v) if isinstance(v, decimal.Decimal) else v) for c, v in zip(cols, row)}
 
 
+# Tables the bot must be able to write for its risk state and audit trail.
+# Checked by Recorder.health_check() every cycle.
+REQUIRED_TABLES = ("trades", "closed_trades", "decisions", "heartbeats", "notifications",
+                   "position_peaks", "journal_events")
+
+
 class Recorder:
     def __init__(self, database_url: Optional[str] = None):
         self.database_url = database_url or os.environ.get("DATABASE_URL", "")
@@ -97,8 +103,21 @@ class Recorder:
         try:
             with conn:
                 with conn.cursor() as cur:
-                    cur.execute("SELECT 1")
-                    cur.fetchone()
+                    # Not just "can we connect": the tables the bot writes to
+                    # must exist. A reachable but empty database (schema never
+                    # applied) is as unusable as an unreachable one.
+                    cur.execute(
+                        "SELECT " + ", ".join(f"to_regclass('public.{t}')" for t in REQUIRED_TABLES)
+                    )
+                    row = cur.fetchone() or ()
+            missing = [t for t, found in zip(REQUIRED_TABLES, row) if found is None]
+            if len(row) != len(REQUIRED_TABLES):
+                missing = list(REQUIRED_TABLES)
+            if missing:
+                self.healthy = False
+                self.last_error = ("database reachable but schema not applied - missing tables: "
+                                   + ", ".join(missing) + " (run scripts/apply_schema.py)")
+                return False
             self.healthy, self.last_error = True, None
             return True
         except Exception as exc:  # noqa: BLE001

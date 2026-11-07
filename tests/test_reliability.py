@@ -167,14 +167,17 @@ def test_recorder_journals_failed_writes_instead_of_dropping(tmp_path):
 
 
 class _RecordingCursor:
-    def __init__(self, store):
-        self.store = store
+    def __init__(self, store, missing=()):
+        self.store, self.missing = store, missing
 
     def execute(self, sql, params=None):
         self.store.append((sql, params))
+        self._last = sql
 
     def fetchone(self):
-        return (1,)
+        # Answer the health check's to_regclass() query: None = table missing.
+        from bot.persistence.db import REQUIRED_TABLES
+        return tuple(None if t in self.missing else t for t in REQUIRED_TABLES)
 
     def __enter__(self):
         return self
@@ -184,11 +187,11 @@ class _RecordingCursor:
 
 
 class _OkConn:
-    def __init__(self, store):
-        self.store = store
+    def __init__(self, store, missing=()):
+        self.store, self.missing = store, missing
 
     def cursor(self):
-        return _RecordingCursor(self.store)
+        return _RecordingCursor(self.store, self.missing)
 
     def close(self):
         pass
@@ -201,11 +204,11 @@ class _OkConn:
 
 
 class _OkPsycopg:
-    def __init__(self):
-        self.store = []
+    def __init__(self, missing=()):
+        self.store, self.missing = [], missing
 
     def connect(self, *a, **k):
-        return _OkConn(self.store)
+        return _OkConn(self.store, self.missing)
 
 
 def test_replay_is_idempotent_and_keeps_original_timestamp(tmp_path):
@@ -361,3 +364,15 @@ def test_startup_reconcile_failure_then_success_announces_reenable_without_outag
     clock.t += 1800
     assert gate.check() is True
     assert alerts[-1][1].startswith("Reconciliation complete") and "re-enabled" in alerts[-1][1]
+
+
+def test_health_check_fails_when_schema_not_applied():
+    """Found in staging: a reachable but empty database passed the old
+    connect + SELECT 1 check while every write failed."""
+    rec = Recorder(database_url="postgres://x")
+    rec.enabled, rec._psycopg2 = True, _OkPsycopg(missing=("decisions", "heartbeats"))
+    assert rec.health_check() is False
+    assert "schema not applied" in rec.last_error
+    assert "decisions" in rec.last_error and "heartbeats" in rec.last_error
+    gate = DbHealthGate(rec, alert=_Alerts())
+    assert gate.check() is False and "schema not applied" in gate.last_reason
