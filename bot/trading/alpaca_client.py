@@ -100,6 +100,25 @@ def _order_view(o: dict, parent_id) -> dict:
     }
 
 
+class OrderRejected(RuntimeError):
+    """Alpaca gave a definite rejection (4xx): nothing was placed."""
+
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
+
+
+class OrderOutcomeUnknown(RuntimeError):
+    """The submission's outcome could not be established (response lost and
+    the order could not be found by its client ID). Nothing is resubmitted
+    automatically; the caller must reconcile from broker state first."""
+
+
+def _looks_duplicate_id(exc) -> bool:
+    text = str(exc).lower()
+    return "client_order_id" in text and ("unique" in text or "duplicate" in text or "exists" in text)
+
+
 class OrderBlockedError(RuntimeError):
     """An order action was refused before reaching Alpaca (e.g. this process
     doesn't hold the trading lease). Nothing was sent to the broker."""
@@ -329,6 +348,15 @@ class AlpacaBroker:
         self.order_guard = None
 
         self._trading = TradingClient(api_key, secret_key, paper=self.connects_to_paper)
+        # v3 6b: alpaca-py's REST client retries 429/504 for EVERY method,
+        # including POST /orders, which could create a duplicate order. All
+        # reads are already retried by our own call_with_retry wrapper, and
+        # order writes go through submit_order_once (exactly one attempt).
+        self._trading._retry = 0
+        self._trading._retry_codes = []
+        # 's' staging / 'p' production: prefix of deterministic order IDs.
+        self.env_tag = "p"
+        self.last_order_problem: Optional[str] = None
         self._data = StockHistoricalDataClient(api_key, secret_key)
         self._retry_attempts = retry_attempts
         self._retry_base_delay = retry_base_delay
@@ -896,9 +924,77 @@ class AlpacaBroker:
             "stop_loss": {"stop_price": str(round(stop_price, 2))},
             "client_order_id": client_order_id,
         }
+        # Raw single attempt; the protection manager runs its own
+        # uncertain-submission protocol across sweeps (no blocking lookups).
         return self._raw("POST", "/orders", body, retry=False)
 
     # ---- order placement -----------------------------------------------
+    LOOKUP_DELAYS_S = (1.0, 2.0, 4.0, 8.0)
+
+    def submit_order_once(self, body: dict, kind: str, what: str) -> dict:
+        """THE way orders are created (v3 6b). Exactly one POST; never an
+        automatic resubmission.
+          * accepted            -> the order dict (still not proof it's working)
+          * definite rejection  -> OrderRejected (nothing placed). A duplicate
+                                   client-ID rejection is resolved by looking
+                                   the existing order up and returning it.
+          * ambiguous (timeout, connection error, 5xx)
+                                -> look the client ID up at 1, 2, 4, 8 s; found
+                                   -> that order; otherwise OrderOutcomeUnknown
+        """
+        if not self.allow_submit:
+            raise RuntimeError(f"{what} blocked: order submission is disabled in mode={self.mode}")
+        self._guard(kind, what)
+        cid = body.get("client_order_id")
+        try:
+            return self._raw("POST", "/orders", body, retry=False)
+        except Exception as exc:  # noqa: BLE001
+            if classify_submit_error(exc) == "rejected":
+                if cid and _looks_duplicate_id(exc):
+                    found = self.order_by_client_id(cid)
+                    if found.ok and found.data:
+                        logger.warning("%s: client ID %s already exists at Alpaca; using that order.",
+                                       what, cid)
+                        return found.data
+                raise OrderRejected(f"{what} rejected by Alpaca: {exc}", http_status(exc)) from exc
+            return self._resolve_ambiguous(cid, what, exc)
+
+    def _resolve_ambiguous(self, cid: Optional[str], what: str, exc) -> dict:
+        logger.error("%s: outcome AMBIGUOUS (%s); resolving by client-ID lookup.", what, exc)
+        if not cid:
+            raise OrderOutcomeUnknown(f"{what}: response lost ({exc}) and no client ID to look up")
+        last = "not found"
+        for delay in self.LOOKUP_DELAYS_S:
+            time.sleep(delay)
+            snap = self.order_by_client_id(cid)
+            if snap.ok and snap.data:
+                logger.warning("%s: order %s found after the ambiguous response (status %s).",
+                               what, cid, snap.data.get("status"))
+                return snap.data
+            last = "not found" if snap.ok else f"lookup failed: {snap.error}"
+        raise OrderOutcomeUnknown(
+            f"{what}: response lost ({exc}); order {cid} {last} after 15 s. NOT resubmitted - "
+            "the next attempt must reconcile broker orders and positions first.")
+
+    def _next_exit_client_id(self, kind: str, symbol: str, position: dict) -> Optional[str]:
+        """Deterministic <env><kind>-SYMBOL-<ref>-<n> from broker history, or
+        None if the history can't be read or an earlier attempt is still
+        working (never stack a second order on an unfinished one)."""
+        from .order_ids import attempts_at_broker, position_ref, prefix_for
+
+        fill = self.last_fill(symbol, side="buy")
+        prefix = prefix_for(getattr(self, "env_tag", "p"), kind, symbol,
+                            position_ref(getattr(fill, "order_id", None), position))
+        hist = self.symbol_orders_snapshot(symbol)
+        if not hist.ok:
+            self.last_order_problem = f"order history unreadable ({hist.error})"
+            return None
+        used, working = attempts_at_broker(hist.data, prefix)
+        if working:
+            self.last_order_problem = f"an earlier {kind} order for {symbol} is still working"
+            return None
+        return prefix + str(used + 1)
+
     def _guard(self, kind: str, what: str) -> None:
         """Raise OrderBlockedError if the trading lease (or another guard)
         says this process must not touch orders right now."""
@@ -932,29 +1028,19 @@ class AlpacaBroker:
                 f"mode={self.mode}. This should never be reached in normal operation - the "
                 "strategy layer checks this first; this is the second line of defense."
             )
-        self._guard("entry", f"submit_bracket_buy({symbol})")
-        from alpaca.trading.requests import (
-            MarketOrderRequest,
-            StopLossRequest,
-            TakeProfitRequest,
-        )
-        from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
-
-        req = MarketOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.GTC,
-            order_class=OrderClass.BRACKET,
-            client_order_id=client_order_id,
-            take_profit=TakeProfitRequest(limit_price=round(take_profit_price, 2)),
-            stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
-        )
-        order = self._retry(lambda: self._trading.submit_order(req), f"submit_bracket_buy({symbol})")
+        body = {
+            "symbol": symbol, "qty": str(qty), "side": "buy", "type": "market",
+            "time_in_force": "gtc", "order_class": "bracket",
+            "take_profit": {"limit_price": str(round(take_profit_price, 2))},
+            "stop_loss": {"stop_price": str(round(stop_price, 2))},
+        }
+        if client_order_id:
+            body["client_order_id"] = client_order_id
+        order = self.submit_order_once(body, "entry", f"submit_bracket_buy({symbol})")
         return PlacedOrder(
-            order_id=str(order.id), symbol=symbol, side="buy", qty=qty,
+            order_id=str(order.get("id")), symbol=symbol, side="buy", qty=qty,
             stop_price=round(stop_price, 2), take_profit_price=round(take_profit_price, 2),
-            status=str(order.status),
+            status=str(order.get("status")),
         )
 
     def get_protected_symbols(self) -> Optional[Set[str]]:
@@ -1007,22 +1093,20 @@ class AlpacaBroker:
                 f"mode={self.mode}. This should never be reached in normal operation - the "
                 "strategy layer checks this first; this is the second line of defense."
             )
-        self._guard("protect", f"submit_protective_exit({symbol})")
-        from alpaca.trading.requests import LimitOrderRequest, StopLossRequest, TakeProfitRequest
-        from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
-
-        req = LimitOrderRequest(
-            symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC,
-            order_class=OrderClass.OCO, limit_price=round(take_profit_price, 2),
-            take_profit=TakeProfitRequest(limit_price=round(take_profit_price, 2)),
-            stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
-            client_order_id=client_order_id,
-        )
-        order = self._retry(lambda: self._trading.submit_order(req), f"submit_protective_exit({symbol})")
+        body = {
+            "symbol": symbol, "qty": str(qty), "side": "sell", "type": "limit",
+            "time_in_force": "gtc", "order_class": "oco",
+            "limit_price": str(round(take_profit_price, 2)),
+            "take_profit": {"limit_price": str(round(take_profit_price, 2))},
+            "stop_loss": {"stop_price": str(round(stop_price, 2))},
+        }
+        if client_order_id:
+            body["client_order_id"] = client_order_id
+        order = self.submit_order_once(body, "protect", f"submit_protective_exit({symbol})")
         return PlacedOrder(
-            order_id=str(order.id), symbol=symbol, side="sell", qty=qty,
+            order_id=str(order.get("id")), symbol=symbol, side="sell", qty=qty,
             stop_price=round(stop_price, 2), take_profit_price=round(take_profit_price, 2),
-            status=str(order.status),
+            status=str(order.get("status")),
         )
 
     def cancel_orders_for(self, symbol: str, settle_timeout_s: float = 20.0,
@@ -1079,36 +1163,56 @@ class AlpacaBroker:
             self._guard("exit", f"close_position({symbol})")
         except OrderBlockedError:
             return None   # caller treats as a failed sell; nothing was cancelled
+        self.last_order_problem = None
         # Cancel the open bracket legs FIRST. Otherwise, after we flatten, a
         # leftover stop or limit leg can still execute and open an unintended
         # short position.
         self.cancel_orders_for(symbol)
-        try:
-            # This call races against Alpaca settling the cancel just issued
-            # above: shares stay "held_for_orders" until the cancel fully
-            # clears broker-side, so close_position can fail with
-            # "insufficient qty available" even though cancel_orders_for
-            # already waited. Seen in production: AMZN failed permanently
-            # after the broker's generic 4-attempt/~8s retry budget on
-            # 2026-10-14's market-open cycle (held_for_orders hadn't
-            # cleared yet) and the sentiment-exit sat unfilled - and the
-            # position unprotected from further news-driven moves - for a
-            # full 30-minute cycle until the next run retried it. Give this
-            # specific operation a longer, dedicated retry budget (~30-37s
-            # vs. the broker's shared ~8s default) instead of the generic
-            # self._retry, so a slow-clearing cancel resolves within this
-            # same cycle rather than waiting for the next one.
-            order = call_with_retry(
-                lambda: self._trading.close_position(symbol),
-                attempts=5, base_delay=2.0, max_delay=30.0,
-                op_name=f"close_position({symbol})",
-            )
-            return PlacedOrder(
-                order_id=str(order.id), symbol=symbol, side="sell",
-                qty=int(float(order.qty)) if order.qty else 0,
-                stop_price=0.0, take_profit_price=0.0, status=str(order.status),
-                filled_avg_price=float(order.filled_avg_price) if getattr(order, "filled_avg_price", None) else None,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("close_position failed for %s: %s", symbol, exc)
+        # v3 6b: confirm the actual position from a fresh read, then sell it
+        # with ONE deterministic order (<env>X-SYMBOL-<ref>-<n>) instead of
+        # DELETE /positions (which can't carry a client ID, so a lost
+        # response could never be resolved).
+        pos = self.positions_snapshot()
+        if not pos.ok:
+            self.last_order_problem = f"position unknown ({pos.error}); no sell submitted"
+            logger.error("close_position %s: %s", symbol, self.last_order_problem)
             return None
+        p = (pos.data or {}).get(symbol)
+        if not p or (p.get("qty") or 0) <= 0:
+            self.last_order_problem = "no long position at the broker"
+            return None
+        qty = p["qty"]
+        cid = self._next_exit_client_id("X", symbol, p)
+        if cid is None:
+            logger.error("close_position %s: %s; no sell submitted", symbol, self.last_order_problem)
+            return None
+        body = {"symbol": symbol, "qty": str(qty), "side": "sell", "type": "market",
+                "time_in_force": "day", "client_order_id": cid}
+        # Shares stay "held_for_orders" until the leg cancels settle, so the
+        # sell can be REJECTED with "insufficient qty available" for a few
+        # seconds (seen in production, AMZN 14 Oct). A definite rejection
+        # means nothing was placed, so the same order is retried (up to 5
+        # tries over ~24 s). An ambiguous outcome is never retried.
+        delays = [2.0, 4.0, 8.0, 10.0]
+        while True:
+            try:
+                order = self.submit_order_once(body, "exit", f"close_position({symbol})")
+            except OrderBlockedError as exc:
+                self.last_order_problem = str(exc)
+                return None
+            except OrderOutcomeUnknown as exc:
+                self.last_order_problem = f"OUTCOME UNKNOWN: {exc}"
+                logger.error("close_position %s: %s", symbol, exc)
+                return None
+            except OrderRejected as exc:
+                if "insufficient qty" in str(exc).lower() and delays:
+                    time.sleep(delays.pop(0))
+                    continue
+                self.last_order_problem = str(exc)
+                logger.warning("close_position failed for %s: %s", symbol, exc)
+                return None
+            return PlacedOrder(
+                order_id=str(order.get("id")), symbol=symbol, side="sell", qty=qty,
+                stop_price=0.0, take_profit_price=0.0, status=str(order.get("status")),
+                filled_avg_price=float(order["filled_avg_price"]) if order.get("filled_avg_price") else None,
+            )

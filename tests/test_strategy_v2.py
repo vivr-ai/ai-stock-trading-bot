@@ -1173,37 +1173,58 @@ class _FlakyCloseTradingClient:
         return _Order()
 
 
+def _close_broker(trading, fail_times):
+    """v3 6b: close_position sells with ONE deterministic market order per
+    try; a definite 'insufficient qty' rejection (held_for_orders still
+    settling) is retried with the same client ID, nothing else is."""
+    from types import SimpleNamespace
+
+    from bot.trading.alpaca_client import BrokerSnapshot
+
+    broker = _bare_broker(trading)
+    broker.allow_submit, broker.mode, broker.env_tag, broker.order_guard = True, "paper", "s", None
+    broker.positions_snapshot = lambda: BrokerSnapshot(True, {"AMZN": {"qty": 19.0, "qty_available": 19.0,
+                                                                       "avg_entry_price": 250.0}})
+    broker.last_fill = lambda sym, side=None: SimpleNamespace(order_id="abcdef123456-0000")
+    broker.symbol_orders_snapshot = lambda sym, after_iso=None: BrokerSnapshot(True, [])
+    posts = []
+
+    def raw(method, path, data=None, retry=True):
+        posts.append(dict(data))
+        if len(posts) <= fail_times:
+            raise _HeldForOrdersError("AMZN", existing_qty=19)
+        return {"id": "order-after-settle", "status": "accepted", "client_order_id": data["client_order_id"]}
+
+    broker._raw = raw
+    return broker, posts
+
+
 def test_close_position_outlasts_slow_clearing_cancel(monkeypatch):
     pytest = __import__("pytest")
     pytest.importorskip("alpaca")
     monkeypatch.setattr(time_module, "sleep", lambda *_a, **_k: None)
-
-    # Fails the first 4 attempts - the old budget's entire allowance -
-    # and only succeeds on the 5th, which used to be out of reach.
-    trading = _FlakyCloseTradingClient(fail_times=4)
-    broker = _bare_broker(trading)
-    broker.allow_submit = True
+    trading = _FlakyCloseTradingClient(fail_times=0)
+    broker, posts = _close_broker(trading, fail_times=4)
 
     order = broker.close_position("AMZN")
 
-    assert order is not None
-    assert order.order_id == "order-after-settle"
-    assert trading.calls == 5
+    assert order is not None and order.order_id == "order-after-settle"
+    assert len(posts) == 5
+    assert {p["client_order_id"] for p in posts} == {"sX-AMZN-abcdef123456-1"}   # same ID every try
+    assert posts[0]["qty"] == "19.0" and posts[0]["side"] == "sell"
 
 
 def test_close_position_still_gives_up_eventually(monkeypatch):
-    """Not an infinite retry: exhausting the new budget still returns
-    None (close_position's own except-clause) rather than hanging or
-    raising out to the caller."""
+    """Not an infinite retry: after 5 definite rejections it returns None
+    (with the reason recorded) rather than hanging or raising."""
     pytest = __import__("pytest")
     pytest.importorskip("alpaca")
     monkeypatch.setattr(time_module, "sleep", lambda *_a, **_k: None)
-
-    trading = _FlakyCloseTradingClient(fail_times=10_000)  # never clears
-    broker = _bare_broker(trading)
-    broker.allow_submit = True
+    trading = _FlakyCloseTradingClient(fail_times=0)
+    broker, posts = _close_broker(trading, fail_times=10_000)
 
     order = broker.close_position("AMZN")
 
     assert order is None
-    assert trading.calls == 5  # bounded by the new budget, not unbounded
+    assert len(posts) == 5
+    assert "insufficient qty" in broker.last_order_problem

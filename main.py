@@ -134,6 +134,7 @@ def build(cfg):
     # EXPECTED_ALPACA_ACCOUNT_NUMBER is set). Raises -> process exits before
     # any cycle or order can run. See bot/deployment_guard.py.
     account_masked = verify_account_identity(cfg, broker)
+    broker.env_tag = "s" if cfg.deployment.is_staging else "p"
     universe = get_universe_provider(cfg)
     news = get_news_provider(cfg)
     analyzer = get_sentiment_analyzer(cfg)

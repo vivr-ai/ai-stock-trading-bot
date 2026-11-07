@@ -2000,8 +2000,15 @@ class SentimentStrategy:
                     symbol, plan.qty, plan.stop_price, plan.take_profit_price,
                     client_order_id=f"{symbol}-{slot}",
                 )
-            except Exception as exc:  # noqa: BLE001 - order failed even after retries
-                logger.error("BUY %s failed after retries: %s", symbol, exc,
+            except Exception as exc:  # noqa: BLE001 - one attempt; see submit_order_once
+                if type(exc).__name__ == "OrderOutcomeUnknown":
+                    # Possibly placed: never resubmitted. Next cycle's pending-
+                    # order check and the broker reconciliation will show it.
+                    self.recorder.record_notification(
+                        type_="error", severity="critical",
+                        title=f"BUY {symbol}: outcome unknown (not retried)", message=str(exc),
+                    )
+                logger.error("BUY %s failed: %s", symbol, exc,
                             extra={"symbol": symbol, "decision": "buy_failed", "error": str(exc)})
                 self.recorder.record_decision(symbol=symbol, decision="buy_failed",
                                               reason=str(exc), sentiment_score=sentiment.score,
@@ -2161,12 +2168,24 @@ class SentimentStrategy:
 
         order = self.broker.close_position(symbol)
         if order is None:
-            logger.error("SELL %s failed (close_position returned no order)", symbol,
+            problem = getattr(self.broker, "last_order_problem", None) or "close_position returned no order"
+            unknown = "OUTCOME UNKNOWN" in str(problem)
+            logger.error("SELL %s failed: %s", symbol, problem,
                         extra={"symbol": symbol, "decision": "sell_failed"})
             self.recorder.record_notification(
-                type_="error", severity="warning", title=f"SELL {symbol} failed",
-                message="close_position returned no order",
+                type_="error", severity="critical" if unknown else "warning",
+                title=f"SELL {symbol} failed" + (" - outcome unknown, not retried" if unknown else ""),
+                message=str(problem),
             )
+            # The close cancels the bracket legs first, so a failed sell can
+            # leave the position without a stop. Re-check protection NOW
+            # (restores it if confirmed missing; never acts on UNKNOWN).
+            protection = getattr(self, "protection", None)
+            if protection is not None:
+                try:
+                    protection.sweep()
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Post-failure protection sweep failed for %s: %s", symbol, exc)
             return False
         logger.info("Submitted CLOSE %s: order %s (%s)", symbol, order.order_id, reason,
                     extra={"symbol": symbol, "decision": "sell", "dry_run": False,

@@ -46,6 +46,7 @@ from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 from ..trading.alpaca_client import (WORKING_STATUSES, OrderBlockedError, classify_submit_error)
+from ..trading.order_ids import attempts_at_broker, order_id, position_ref  # noqa: F401 - re-exported
 
 logger = logging.getLogger(__name__)
 
@@ -86,33 +87,6 @@ def classify(positions: Optional[Dict[str, dict]], orders: Optional[List[dict]])
         else:
             out[sym] = (UNPROTECTED, 0.0)
     return out
-
-
-def position_ref(entry_order_id: Optional[str], position: dict) -> str:
-    if entry_order_id:
-        return re.sub(r"[^0-9a-f]", "", str(entry_order_id).lower())[:12] or "unknown"
-    # No buy order on record: derive from the position itself so every
-    # instance computes the same reference.
-    return f"u{int(round((position.get('avg_entry_price') or 0) * 100))}q{int(position.get('qty') or 0)}"
-
-
-def order_id(env_tag: str, kind: str, symbol: str, ref: str, attempt: int) -> str:
-    return f"{env_tag}{kind}-{symbol}-{ref}-{attempt}"
-
-
-def attempts_at_broker(orders: List[dict], prefix: str) -> Tuple[int, bool]:
-    """(highest attempt number already used, any of them still working)."""
-    best, working = 0, False
-    for o in orders:
-        cid = o.get("client_order_id") or ""
-        if not cid.startswith(prefix):
-            continue
-        tail = cid[len(prefix):]
-        if tail.isdigit():
-            best = max(best, int(tail))
-        if o.get("status") in WORKING_STATUSES:
-            working = True
-    return best, working
 
 
 # ---- per-symbol tracking -------------------------------------------------------
