@@ -19,12 +19,14 @@ from __future__ import annotations
 
 import decimal
 import json
+import time
 import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+_sleep = time.sleep   # patched in tests
 
 
 def _row_to_dict(cols, row) -> Dict[str, Any]:
@@ -65,6 +67,13 @@ class Recorder:
         # Optional bot/reliability/journal.Journal: failed writes are appended
         # there instead of being dropped (set by main.build).
         self.journal = None
+        # 2G: set when a CRITICAL write fails; cleared only after the DB gate
+        # reconciles. Non-critical failures don't set it.
+        self.critical_failed = False
+        self.noncritical_failing = False
+        self.on_noncritical_failure = None
+        self.on_noncritical_recovered = None
+        self._retry_budget = self.RETRY_BUDGET_PER_CYCLE_S
         if self.enabled:
             try:
                 import psycopg2  # noqa: F401
@@ -82,12 +91,12 @@ class Recorder:
                         "(bot still runs normally on CSV/JSON logs only).")
 
     # ---- internals ---------------------------------------------------
-    def _journal_failed_write(self, sql: str, params: Dict[str, Any]) -> None:
+    def _journal_failed_write(self, sql: str, params: Dict[str, Any], critical: bool = False) -> None:
         if self.journal is None:
             return
         first = " ".join(sql.split())[:80]
         self.journal.append("db_write", {"statement": first, "sql": sql, "params": params,
-                                         "error": self.last_error})
+                                         "error": self.last_error, "critical": critical})
 
     def health_check(self) -> bool:
         """Cheap connectivity check (connect + SELECT 1), run once per cycle
@@ -164,28 +173,79 @@ class Recorder:
             except Exception:  # noqa: BLE001
                 pass
 
-    def _execute(self, sql: str, params: Dict[str, Any]) -> None:
+    # ---- Reliability v3 (2G): critical vs non-critical writes -------------
+    # Critical = trading state the bot relies on (trades, closed_trades,
+    # trailing peaks, stagnation checkpoints). A critical failure blocks NEW
+    # entries until the DB health check AND a reconciliation succeed (see
+    # bot/reliability/db_gate.py). Non-critical = analytics and status
+    # (decisions, heartbeats, notifications, snapshots): retried briefly,
+    # then journalled; never blocks trading, alerted once an hour.
+    # Neither class ever blocks an exit. Missing analytics rows are never
+    # treated as broker state: positions/orders always come from Alpaca.
+    RETRY_DELAYS_S = (0.5, 1.0, 2.0)
+    RETRY_BUDGET_PER_CYCLE_S = 5.0
+
+    def begin_cycle(self) -> None:
+        """Reset the per-cycle retry budget (called by the DB gate)."""
+        self._retry_budget = self.RETRY_BUDGET_PER_CYCLE_S
+
+    def _note_critical_failure(self, exc) -> None:
+        self.critical_failed = True
+        self.healthy = False
+        self.last_error = str(exc)
+
+    def _execute(self, sql: str, params: Dict[str, Any], critical: bool = False) -> None:
         if not self.enabled:
             return
+        budget = getattr(self, "_retry_budget", self.RETRY_BUDGET_PER_CYCLE_S)
+        delays = list(self.RETRY_DELAYS_S)
+        while True:
+            err = self._execute_once(sql, params)
+            if err is None:
+                if not critical and getattr(self, "noncritical_failing", False):
+                    self.noncritical_failing = False
+                    cb = getattr(self, "on_noncritical_recovered", None)
+                    if cb:
+                        cb()
+                if critical or not getattr(self, "critical_failed", False):
+                    self.healthy, self.last_error = True, None
+                return
+            if delays and budget >= delays[0]:
+                d = delays.pop(0)
+                budget -= d
+                self._retry_budget = budget
+                _sleep(d)
+                continue
+            break
+        self.last_error = str(err)
+        if critical:
+            logger.warning("CRITICAL DB write failed (journaled; new entries blocked): %s", err)
+            self._note_critical_failure(err)
+        else:
+            logger.warning("Non-critical DB write failed (journaled; trading continues): %s", err)
+            self.healthy = False          # reported as a DB problem, but does not block entries
+            self.noncritical_failing = True
+            cb = getattr(self, "on_noncritical_failure", None)
+            if cb:
+                try:
+                    cb(str(err))
+                except Exception:  # noqa: BLE001
+                    pass
+        self._journal_failed_write(sql, params, critical=critical)
+
+    def _execute_once(self, sql: str, params: Dict[str, Any]):
+        """One attempt. Returns None on success, the exception otherwise."""
         try:
             conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Dashboard DB connect failed (row journaled locally): %s", exc)
-            self.healthy = False
-            self.last_error = str(exc)
-            self._journal_failed_write(sql, params)
-            return
+            return exc
         try:
             with conn:
                 with conn.cursor() as cur:
                     cur.execute(sql, params)
-            self.healthy = True
-            self.last_error = None
+            return None
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Dashboard DB write failed (row journaled locally): %s", exc)
-            self.healthy = False
-            self.last_error = str(exc)
-            self._journal_failed_write(sql, params)
+            return exc
         finally:
             try:
                 conn.close()
@@ -355,6 +415,7 @@ class Recorder:
                  reason=reason, rationale=rationale, dry_run=dry_run, order_id=order_id,
                  status=status, sector=sector, market_regime=market_regime, entry_path=entry_path,
                  strategy_version=strategy_version),
+            critical=True,
         )
 
     def record_closed_trade(self, *, symbol: str, qty: float, entry_price: float, exit_price: float,
@@ -384,6 +445,7 @@ class Recorder:
                  buy_reason=buy_reason, news_summary=news_summary,
                  sector=sector, confidence_score=confidence_score, confidence_label=confidence_label,
                  market_regime=market_regime, strategy_version=strategy_version),
+            critical=True,
         )
 
     # ---- reads (for the bot's OWN daily/weekly performance report) ----
@@ -843,6 +905,7 @@ class Recorder:
             conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Dashboard DB connect failed (peak update dropped for %s): %s", symbol, exc)
+            self._note_critical_failure(exc)
             return
         try:
             with conn:
@@ -859,6 +922,7 @@ class Recorder:
                     )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Dashboard DB peak update failed for %s: %s", symbol, exc)
+            self._note_critical_failure(exc)
         finally:
             try:
                 conn.close()
@@ -880,6 +944,7 @@ class Recorder:
             conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Dashboard DB connect failed (peak reset dropped for %s): %s", symbol, exc)
+            self._note_critical_failure(exc)
             return
         try:
             with conn:
@@ -895,6 +960,7 @@ class Recorder:
                     )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Dashboard DB peak reset failed for %s: %s", symbol, exc)
+            self._note_critical_failure(exc)
         finally:
             try:
                 conn.close()
@@ -989,6 +1055,7 @@ class Recorder:
             conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Dashboard DB connect failed (stagnation range update dropped for %s): %s", symbol, exc)
+            self._note_critical_failure(exc)
             return
         try:
             with conn:
@@ -1007,6 +1074,7 @@ class Recorder:
                     )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Dashboard DB stagnation range update failed for %s: %s", symbol, exc)
+            self._note_critical_failure(exc)
         finally:
             try:
                 conn.close()
@@ -1028,6 +1096,7 @@ class Recorder:
             conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Dashboard DB connect failed (stagnation reset dropped for %s): %s", symbol, exc)
+            self._note_critical_failure(exc)
             return
         try:
             with conn:
@@ -1048,6 +1117,7 @@ class Recorder:
                     )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Dashboard DB stagnation reset failed for %s: %s", symbol, exc)
+            self._note_critical_failure(exc)
         finally:
             try:
                 conn.close()

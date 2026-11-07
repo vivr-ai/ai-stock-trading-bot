@@ -51,6 +51,9 @@ class DbHealthGate:
         True if new entries are allowed this cycle."""
         if not self.enabled:
             return True
+        begin = getattr(self.recorder, "begin_cycle", None)
+        if callable(begin):
+            begin()
         try:
             ok = bool(self.recorder.health_check())
         except Exception as exc:  # noqa: BLE001
@@ -59,6 +62,10 @@ class DbHealthGate:
         if not ok:
             self._mark_down(getattr(self.recorder, "last_error", None) or "health check failed")
             return False
+        if getattr(self.recorder, "critical_failed", False) and self.state == HEALTHY:
+            # A critical write failed since the last check: reconcile before
+            # entries resume, even though the DB answers again.
+            self._mark_down(getattr(self.recorder, "last_error", None) or "critical write failed")
         if self.state in (DOWN, RECONCILING):
             self._try_reconcile()
         return self.state == HEALTHY
@@ -67,8 +74,16 @@ class DbHealthGate:
     def entries_allowed(self) -> bool:
         if not self.enabled:
             return True
-        if not getattr(self.recorder, "healthy", True):
-            # A write failed mid-cycle: stop entries for the rest of the cycle.
+        if hasattr(self.recorder, "critical_failed"):
+            # v3 2G: only a failed CRITICAL write (trades, closed trades,
+            # trailing/stagnation state) blocks entries; analytics writes
+            # are retried and journalled without interrupting trading.
+            failed = bool(self.recorder.critical_failed)
+        else:
+            failed = not getattr(self.recorder, "healthy", True)
+        if failed:
+            # A critical write failed mid-cycle: stop entries until the DB is
+            # healthy AND a reconciliation pass succeeds.
             self._mark_down(getattr(self.recorder, "last_error", None) or "write failed mid-cycle")
             return False
         return self.state == HEALTHY
@@ -102,6 +117,8 @@ class DbHealthGate:
         now = self.clock()
         if ok:
             self.state, self.last_reason = HEALTHY, "healthy"
+            if getattr(self.recorder, "critical_failed", False):
+                self.recorder.critical_failed = False
             logger.info("DB health gate: HEALTHY (%s)", summary)
             if was_down:
                 if self.down_since is not None:

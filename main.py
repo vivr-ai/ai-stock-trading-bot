@@ -170,6 +170,13 @@ def build(cfg):
         alerts.raise_("journal_not_durable", f"Journal is not durable: {where}.", "warning",
                       repeat_s=86400)
     base_recorder.journal = journal
+    # v3 2G: analytics/status writes that fail after bounded retries are
+    # journalled and alerted (once an hour at most); they never block trading.
+    base_recorder.on_noncritical_failure = lambda err: alerts.raise_(
+        "db_noncritical", "Some non-critical database writes (decisions, heartbeats, snapshots) "
+        f"are failing; they are journalled and trading continues. Error: {err}", "warning", 3600)
+    base_recorder.on_noncritical_recovered = lambda: alerts.resolve(
+        "db_noncritical", "Non-critical database writes are succeeding again.")
     recorder = NotificationService(base_recorder, telegram=telegram)
     # Stage 2: DB health gate - blocks NEW entries while the DB is down or
     # until reconciliation succeeds (incl. after every restart), alerts
