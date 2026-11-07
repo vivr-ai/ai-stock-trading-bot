@@ -8,6 +8,7 @@
  * because nothing currently calls it, not because it's still correct -
  * safe to delete next time you're editing locally.
  */
+import { heartbeatState } from "@/lib/botSchedule";
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
@@ -18,7 +19,6 @@ export const dynamic = "force-dynamic";
 // A heartbeat older than this is treated as "Stopped" - the scheduler runs
 // every 30 min during market hours, so a 45-min gap means something's wrong
 // (or the market's closed and the bot correctly went quiet).
-const STALE_HEARTBEAT_MINUTES = 45;
 
 type Heartbeat = {
   ts: string;
@@ -74,11 +74,12 @@ export async function GET() {
     const heartbeatAgeMinutes = heartbeat
       ? (now - new Date(heartbeat.ts).getTime()) / 60000
       : null;
+    const hbState = heartbeatState(heartbeat?.ts ?? null);
     const botStatus =
-      heartbeat && heartbeatAgeMinutes !== null && heartbeatAgeMinutes < STALE_HEARTBEAT_MINUTES
+      heartbeat && hbState !== "stopped"
         ? heartbeat.status === "error"
           ? "error"
-          : "running"
+          : hbState
         : "stopped";
 
     const portfolioValue = heartbeat?.portfolio_value ?? null;

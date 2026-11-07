@@ -31,9 +31,9 @@ type SystemHealthResponse = {
     daytradeCount: number | null;
     patternDayTrader: boolean | null;
   };
-  botStatus: "running" | "stopped" | "error";
+  botStatus: "running" | "idle" | "stopped" | "error";
   scheduler: {
-    status: "running" | "stopped" | "error";
+    status: "running" | "idle" | "stopped" | "error";
     lastMode: string | null;
     lastFailure: { ts: string; message: string | null } | null;
   };

@@ -1,3 +1,4 @@
+import { heartbeatState } from "@/lib/botSchedule";
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
@@ -77,7 +78,9 @@ export async function GET() {
     ]);
 
     const heartbeatAgeMinutes = minutesAgo(heartbeat?.ts ?? null);
-    const heartbeatStale = heartbeatAgeMinutes == null || heartbeatAgeMinutes > STALE_HEARTBEAT_MINUTES;
+    // Outside the weekday 09:00-16:00 NY scheduler window no heartbeat is
+    // expected; only an overdue one counts as stale (lib/botSchedule.ts).
+    const heartbeatStale = heartbeatState(heartbeat?.ts ?? null) === "stopped";
 
     const checklist: ChecklistItem[] = [];
 

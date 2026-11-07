@@ -112,6 +112,11 @@ export default function StrategyVersionsPage() {
             compare. Creating a new version is the only action that changes what new trades are
             tagged with going forward - it never edits the trading engine's code or config directly.
           </p>
+          <p className="mt-2 text-xs text-muted">
+            Caution: before v3 (1 Nov 2026) the version tag was kept only in the bot&apos;s temporary local
+            state and was lost on every redeploy, so many trades made under v2 are counted under v1 here. Treat
+            the v1 and v2 figures as approximate; v3 onwards is recorded reliably.
+          </p>
         </div>
         <button
           onClick={() => setShowCreate(true)}

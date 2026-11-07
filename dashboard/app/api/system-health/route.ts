@@ -1,3 +1,4 @@
+import { heartbeatState } from "@/lib/botSchedule";
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
@@ -9,7 +10,6 @@ export const dynamic = "force-dynamic";
 // runs every 30 min during market hours, so a longer gap than this means
 // something's actually wrong (or the market's closed, which is handled
 // separately via market_open).
-const STALE_HEARTBEAT_MINUTES = 45;
 // Notifications this recent are still considered "active" for a
 // connectivity/failure banner, even if the very latest heartbeat looks fine.
 const RECENT_ISSUE_WINDOW_MINUTES = 60;
@@ -231,19 +231,21 @@ export async function GET() {
     const railway = await railwayPromise;
 
     const heartbeatAgeMinutes = minutesAgo(heartbeat?.ts ?? null);
-    const heartbeatStale =
-      heartbeatAgeMinutes == null || heartbeatAgeMinutes > STALE_HEARTBEAT_MINUTES;
+    // Overdue only relative to the scheduler window (lib/botSchedule.ts):
+    // evenings and weekends with no heartbeat are "idle", not "stopped".
+    const hbState = heartbeatState(heartbeat?.ts ?? null);
+    const heartbeatStale = hbState === "stopped";
 
     // Bot / scheduler status: recency of any heartbeat is itself proof the
     // scheduler is alive (a heartbeat is written every cycle, market open or
     // not), independent of whether the trading cycle itself hit an error.
-    let botStatus: "running" | "stopped" | "error";
+    let botStatus: "running" | "idle" | "stopped" | "error";
     if (!heartbeat || heartbeatStale) {
       botStatus = "stopped";
     } else if (heartbeat.status === "error" || lastSchedulerFailure) {
       botStatus = "error";
     } else {
-      botStatus = "running";
+      botStatus = hbState;
     }
 
     // Alpaca connectivity: a heartbeat with status='error' is written
@@ -262,11 +264,11 @@ export async function GET() {
       alpacaStatus = "connected";
     }
 
-    const schedulerStatus: "running" | "stopped" | "error" = lastSchedulerFailure
+    const schedulerStatus: "running" | "idle" | "stopped" | "error" = lastSchedulerFailure
       ? "error"
       : heartbeatStale
       ? "stopped"
-      : "running";
+      : hbState;
 
     return NextResponse.json({
       hasAnyData: Boolean(heartbeat),

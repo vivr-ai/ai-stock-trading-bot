@@ -169,7 +169,7 @@ export default function RiskDashboardPage() {
               }
             />
             <StatCard
-              label="Today's P/L"
+              label="Day P/L (latest session)"
               value={fmtPct(data.dailyPnlPct)}
               tone={data.dailyLossBreached ? "loss" : data.dailyPnlPct != null && data.dailyPnlPct > 0 ? "gain" : "neutral"}
               sublabel={data.dailyLossBreached ? "Daily loss limit breached" : undefined}

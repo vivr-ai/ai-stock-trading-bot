@@ -1,3 +1,4 @@
+import { heartbeatState, nyDate } from "@/lib/botSchedule";
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
@@ -14,7 +15,6 @@ export const dynamic = "force-dynamic";
 // Mirrors /api/status and /api/system-health's threshold - the scheduler
 // runs every 30 min during market hours, so a longer gap means the bot has
 // actually stopped (or the market's closed, handled separately).
-const STALE_HEARTBEAT_MINUTES = 45;
 
 // ---- Market-hours heuristics ---------------------------------------------
 // The dashboard has no direct Alpaca/exchange-calendar connection - only
@@ -188,7 +188,15 @@ export async function GET() {
          FROM heartbeats ORDER BY ts DESC LIMIT 1`
       ),
       queryOne<LastTrade>(
-        `SELECT ts, action, symbol, qty, price FROM trades ORDER BY ts DESC LIMIT 1`
+        // A sell is recorded the moment its market order is submitted, before
+        // it fills, so trades.price is 0 for sells. Use the matching closed
+        // trade's exit price (recorded within the following cycles) instead.
+        `SELECT t.ts, t.action, t.symbol, t.qty,
+                CASE WHEN coalesce(t.price, 0) > 0 THEN t.price
+                     ELSE (SELECT c.exit_price FROM closed_trades c
+                           WHERE c.symbol = t.symbol AND c.ts >= t.ts - interval '5 minutes'
+                           ORDER BY c.ts ASC LIMIT 1) END AS price
+         FROM trades t ORDER BY t.ts DESC LIMIT 1`
       ),
       queryOne<LatestDecision>(
         `SELECT ts, symbol, decision, reason, sentiment_score, sentiment_label, rationale
@@ -202,7 +210,9 @@ export async function GET() {
         "SELECT count(*) FROM strategy_recommendations WHERE status = 'pending'"
       ),
       query<{ ts: string; portfolio_value: number | null; cash: number | null }>(
-        "SELECT ts, portfolio_value, cash FROM portfolio_snapshots ORDER BY ts ASC LIMIT 5000"
+        // Newest 5000 (in time order): ASC LIMIT would silently drop the most
+        // recent snapshots once there are more than 5000 of them.
+        "SELECT ts, portfolio_value, cash FROM (SELECT ts, portfolio_value, cash FROM portfolio_snapshots ORDER BY ts DESC LIMIT 5000) s ORDER BY ts ASC"
       ),
       queryOne<{ count: string; wins: string; total_pnl: string | null }>(
         `SELECT count(*), count(*) FILTER (WHERE pnl > 0) AS wins, sum(pnl) as total_pnl
@@ -248,13 +258,15 @@ export async function GET() {
     const heartbeatAgeMinutes = heartbeat
       ? (now.getTime() - new Date(heartbeat.ts).getTime()) / 60000
       : null;
-    const botRunning =
-      Boolean(heartbeat) && heartbeatAgeMinutes !== null && heartbeatAgeMinutes < STALE_HEARTBEAT_MINUTES;
-    const botStatus: "running" | "stopped" | "error" = !botRunning
+    // "idle" outside the scheduler's weekday 09:00-16:00 NY window, when no
+    // heartbeat is expected (see lib/botSchedule.ts).
+    const hbState = heartbeatState(heartbeat?.ts ?? null, now);
+    const botRunning = hbState !== "stopped";
+    const botStatus: "running" | "idle" | "stopped" | "error" = hbState === "stopped"
       ? "stopped"
       : heartbeat!.status === "error" || Boolean(recentSchedulerFailure)
       ? "error"
-      : "running";
+      : hbState;
 
     // ---- Portfolio ----
     // The latest heartbeat is written every ~30 min regardless of whether
@@ -280,9 +292,30 @@ export async function GET() {
         : null;
 
     const realizedToday = todaysClosedTrades?.total_pnl ? Number(todaysClosedTrades.total_pnl) : 0;
-    // Closed trades only (realized). Unrealized P/L on held positions moves
-    // with price and is shown on the Portfolio page's total row instead.
-    const todaysPl = realizedToday;
+    // Day P/L = change in total portfolio value (realized + unrealized) over
+    // the latest trading session: the latest known value minus the last
+    // snapshot from the PREVIOUS New York trading day (the prior close) -
+    // the same basis as Alpaca's equity vs last_equity, which the bot's 4%
+    // daily-loss limit uses. Previously this showed only trades closed today
+    // (realized), which stayed at $0.00 on most days.
+    const valueAsOf = heartbeat?.portfolio_value != null ? heartbeat.ts : latestSnapshotRow?.ts ?? null;
+    const session = valueAsOf ? nyDate(valueAsOf) : null;
+    let priorClose: number | null = null;
+    if (session) {
+      for (let i = snapshots.length - 1; i >= 0; i--) {
+        const sn = snapshots[i];
+        if (sn.portfolio_value != null && nyDate(sn.ts) < session) {
+          priorClose = Number(sn.portfolio_value);
+          break;
+        }
+      }
+    }
+    const todaysPl =
+      portfolioValue != null && priorClose != null ? Number(portfolioValue) - priorClose : realizedToday;
+    const dayPlPct =
+      portfolioValue != null && priorClose != null && priorClose > 0
+        ? ((Number(portfolioValue) - priorClose) / priorClose) * 100
+        : null;
 
     // ---- Trading activity ----
     const tradesToday = todaysClosedTrades ? Number(todaysClosedTrades.count) : 0;
@@ -307,17 +340,27 @@ export async function GET() {
     }
 
     // ---- Risk snapshot ----
-    const startOfDayValue = todayFirstSnapshot?.portfolio_value ?? null;
-    const dailyPnlPct =
-      startOfDayValue && startOfDayValue > 0 && portfolioValue != null
-        ? ((portfolioValue - startOfDayValue) / startOfDayValue) * 100
-        : null;
+    // Same basis as the Day P/L above (prior session close), so the risk
+    // level matches the bot's own daily-loss rule.
+    void todayFirstSnapshot;
+    const dailyPnlPct = dayPlPct;
     const dailyLossBreached = dailyPnlPct != null && dailyPnlPct <= -riskConfig.dailyLossLimitPct;
     const totalExposurePct =
       portfolioValue && portfolioValue > 0
         ? ((portfolioValue - (cashValue ?? 0)) / portfolioValue) * 100
         : null;
-    const drawdownPct = maxDrawdownPct(dailySeries.map((p) => p.value));
+    // "Current drawdown" = how far the latest value sits below the highest
+    // end-of-day value so far (it previously showed the all-time MAXIMUM
+    // drawdown under the "current" label).
+    const dailyValues = dailySeries.map((p) => p.value);
+    const peakValue = dailyValues.length ? Math.max(...dailyValues) : null;
+    const latestValue = portfolioValue != null ? Number(portfolioValue) : dailyValues[dailyValues.length - 1] ?? null;
+    const drawdownPct =
+      peakValue && latestValue != null && peakValue > 0
+        ? Math.max(0, ((peakValue - latestValue) / peakValue) * 100)
+        : null;
+    const maxDrawdownSoFarPct = maxDrawdownPct(dailyValues);
+    void maxDrawdownSoFarPct;
 
     let riskLevel: "normal" | "elevated" | "high" = "normal";
     if (
@@ -382,6 +425,9 @@ export async function GET() {
         value: portfolioValue,
         cash: cashValue,
         todaysPl,
+        dayPlPct,
+        daySession: session,
+        realizedToday,
         weeklyReturnPct: pctReturn(weeklyBaseline),
         monthlyReturnPct: pctReturn(monthlyBaseline),
         lifetimeReturnPct: pctReturn(lifetimeBaseline),
@@ -413,6 +459,7 @@ export async function GET() {
       },
       botStatusPanel: {
         running: botRunning,
+        idle: hbState === "idle",
         lastHeartbeat: heartbeat?.ts ?? null,
         schedulerStatus: heartbeat?.scheduler_status ?? null,
         dryRun: heartbeat?.dry_run ?? null,

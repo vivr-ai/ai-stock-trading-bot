@@ -49,7 +49,7 @@ import {
 type HomeResponse = {
   hasAnyData: boolean;
   statusStrip: {
-    bot: "running" | "stopped" | "error";
+    bot: "running" | "idle" | "stopped" | "error";
     market: "open" | "closed";
     risk: "normal" | "elevated" | "high";
     todaysPl: number;
@@ -58,6 +58,9 @@ type HomeResponse = {
     value: number | null;
     cash: number | null;
     todaysPl: number;
+    dayPlPct?: number | null;
+    daySession?: string | null;
+    realizedToday?: number;
     weeklyReturnPct: number | null;
     monthlyReturnPct: number | null;
     lifetimeReturnPct: number | null;
@@ -78,6 +81,7 @@ type HomeResponse = {
   };
   botStatusPanel: {
     running: boolean;
+    idle?: boolean;
     lastHeartbeat: string | null;
     schedulerStatus: string | null;
     dryRun: boolean | null;
@@ -123,6 +127,11 @@ function fmtMinutes(mins: number | null): string {
   const hours = Math.floor(mins / 60);
   const rem = Math.round(mins % 60);
   return `${hours}h ${rem}m`;
+}
+
+function sessionLabel(isoDate: string): string {
+  const d = new Date(`${isoDate}T12:00:00Z`);
+  return d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" });
 }
 
 export default function HomePage() {
@@ -195,9 +204,9 @@ export default function HomePage() {
           <div className="mb-6 flex flex-wrap items-center gap-x-6 gap-y-2 rounded-xl border border-bg-border bg-bg-panel px-4 py-3">
             <StatusDot
               tone={
-                data.statusStrip.bot === "running" ? "gain" : data.statusStrip.bot === "error" ? "loss" : "neutral"
+                data.statusStrip.bot === "running" ? "gain" : data.statusStrip.bot === "error" || data.statusStrip.bot === "stopped" ? "loss" : "neutral"
               }
-              label={`Bot ${data.statusStrip.bot === "running" ? "running" : data.statusStrip.bot === "error" ? "error" : "stopped"}`}
+              label={`Bot ${data.statusStrip.bot === "running" ? "running" : data.statusStrip.bot === "idle" ? "idle (outside trading hours)" : data.statusStrip.bot === "error" ? "error" : "stopped"}`}
             />
             <StatusDot
               tone={data.statusStrip.market === "open" ? "gain" : "neutral"}
@@ -206,7 +215,7 @@ export default function HomePage() {
             <StatusDot tone={riskDotTone(data.statusStrip.risk)} label={`Risk ${data.statusStrip.risk}`} />
             <StatusDot
               tone={toneFor(data.statusStrip.todaysPl) === "loss" ? "loss" : toneFor(data.statusStrip.todaysPl) === "gain" ? "gain" : "neutral"}
-              label={`Today's P/L ${fmtMoney(data.statusStrip.todaysPl)}`}
+              label={`Day P/L ${fmtMoney(data.statusStrip.todaysPl)}`}
             />
             {data.botControl.isPaused && (
               <span className="ml-auto">
@@ -233,10 +242,16 @@ export default function HomePage() {
             />
             <StatCard
               size="lg"
-              label="Today's P/L"
+              label="Day P/L"
               value={fmtMoney(data.portfolio.todaysPl)}
               tone={toneFor(data.portfolio.todaysPl)}
-              sublabel="Closed trades today (realized only)"
+              sublabel={
+                data.portfolio.daySession
+                  ? `${sessionLabel(data.portfolio.daySession)} session vs prior close` +
+                    (data.portfolio.dayPlPct != null ? ` (${data.portfolio.dayPlPct >= 0 ? "+" : ""}${data.portfolio.dayPlPct.toFixed(2)}%)` : "") +
+                    ` · realized ${fmtMoney(data.portfolio.realizedToday ?? 0)}`
+                  : "Closed trades today (realized only)"
+              }
               icon={<TrendingUp size={15} />}
             />
             <StatCard
@@ -316,9 +331,11 @@ export default function HomePage() {
                 }
                 sublabel={
                   data.tradingActivity.lastTrade
-                    ? `${data.tradingActivity.lastTrade.qty ?? ""} @ ${fmtMoney(
-                        data.tradingActivity.lastTrade.price
-                      )} · ${timeAgo(data.tradingActivity.lastTrade.ts)}`
+                    ? `${data.tradingActivity.lastTrade.qty ?? ""} @ ${
+                        data.tradingActivity.lastTrade.price && Number(data.tradingActivity.lastTrade.price) > 0
+                          ? fmtMoney(data.tradingActivity.lastTrade.price)
+                          : "market (fill pending)"
+                      } · ${timeAgo(data.tradingActivity.lastTrade.ts)}`
                     : "No trades yet"
                 }
               />
@@ -350,7 +367,7 @@ export default function HomePage() {
               <InfoRow
                 label="Running / Paused"
                 value={
-                  <StatusBadge status={data.botControl.isPaused ? "paused" : data.botStatusPanel.running ? "running" : "stopped"} />
+                  <StatusBadge status={data.botControl.isPaused ? "paused" : data.botStatusPanel.idle ? "idle" : data.botStatusPanel.running ? "running" : "stopped"} />
                 }
                 sublabel={data.botStatusPanel.dryRun ? "Dry run (no real orders)" : "Live paper trading"}
               />

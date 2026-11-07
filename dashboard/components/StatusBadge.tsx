@@ -1,5 +1,6 @@
 export type Status =
   | "running"
+  | "idle"
   | "stopped"
   | "error"
   | "open"
@@ -19,6 +20,7 @@ export default function StatusBadge({
 }) {
   const map: Record<string, { label: string; className: string }> = {
     running: { label: "Running", className: "bg-gain/15 text-gain" },
+    idle: { label: "Idle (outside trading hours)", className: "bg-bg-panel2 text-muted" },
     open: { label: "Open", className: "bg-gain/15 text-gain" },
     connected: { label: "Connected", className: "bg-gain/15 text-gain" },
     stopped: { label: "Stopped", className: "bg-loss/15 text-loss" },

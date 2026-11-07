@@ -98,10 +98,10 @@ export default function StrategyPage() {
       >
         <Rule title="News-driven momentum">
           Three things each earn partial credit toward one score out of 1.0: how positive the{" "}
-          <Term definition="A number from -10 to +10 summarizing how positive or negative the recent news coverage is for a stock.">
+          <Term definition="A number from -10 to +10 summarizing how positive or negative the recent news coverage is for a stock. The current scorer counts bullish minus bearish headlines, so in practice it moves in steps of 3 (0, ±3, ±6, ±9, capped at ±10).">
             sentiment
           </Term>{" "}
-          is (50%), how many headlines back it up, up to 5 (20%), and today&apos;s{" "}
+          is (50%), how many recent headlines there are about the stock, up to 5, whatever their tone (20%), and today&apos;s{" "}
           <Term definition="Today's trading volume compared to the recent 20-day average for this time of day. Above 1.0x means more shares are trading than usual - a sign the market has genuinely noticed the news.">
             volume ratio
           </Term>{" "}
@@ -149,30 +149,36 @@ export default function StrategyPage() {
         subtitle="Independent, simple rules layered on top of each other. Any one of them firing is enough — the position doesn't need to fail every check."
       >
         <Rule title="Always on: stop-loss and take-profit">
-          Every position sells the instant it falls <span className="text-loss">10% below entry</span> — a
-          completely separate order, always watching, regardless of anything else below. Alongside it, one mode is
+          Every position has a stop order held at the broker that sells once the price reaches{" "}
+          <span className="text-loss">10% below entry</span> — a completely separate order, always watching,
+          regardless of anything else below. It sells at the market, so a sudden gap can fill a little lower. Alongside it, one mode is
           picked the moment a position opens and never changes mid-trade: a flat{" "}
           <span className="text-gain">+20% take-profit</span> flag (the plain default), or — on this bot&apos;s
           current setting — a{" "}
           <Term definition="A protective exit that follows a position's price upward instead of selling at one fixed target, so a strong winner isn't capped at the same level as a modest one.">
             trailing stop
           </Term>
-          : a distant 50% backstop, arming once the position is up 3%, then selling the moment price falls 7% from
-          its <Term definition="The highest price a position has reached since it was bought.">peak</Term>.
+          : a distant 50% backstop, plus a software check every 30 minutes that sells when the price has fallen
+          7% from its <Term definition="The highest price a position has reached since it was bought.">peak</Term>{" "}
+          while the position is still at least 3% above entry. Because of that second condition, in practice it
+          only fires after a gain of roughly 11% or more; smaller gains that fade are left to the other rules. A
+          corrected version (stays armed once a position is up 3%, never sets its exit below the entry price) is
+          being tested in a separate staging environment and isn&apos;t live yet.
         </Rule>
         <Rule title="Sentiment reversal">
-          Independent of price: a moderate negative reading (-5 or worse) sells early, but only with 3+ headlines
-          behind it. A <span className="text-loss">severe</span> reading (-8 or worse) is trusted with just 1
-          headline — waiting for more confirmation on an already-unambiguous story just rides the loss longer.
+          Independent of price: a negative reading worse than -5 sells early, but only when there are at least 3
+          recent headlines about the stock (of any tone). A <span className="text-loss">severe</span> reading (-8
+          or worse) is trusted with just 1 headline — waiting for more confirmation on an already-unambiguous story just rides the loss longer.
           Moderate-but-thin readings get no software action; the stop-loss/take-profit bracket manages it instead.
         </Rule>
         <Rule title="Time-based exit (stagnation checkpoint)">
           A position that hasn&apos;t hit any rule above is checked after{" "}
-          <span className="text-white">10 trading days</span>: if price hasn&apos;t moved more than{" "}
+          <span className="text-white">10 calendar days</span>: if price hasn&apos;t moved more than{" "}
           <span className="text-white">4%</span> away from its checkpoint at any point in that window, it&apos;s
           closed as going nowhere. If it has moved, the checkpoint resets and the position gets another window
           rather than being force-closed on the calendar alone. Either way, a position closes unconditionally
-          after <span className="text-white">30 days</span> regardless of movement, as a hard outer backstop.
+          after <span className="text-white">30 calendar days</span> regardless of movement, as a hard outer
+          backstop. The checks run with each 30-minute scan, so an exit happens at the first scan after the limit.
         </Rule>
         <div className="grid gap-3 md:grid-cols-2">
           <ExampleCard type="sell" title="Hard stop-loss, no exceptions">
@@ -182,12 +188,12 @@ export default function StrategyPage() {
           </ExampleCard>
           <ExampleCard type="sell" title="Sentiment sours, sells early">
             A stock bought two weeks ago on momentum gets 4 fresh headlines about a product recall — sentiment
-            -6.5, clearing the 3-headline bar. Price hasn&apos;t dropped 10% yet, but the sentiment rule fires
+            -6, clearing the 3-headline bar. Price hasn&apos;t dropped 10% yet, but the sentiment rule fires
             independently, so the bot sells rather than waiting for the stop-loss.
           </ExampleCard>
           <ExampleCard type="sell" title="Severe news needs no confirmation">
             One lawsuit headline drops sentiment straight to -9.0 — normally too thin at 1 headline, but severe
-            enough (past -8) to act on immediately. Contrast: a milder -7.0 on 1 headline stays a hold — bad
+            enough (past -8) to act on immediately. Contrast: a milder -6 on 1 headline stays a hold — bad
             enough to flag, not severe enough to trust alone.
           </ExampleCard>
           <ExampleCard type="sell" title="Trailing stop locks in a big winner">
@@ -196,7 +202,7 @@ export default function StrategyPage() {
             the old flat +20% would have banked.
           </ExampleCard>
           <ExampleCard type="sell" title="Going nowhere gets closed at the checkpoint">
-            Bought at $50, then drifts $48.50-$51 for 10 trading days — never sours enough to trigger the
+            Bought at $50, then drifts $48.50-$51 for 10 days — never sours enough to trigger the
             sentiment exit, never near the stop-loss or take-profit, and never strays more than 4% from the $50
             checkpoint. Closed at roughly breakeven, freeing the slot rather than sitting there indefinitely.
           </ExampleCard>

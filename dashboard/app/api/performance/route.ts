@@ -146,7 +146,10 @@ export async function GET(req: Request) {
       winRatePct: total > 0 ? (wins / total) * 100 : null,
       avgGain: tradeAgg?.avg_gain != null ? Number(tradeAgg.avg_gain) : null,
       avgLoss: tradeAgg?.avg_loss != null ? Number(tradeAgg.avg_loss) : null,
-      maxDrawdownPct: maxDrawdownPct(equityValues),
+      // Measured on end-of-day values, the same basis as Strategy Health,
+      // Strategy Intelligence and Home - previously this used every
+      // intraday snapshot, so it disagreed with them (3.0% vs 2.0%).
+      maxDrawdownPct: maxDrawdownPct(collapseToLast(snapshotsInWindow, dayKey).map((p) => p.value)),
       sharpeRatio: sharpeRatio(dailyReturns.map((d) => d.pct)),
       totalTrades: total,
     });

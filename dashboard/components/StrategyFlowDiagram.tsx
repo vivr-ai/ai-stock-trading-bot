@@ -69,8 +69,8 @@ export default function StrategyFlowDiagram() {
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
           <MiniStep>Stop-loss −10%</MiniStep>
           <MiniStep>Take-profit +20% or trailing pullback</MiniStep>
-          <MiniStep>Sentiment −5 (or −8 severe)</MiniStep>
-          <MiniStep>10d window, moved &lt;4% from checkpoint</MiniStep>
+          <MiniStep>Sentiment below −5 (or −8 severe)</MiniStep>
+          <MiniStep>10-day window, moved &lt;4% from checkpoint</MiniStep>
           <MiniStep>30d hard cap, regardless of movement</MiniStep>
         </div>
       </div>

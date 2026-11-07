@@ -57,10 +57,15 @@ export async function GET() {
       query<OpenPosition>(
         "SELECT symbol, qty, market_value, allocation_pct, current_price, avg_entry_price FROM open_positions ORDER BY market_value DESC NULLS LAST"
       ),
+      // Prior-session close: the last snapshot from an earlier New York
+      // trading day than the latest one (same basis as the bot's daily-loss
+      // rule, equity vs Alpaca's last_equity).
       queryOne<{ portfolio_value: number | null }>(
         `SELECT portfolio_value FROM portfolio_snapshots
-         WHERE ts >= date_trunc('day', now() AT TIME ZONE 'utc') AT TIME ZONE 'utc'
-         ORDER BY ts ASC LIMIT 1`
+         WHERE (ts AT TIME ZONE 'America/New_York')::date <
+               (SELECT (max(ts) AT TIME ZONE 'America/New_York')::date FROM portfolio_snapshots)
+           AND portfolio_value IS NOT NULL
+         ORDER BY ts DESC LIMIT 1`
       ),
       query<{ reason: string | null; ts: string }>(
         `SELECT DISTINCT ON (reason) reason, ts FROM decisions
