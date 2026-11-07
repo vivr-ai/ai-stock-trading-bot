@@ -250,7 +250,10 @@ export function symbolUnderperformanceFindings(trades: ClosedTradeRow[]): Findin
 // have opposite signs, but it IS a heuristic, not a direct read of which
 // bracket leg fired - disclosed in every finding's description.
 function isAutoExit(t: ClosedTradeRow): boolean {
-  return (t.exit_reason ?? "").includes("auto_exit");
+  const r = t.exit_reason ?? "";
+  // Stage 3 reconciled rows record the broker bracket fill they match.
+  return r.includes("auto_exit") || (r.startsWith("reconciled_from_alpaca_fills") &&
+    (r.includes("bracket stop") || r.includes("take-profit")));
 }
 
 export function stopLossFinding(trades: ClosedTradeRow[]): Finding {

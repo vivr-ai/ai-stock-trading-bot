@@ -206,6 +206,14 @@ export function exitReasonCategory(reason: string | null): string {
     r = r.slice(r.indexOf(":") + 1).trim();
   }
   const lower = r.toLowerCase();
+  // Stage 3: round trips rebuilt from Alpaca fills (closed_trades.source =
+  // 'alpaca_fills_reconciliation'); the text says which bracket leg the fill
+  // price matches, when it matches one.
+  if (lower.startsWith("reconciled_from_alpaca_fills")) {
+    if (lower.includes("bracket stop")) return "Stop-loss (reconciled from Alpaca fills)";
+    if (lower.includes("take-profit")) return "Take-profit (reconciled from Alpaca fills)";
+    return "Reconciled from Alpaca fills";
+  }
   if (lower.includes("auto_exit")) {
     if (lower.includes("stop_loss_or_take_profit")) {
       return "Stop-loss / take-profit (pre-fix, unsplit)";
