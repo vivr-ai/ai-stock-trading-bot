@@ -1073,8 +1073,16 @@ class SentimentStrategy:
                 return exposure
 
             # ---- SELL (sentiment leg) - sentiment-momentum positions ----
-            sentiment_reason = self._sentiment_exit_reason(symbol, sentiment)
-            if sentiment_reason:
+            # Stage 4: STRATEGY_SENTIMENT_EXIT_MODE = live (default, today's
+            # behaviour) | shadow (decide and record, never sell) | off (not
+            # evaluated). Scoring and the rule itself are unchanged; every
+            # other exit (trailing, time, broker brackets) runs in all modes.
+            exit_mode = getattr(getattr(self.cfg, "reliability", None), "sentiment_exit_mode", "live")
+            sentiment_reason = (self._sentiment_exit_reason(symbol, sentiment)
+                                if exit_mode in ("live", "shadow") else None)
+            if sentiment_reason and exit_mode == "shadow":
+                self._record_shadow_sentiment_exit(symbol, sentiment, sentiment_reason, lot)
+            elif sentiment_reason:
                 if self._do_sell(symbol, sentiment, reason=sentiment_reason,
                                  entry_path="sentiment_momentum"):
                     self.state.mark_exit(symbol)
@@ -1359,6 +1367,40 @@ class SentimentStrategy:
             if held_days >= cfg.reversion_max_hold_days:
                 return f"max hold of {cfg.reversion_max_hold_days} day(s) reached ({held_days:.1f}d)"
         return None
+
+    def _record_shadow_sentiment_exit(self, symbol, sentiment, reason, lot) -> None:
+        """Stage 4 shadow mode: record everything needed to evaluate the
+        sentiment exit later (what it would have done, on what evidence, at
+        what price) WITHOUT any broker order. Never raises."""
+        try:
+            if getattr(self, "_position_details_cache", None) is None:
+                self._broker_entry_price(symbol)          # fills the per-cycle cache
+            pos = (self._position_details_cache or {}).get(symbol)
+            entry = getattr(pos, "avg_entry_price", None) or (lot or {}).get("entry_price")
+            price = getattr(pos, "current_price", None)
+            if price is None:
+                price = self.broker.latest_price(symbol)
+            extra = {
+                "mode": "shadow", "proposed_exit_reason": reason,
+                "positive_headlines": sentiment.positive_count,
+                "negative_headlines": sentiment.negative_count,
+                "position_qty": getattr(pos, "qty", None),
+                "avg_entry_price": entry, "current_price": price,
+                "unrealized_pct": ((price - entry) / entry * 100.0) if (price and entry) else None,
+                "unrealized_pl": getattr(pos, "unrealized_pl", None),
+                "entry_time": (lot or {}).get("entry_time"),
+            }
+            logger.info("SHADOW sentiment exit for %s (no order placed): %s", symbol, reason,
+                        extra={"symbol": symbol, "decision": "sentiment_exit_shadow", "reason": reason})
+            self.recorder.record_decision(
+                symbol=symbol, decision="sentiment_exit_shadow", reason=reason,
+                sentiment_score=sentiment.score, sentiment_label=sentiment.label,
+                headline_count=sentiment.article_count,
+                positive_headlines=sentiment.positive_count, negative_headlines=sentiment.negative_count,
+                rationale=sentiment.rationale, price=price, extra=extra, entry_path="sentiment_momentum",
+            )
+        except Exception as exc:  # noqa: BLE001 - shadow bookkeeping must never affect trading
+            logger.warning("Shadow sentiment-exit record failed for %s: %s", symbol, exc)
 
     def _sentiment_exit_reason(self, symbol, sentiment) -> Optional[str]:
         """Strategy v3, two-tier sentiment exit for a sentiment-momentum

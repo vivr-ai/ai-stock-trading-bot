@@ -1255,7 +1255,8 @@ class Recorder:
                         WHERE id IN (
                             SELECT id FROM decisions
                             WHERE ts < now() - make_interval(days => %(retention_days)s)
-                              AND decision NOT IN ('reversion_shadow_buy', 'reversion_shadow_exit')
+                              AND decision NOT IN ('reversion_shadow_buy', 'reversion_shadow_exit',
+                                                   'sentiment_exit_shadow')
                             ORDER BY ts
                             LIMIT %(batch_size)s
                         )
