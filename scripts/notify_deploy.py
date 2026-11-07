@@ -34,7 +34,9 @@ def main() -> int:
 
     commit_full = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "")
     commit = commit_full[:7] if commit_full else "unknown"
-    env = os.environ.get("RAILWAY_ENVIRONMENT_NAME", "unknown")
+    # BOT_ENVIRONMENT names the deployment (staging lives in its own Railway
+    # project whose only environment is also called "production").
+    env = (os.environ.get("BOT_ENVIRONMENT") or os.environ.get("RAILWAY_ENVIRONMENT_NAME") or "unknown")
     service = os.environ.get("RAILWAY_SERVICE_NAME", "unknown")
     author = os.environ.get("RAILWAY_GIT_AUTHOR", "")
     message = os.environ.get("RAILWAY_GIT_COMMIT_MESSAGE", "")

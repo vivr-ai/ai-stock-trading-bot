@@ -77,3 +77,50 @@ push to `main`.
 - Paper only. Never live keys.
 - Never point staging at production's `DATABASE_URL` or keys.
 - A change reaches production only by merging to `main`, after explicit approval.
+
+## Reliability plan v3 on staging
+
+Staging runs branch `reliability-v3` with these settings, in addition to the
+variables above. Production has none of them, and every one defaults to
+today's behaviour.
+
+| Variable | Staging value | What it does |
+|---|---|---|
+| `JOURNAL_DIR` | `/data/journal` | Journal on the staging volume (mounted at `/data`), so it survives redeploys |
+| `INSTANCE_LEASE_ENABLED` | `true` | Only the lease holder may place, change or cancel orders |
+| `PROTECTION_SWEEP_ENABLED` | `true` | 5-minute protection sweep; restores missing stops |
+| `STRATEGY_SENTIMENT_EXIT_MODE` | `shadow` | Records sentiment exits without selling |
+| `RISK_TRAILING_V2_ENABLED` | `false` until its turn in the soak | Corrected trailing stop |
+| `EXIT_MANAGER_ENABLED` | `false` | Stage 6 is not built yet |
+| `EXTERNAL_HEARTBEAT_URL` | the Healthchecks.io ping URL | Outside monitor (empty = off) |
+
+### Healthchecks.io (one-time, Vivek)
+
+1. Sign up (free) at https://healthchecks.io.
+2. **Add Check**. Name it `trading-bot-staging`. Under **Schedule** choose
+   **Cron** and enter `0,30 9-15 * * 1-5`. Set the time zone to
+   `America/New_York` and the grace time to **15 minutes**. Save.
+3. **Integrations**: add Email (on by default) and, optionally, Telegram.
+4. Copy the check's ping URL (`https://hc-ping.com/...`) and send it to
+   Claude, who sets it as `EXTERNAL_HEARTBEAT_URL` on the staging service only.
+
+The bot pings only after a successful cycle, including a correctly skipped
+holiday cycle. Weekends expect nothing.
+
+### Verification spike (Stage 6a)
+
+`scripts/alpaca_verify_spike.py` checks Alpaca's real behaviour (duplicate
+client order IDs, bracket group fields, take-profit replacement). It refuses
+to run anywhere except a verified staging paper account. It trades one share
+of VZ, which is outside the bot's universe, and cleans up after itself.
+
+Run it with the bot stopped: temporarily set the staging start command to
+`python scripts/alpaca_verify_spike.py; python main.py`, deploy, read the
+`SPIKE_RESULT` log lines, then restore `python main.py`. V3 needs market hours.
+
+### Rollback
+
+Every v3 feature is a variable. Set it back to the default (or delete it) and
+redeploy. The new tables (`bot_lease`, `bot_lease_events`, `trailing_state`,
+`ledger_corrections`) and the two new `closed_trades` columns are additive.
+The old code ignores them, so switching the branch back is also safe.
