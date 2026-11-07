@@ -625,3 +625,19 @@ CREATE TABLE IF NOT EXISTS ledger_corrections (
     source           TEXT NOT NULL DEFAULT 'alpaca_fills_reconciliation'
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_corrections_trade ON ledger_corrections (closed_trade_id);
+
+-- ---------------------------------------------------------------------
+-- Stage 5: trailing stop v2 state (RISK_TRAILING_V2_ENABLED). Sticky armed
+-- flag and peak per position episode (entry_ref = Alpaca average entry
+-- price), so a restart or DB outage can't disarm it and a new position never
+-- inherits an old one's state. Removed when the position closes.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS trailing_state (
+    symbol       TEXT PRIMARY KEY,
+    entry_ref    TEXT NOT NULL,
+    entry_price  NUMERIC NOT NULL,
+    armed        BOOLEAN NOT NULL DEFAULT false,
+    armed_at     TIMESTAMPTZ,
+    peak_price   NUMERIC NOT NULL,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);

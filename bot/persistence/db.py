@@ -992,6 +992,67 @@ class Recorder:
             except Exception:  # noqa: BLE001
                 pass
 
+    # ---- Stage 5: trailing stop v2 state (critical) -------------------------
+    def get_trailing_state(self, symbol: str):
+        """(ok, row). ok=False means the DB couldn't be read (UNKNOWN), which
+        is different from ok=True, row=None (no stored state)."""
+        if not self.enabled:
+            return True, None
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Trailing-state read failed for %s: %s", symbol, exc)
+            return False, None
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT entry_ref, entry_price, armed, extract(epoch from armed_at), peak_price "
+                        "FROM trailing_state WHERE symbol = %(symbol)s", dict(symbol=symbol))
+                    row = cur.fetchone()
+            if not row:
+                return True, None
+            return True, {"entry_ref": row[0], "entry_price": float(row[1]), "armed": bool(row[2]),
+                          "armed_at": float(row[3]) if row[3] is not None else None,
+                          "peak": float(row[4])}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Trailing-state read failed for %s: %s", symbol, exc)
+            return False, None
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def upsert_trailing_state(self, symbol: str, entry_ref: str, entry_price: float, armed: bool,
+                              armed_at: Optional[float], peak: float) -> None:
+        """Critical write. Within the same position (entry_ref) the stored
+        state only ratchets: armed stays armed, the peak only rises. A new
+        entry_ref (new position) replaces the row."""
+        self._execute(
+            """
+            INSERT INTO trailing_state (symbol, entry_ref, entry_price, armed, armed_at, peak_price, updated_at)
+            VALUES (%(symbol)s, %(ref)s, %(entry)s, %(armed)s,
+                    CASE WHEN %(armed_at)s IS NULL THEN NULL ELSE to_timestamp(%(armed_at)s) END,
+                    %(peak)s, now())
+            ON CONFLICT (symbol) DO UPDATE SET
+                armed = CASE WHEN trailing_state.entry_ref = EXCLUDED.entry_ref
+                             THEN trailing_state.armed OR EXCLUDED.armed ELSE EXCLUDED.armed END,
+                armed_at = CASE WHEN trailing_state.entry_ref = EXCLUDED.entry_ref
+                                THEN coalesce(trailing_state.armed_at, EXCLUDED.armed_at)
+                                ELSE EXCLUDED.armed_at END,
+                peak_price = CASE WHEN trailing_state.entry_ref = EXCLUDED.entry_ref
+                                  THEN GREATEST(trailing_state.peak_price, EXCLUDED.peak_price)
+                                  ELSE EXCLUDED.peak_price END,
+                entry_ref = EXCLUDED.entry_ref, entry_price = EXCLUDED.entry_price, updated_at = now()
+            """,
+            dict(symbol=symbol, ref=entry_ref, entry=entry_price, armed=armed, armed_at=armed_at, peak=peak),
+            critical=True,
+        )
+
+    def clear_trailing_state(self, symbol: str) -> None:
+        self._execute("DELETE FROM trailing_state WHERE symbol = %(symbol)s", dict(symbol=symbol))
+
     def get_stagnation_checkpoint(self, symbol: str) -> Optional[dict]:
         """Durable state for the momentum-exit stagnation gate (see
         SentimentStrategy._momentum_time_exit_reason). The checkpoint

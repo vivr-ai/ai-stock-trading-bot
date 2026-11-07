@@ -822,6 +822,9 @@ class SentimentStrategy:
         if self.recorder is not None:
             self.recorder.clear_position_peak(symbol)
             self.__dict__.setdefault("_mem_peaks", {}).pop(symbol, None)
+            self.__dict__.setdefault("_trail_mem", {}).pop(symbol, None)
+            if hasattr(self.recorder, "clear_trailing_state"):
+                self.recorder.clear_trailing_state(symbol)
             self.recorder.clear_stagnation_checkpoint(symbol)
 
     @staticmethod
@@ -937,6 +940,9 @@ class SentimentStrategy:
         if self.recorder is not None:
             self.recorder.clear_position_peak(symbol)
             self.__dict__.setdefault("_mem_peaks", {}).pop(symbol, None)
+            self.__dict__.setdefault("_trail_mem", {}).pop(symbol, None)
+            if hasattr(self.recorder, "clear_trailing_state"):
+                self.recorder.clear_trailing_state(symbol)
             self.recorder.clear_stagnation_checkpoint(symbol)
 
     def _resolve_lot(self, symbol: str) -> Optional[dict]:
@@ -1700,6 +1706,8 @@ class SentimentStrategy:
         exit)."""
         if not self.cfg.risk.trailing_stop_enabled:
             return False
+        if getattr(getattr(self.cfg, "reliability", None), "trailing_v2_enabled", False):
+            return self._trailing_stop_v2(symbol, sentiment, entry_path, sector_counts, stats)
 
         try:
             price = self.broker.latest_price(symbol)
@@ -1778,6 +1786,93 @@ class SentimentStrategy:
             sector_counts[sector_of(symbol)] -= 1
             stats.sells += 1
         return True
+
+    def _trailing_stop_v2(self, symbol, sentiment, entry_path, sector_counts, stats) -> bool:
+        """Stage 5 corrected trailing stop (RISK_TRAILING_V2_ENABLED; see
+        bot/trading/trailing.py for the rules). State comes from memory and
+        the trailing_state table, merged (armed is sticky, peak only rises);
+        if both are lost it is rebuilt from Alpaca bars since entry. Exits go
+        through _do_sell today; the Stage 5/6 integration routes them to the
+        exit manager instead."""
+        import time as _time
+
+        from .trailing import TrailState, entry_reference, evaluate, merge
+
+        price = self.broker.latest_price(symbol)
+        if price is None or price <= 0:
+            logger.warning("Trailing v2 skipped for %s: no current price", symbol)
+            return False
+        entry = self._broker_entry_price(symbol)           # Alpaca's average entry price
+        if not entry:
+            try:
+                buy = self.recorder.get_last_buy_trade(symbol) or {}
+            except Exception:  # noqa: BLE001
+                buy = {}
+            entry = float(buy.get("price") or 0) or None
+        if not entry:
+            logger.warning("Trailing v2 skipped for %s: no entry price from broker or DB", symbol)
+            return False
+        ref = entry_reference(entry)
+        mem = self.__dict__.setdefault("_trail_mem", {})
+        mem_state = mem.get(symbol)
+        if mem_state is not None and mem_state.entry_ref != ref:
+            mem_state = None                                 # a different (older) position
+        ok, row = (self.recorder.get_trailing_state(symbol)
+                   if hasattr(self.recorder, "get_trailing_state") else (False, None))
+        db_state = None
+        if ok and row and row["entry_ref"] == ref:
+            db_state = TrailState(entry_ref=ref, entry_price=entry, armed=row["armed"],
+                                  armed_at=row["armed_at"], peak=row["peak"])
+        state = merge(mem_state, db_state)
+        if state is None:
+            state = self._recover_trail_state(symbol, ref, entry, price, db_readable=ok)
+        decision = evaluate(state, price, _time.time(),
+                            activation_pct=self.cfg.risk.trailing_stop_activation_pct,
+                            trail_pct=self.cfg.risk.trailing_stop_pct)
+        new = decision.state
+        mem[symbol] = new
+        changed = (state.armed != new.armed or abs((state.peak or 0) - new.peak) > 1e-9
+                   or db_state is None)
+        if changed and hasattr(self.recorder, "upsert_trailing_state"):
+            self.recorder.upsert_trailing_state(symbol, ref, entry, new.armed, new.armed_at, new.peak)
+        if decision.newly_armed:
+            logger.info("Trailing v2 ARMED for %s (peak %.2f, entry %.2f)", symbol, new.peak, entry,
+                        extra={"symbol": symbol, "decision": "trailing_armed"})
+        if not decision.exit:
+            return False
+        logger.info("SELL %s %s", symbol, decision.reason,
+                    extra={"symbol": symbol, "decision": "trailing_stop", "peak": new.peak,
+                           "price": price, "stop_level": decision.stop_level})
+        if self._do_sell(symbol, sentiment, reason=decision.reason, entry_path=entry_path):
+            self.state.mark_exit(symbol)
+            sector_counts[sector_of(symbol)] -= 1
+            stats.sells += 1
+        return True
+
+    def _recover_trail_state(self, symbol, ref, entry, price, db_readable: bool):
+        """Both memory and DB have nothing for this position (first sight, or
+        restart while the DB was down). Rebuild the peak from 15-minute bars
+        since the entry fill so an armed stop isn't silently forgotten."""
+        from .trailing import TrailState
+
+        lot = self._resolve_lot(symbol) or {}
+        since = lot.get("entry_time")
+        peak = max(entry, price)
+        recovered = False
+        if since:
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+
+                start = since if isinstance(since, _dt) else _dt.fromtimestamp(float(since), tz=_tz.utc)
+                high = self.broker.max_high_since(symbol, start)
+                if high:
+                    peak, recovered = max(peak, high), True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Trailing v2 peak recovery failed for %s: %s", symbol, exc)
+        if not db_readable:
+            logger.warning("Trailing v2 for %s: DB unreadable and no in-memory state; peak rebuilt "
+                           "from %s (%.2f).", symbol, "bars" if recovered else "entry/current price", peak)
+        return TrailState(entry_ref=ref, entry_price=entry, armed=False, peak=peak, recovered=recovered)
 
     def _do_buy(self, symbol, sentiment, price, acct, exposure, open_positions,
                 sector_counts, stats, market_regime=None,
@@ -1987,6 +2082,9 @@ class SentimentStrategy:
             # own delete-on-close housekeeping).
             self.recorder.clear_position_peak(symbol)
             self.__dict__.setdefault("_mem_peaks", {}).pop(symbol, None)
+            self.__dict__.setdefault("_trail_mem", {}).pop(symbol, None)
+            if hasattr(self.recorder, "clear_trailing_state"):
+                self.recorder.clear_trailing_state(symbol)
             self.recorder.clear_stagnation_checkpoint(symbol)
             return True
 
