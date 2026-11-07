@@ -27,6 +27,7 @@ from bot.config import load_config
 from bot.logging_utils import ClosedTradeLogger, DailySummaryLogger, TradeLogger
 from bot.news import get_news_provider
 from bot.deployment_guard import verify_account_identity
+from bot.reliability.alerts import AlertDeduper
 from bot.reliability.db_gate import DbHealthGate
 from bot.reliability.heartbeat_ping import ExternalHeartbeat
 from bot.reliability.journal import Journal
@@ -147,9 +148,26 @@ def build(cfg):
                                  label=_env_label(cfg))
                 if cfg.telegram.enabled else TelegramNotifier("", ""))
     base_recorder = Recorder()
-    # Stage 2: failed DB writes go to a local append-only journal instead of
-    # being dropped (copied into journal_events on recovery).
-    journal = Journal(os.path.join(os.path.dirname(cfg.logging.state_path) or "logs", "journal"))
+    # Reliability v3 (2G): one de-duplicated, rate-limited alert channel for
+    # every reliability component (Telegram directly - never via the DB).
+    alerts = AlertDeduper(lambda text, severity: telegram.send(text, severity=severity))
+    # Stage 2 / v3 2F: failed DB writes go to an append-only journal instead
+    # of being dropped (copied into journal_events on recovery). JOURNAL_DIR
+    # should point at a Railway volume so it survives redeploys.
+    rel = cfg.reliability
+    journal = Journal(
+        rel.journal_dir or os.path.join(os.path.dirname(cfg.logging.state_path) or "logs", "journal"),
+        rotate_bytes=int(rel.journal_rotate_mb * 1024 * 1024),
+        max_bytes=int(rel.journal_max_mb * 1024 * 1024),
+        retention_days=rel.journal_retention_days,
+        on_problem=lambda key, text: alerts.raise_(key, f"JOURNAL PROBLEM: {text}", "critical"),
+    )
+    journal.self_test()
+    durable, where = journal.durability()
+    logging.getLogger("main").info("Journal at %s: %s", journal.directory, where)
+    if not durable and cfg.deployment.is_staging:
+        alerts.raise_("journal_not_durable", f"Journal is not durable: {where}.", "warning",
+                      repeat_s=86400)
     base_recorder.journal = journal
     recorder = NotificationService(base_recorder, telegram=telegram)
     # Stage 2: DB health gate - blocks NEW entries while the DB is down or
@@ -171,6 +189,8 @@ def build(cfg):
         closed_trade_logger=closed_trade_logger, recorder=recorder, db_gate=db_gate,
     )
     strategy.telegram = telegram
+    strategy.alerts = alerts
+    strategy.journal = journal
     return broker, summary_logger, reporter, strategy, recorder
 
 
@@ -461,6 +481,12 @@ def main() -> int:
         # Best-effort like the account-activities sync above: a failure just
         # logs a warning and the next day's run picks up where this one left
         # off, never anything that should interrupt trading.
+        try:
+            removed = strategy.journal.cleanup()
+            if removed:
+                log.info("Journal cleanup: removed %d fully-replayed segment(s).", removed)
+        except Exception as exc:  # noqa: BLE001 - housekeeping only
+            log.warning("Journal cleanup failed: %s", exc)
         deleted = recorder.prune_old_decisions(
             retention_days=cfg.retention.decisions_days,
             batch_size=cfg.retention.prune_batch_size,
