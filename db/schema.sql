@@ -593,3 +593,35 @@ CREATE TABLE IF NOT EXISTS bot_lease_events (
     detail  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_bot_lease_events_ts ON bot_lease_events (ts);
+
+-- ---------------------------------------------------------------------
+-- Reliability v3 / Stage 3: ledger reconciliation from Alpaca fills.
+-- Additive only. Existing closed_trades rows are never edited or deleted:
+--   * source: NULL for rows the bot wrote itself; 'alpaca_fills_reconciliation'
+--     for round trips rebuilt from Alpaca fills (approved decision D9).
+--   * broker_sell_order_id: the Alpaca order that closed the trade, unique
+--     when present, so a reconciliation insert can run only once.
+-- ledger_corrections records differences in EXISTING rows (and other
+-- documented history) next to them instead of overwriting them.
+-- ---------------------------------------------------------------------
+ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS source TEXT;
+ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS broker_sell_order_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_closed_trades_broker_sell_order_id
+    ON closed_trades (broker_sell_order_id) WHERE broker_sell_order_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS ledger_corrections (
+    id               BIGSERIAL PRIMARY KEY,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    correction_key   TEXT NOT NULL UNIQUE,      -- deterministic: rerunning adds nothing
+    closed_trade_id  BIGINT,                    -- the existing row it annotates (NULL if none)
+    symbol           TEXT NOT NULL,
+    kind             TEXT NOT NULL,             -- price_difference | entry_time | delayed_execution |
+                                                -- buy_without_trades_row | pre_ledger_round_trip
+    field            TEXT,
+    ledger_value     TEXT,
+    broker_value     TEXT,
+    detail           TEXT,
+    broker_order_ids TEXT,
+    source           TEXT NOT NULL DEFAULT 'alpaca_fills_reconciliation'
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_corrections_trade ON ledger_corrections (closed_trade_id);

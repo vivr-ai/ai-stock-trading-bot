@@ -27,3 +27,4 @@ env/
 # Files the Claude desktop app delivers into this folder (not source) -
 # swept in by an earlier `git add -A` (see fc1afc2) and removed there.
 Claude outputs/
+ledger_export/
