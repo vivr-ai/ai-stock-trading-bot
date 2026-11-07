@@ -1007,14 +1007,14 @@ class Recorder:
             with conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT entry_ref, entry_price, armed, extract(epoch from armed_at), peak_price "
-                        "FROM trailing_state WHERE symbol = %(symbol)s", dict(symbol=symbol))
+                        "SELECT entry_ref, entry_price, armed, extract(epoch from armed_at), peak_price, "
+                        "peak_source FROM trailing_state WHERE symbol = %(symbol)s", dict(symbol=symbol))
                     row = cur.fetchone()
             if not row:
                 return True, None
             return True, {"entry_ref": row[0], "entry_price": float(row[1]), "armed": bool(row[2]),
                           "armed_at": float(row[3]) if row[3] is not None else None,
-                          "peak": float(row[4])}
+                          "peak": float(row[4]), "peak_source": row[5] or "observed"}
         except Exception as exc:  # noqa: BLE001
             logger.warning("Trailing-state read failed for %s: %s", symbol, exc)
             return False, None
@@ -1025,28 +1025,33 @@ class Recorder:
                 pass
 
     def upsert_trailing_state(self, symbol: str, entry_ref: str, entry_price: float, armed: bool,
-                              armed_at: Optional[float], peak: float) -> None:
+                              armed_at: Optional[float], peak: float, peak_source: str = "observed") -> None:
         """Critical write. Within the same position (entry_ref) the stored
         state only ratchets: armed stays armed, the peak only rises. A new
         entry_ref (new position) replaces the row."""
         self._execute(
             """
-            INSERT INTO trailing_state (symbol, entry_ref, entry_price, armed, armed_at, peak_price, updated_at)
+            INSERT INTO trailing_state (symbol, entry_ref, entry_price, armed, armed_at, peak_price,
+                                        peak_source, updated_at)
             VALUES (%(symbol)s, %(ref)s, %(entry)s, %(armed)s,
                     CASE WHEN %(armed_at)s IS NULL THEN NULL ELSE to_timestamp(%(armed_at)s) END,
-                    %(peak)s, now())
+                    %(peak)s, %(src)s, now())
             ON CONFLICT (symbol) DO UPDATE SET
                 armed = CASE WHEN trailing_state.entry_ref = EXCLUDED.entry_ref
                              THEN trailing_state.armed OR EXCLUDED.armed ELSE EXCLUDED.armed END,
                 armed_at = CASE WHEN trailing_state.entry_ref = EXCLUDED.entry_ref
                                 THEN coalesce(trailing_state.armed_at, EXCLUDED.armed_at)
                                 ELSE EXCLUDED.armed_at END,
+                peak_source = CASE WHEN trailing_state.entry_ref = EXCLUDED.entry_ref
+                                        AND trailing_state.peak_price >= EXCLUDED.peak_price
+                                   THEN trailing_state.peak_source ELSE EXCLUDED.peak_source END,
                 peak_price = CASE WHEN trailing_state.entry_ref = EXCLUDED.entry_ref
                                   THEN GREATEST(trailing_state.peak_price, EXCLUDED.peak_price)
                                   ELSE EXCLUDED.peak_price END,
                 entry_ref = EXCLUDED.entry_ref, entry_price = EXCLUDED.entry_price, updated_at = now()
             """,
-            dict(symbol=symbol, ref=entry_ref, entry=entry_price, armed=armed, armed_at=armed_at, peak=peak),
+            dict(symbol=symbol, ref=entry_ref, entry=entry_price, armed=armed, armed_at=armed_at, peak=peak,
+                 src=peak_source),
             critical=True,
         )
 

@@ -664,26 +664,28 @@ class AlpacaBroker:
         )
 
     def max_high_since(self, symbol: str, since: datetime) -> Optional[float]:
-        """Highest 15-minute bar high (IEX, regular and extended) since
-        `since`. Used only to rebuild a trailing-stop peak when both the
-        database and the in-memory copy were lost. None if unavailable."""
-        from alpaca.data.enums import DataFeed
+        """Highest high of COMPLETED 15-minute regular-session bars (IEX,
+        unadjusted prices) since `since`. Used only to rebuild a trailing-stop
+        peak when both the database and in-memory copies were lost. None if
+        unavailable."""
+        from alpaca.data.enums import Adjustment, DataFeed
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+        from .trailing import completed_session_high
 
         try:
             resp = self._retry(
                 lambda: self._data.get_stock_bars(StockBarsRequest(
                     symbol_or_symbols=symbol, timeframe=TimeFrame(15, TimeFrameUnit.Minute),
-                    start=since, feed=DataFeed.IEX)),
+                    start=since, feed=DataFeed.IEX, adjustment=Adjustment.RAW)),
                 f"get_stock_bars_15m({symbol})",
             )
             series = resp.data.get(symbol) if hasattr(resp, "data") else resp[symbol]
         except Exception as exc:  # noqa: BLE001
             logger.warning("max_high_since failed for %s: %s", symbol, exc)
             return None
-        highs = [float(b.high) for b in (series or []) if getattr(b, "high", None)]
-        return max(highs) if highs else None
+        return completed_session_high(series, datetime.now(timezone.utc))
 
     def quote(self, symbol: str):
         """Backward-compatible {last, prev_close, change_pct} shape."""

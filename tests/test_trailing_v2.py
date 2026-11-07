@@ -71,8 +71,8 @@ class Rec:
             return False, None
         return True, self.rows.get(sym)
 
-    def upsert_trailing_state(self, sym, ref, entry, armed, armed_at, peak):
-        self.upserts.append((sym, armed, peak))
+    def upsert_trailing_state(self, sym, ref, entry, armed, armed_at, peak, peak_source="observed"):
+        self.upserts.append((sym, armed, peak, peak_source))
         if not self.readable:
             return
         old = self.rows.get(sym)
@@ -175,3 +175,61 @@ def test_trailing_state_sql_is_sticky_and_resets_for_new_position(pg_url):
     with psycopg2.connect(pg_url) as c, c.cursor() as cur:
         cur.execute("SELECT count(*) FROM trailing_state")
         assert cur.fetchone()[0] == 0
+
+
+# ---- reconstruction safeguards (review 7 Nov) -----------------------------------------------
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+from bot.trading.trailing import completed_session_high  # noqa: E402
+
+
+def bar(local_iso, high):
+    from zoneinfo import ZoneInfo
+    ts = datetime.fromisoformat(local_iso).replace(tzinfo=ZoneInfo("America/New_York"))
+    return SimpleNamespace(timestamp=ts.astimezone(timezone.utc), high=high)
+
+
+def test_reconstruction_uses_completed_regular_session_bars_only():
+    now = bar("2026-11-09T11:07", 0).timestamp
+    bars = [bar("2026-11-09T08:00", 150.0),   # pre-market: ignored
+            bar("2026-11-09T09:30", 104.0),   # regular session, complete
+            bar("2026-11-09T10:45", 106.0),   # complete (ends 11:00)
+            bar("2026-11-09T11:00", 120.0),   # still forming at 11:07: ignored
+            bar("2026-11-08T12:00", 130.0)]   # Sunday: ignored
+    assert completed_session_high(bars, now) == 106.0
+    assert completed_session_high([], now) is None
+
+
+def test_reconstructed_peak_is_labelled_and_live_observation_replaces_label():
+    rec = Rec(readable=False)
+    s, _ = strat([101.0, 106.0], rec, bars_high=105.0)
+    step(s)
+    assert s._trail_mem["AAPL"].peak == 105.0 and s._trail_mem["AAPL"].peak_source == "reconstructed"
+    step(s)
+    assert s._trail_mem["AAPL"].peak == 106.0 and s._trail_mem["AAPL"].peak_source == "observed"
+
+
+def test_reconstruction_never_lowers_a_recorded_peak():
+    m = merge(TrailState("100.0000", 100.0, armed=True, peak=112.0),
+              TrailState("100.0000", 100.0, peak=108.0, peak_source="reconstructed"))
+    assert m.peak == 112.0 and m.peak_source == "observed"
+    assert evaluate(m, 109.0, 1).state.peak == 112.0
+
+
+def test_below_trigger_at_next_scan_attempts_exit_not_hold():
+    d = evaluate(st(), 110.0, 0)                  # armed, level 102.3
+    e = evaluate(d.state, 95.0, 1)                # discovered well below the trigger
+    assert e.exit and e.state.armed               # attempts the exit; never disarms
+
+
+def test_peak_source_sql(pg_url):
+    from bot.persistence.db import Recorder
+
+    r = Recorder(database_url=pg_url)
+    r.upsert_trailing_state("YYY", "100.0000", 100.0, False, None, 105.0, "reconstructed")
+    r.upsert_trailing_state("YYY", "100.0000", 100.0, False, None, 104.0, "observed")   # lower: keeps label
+    assert r.get_trailing_state("YYY")[1]["peak_source"] == "reconstructed"
+    r.upsert_trailing_state("YYY", "100.0000", 100.0, False, None, 107.0, "observed")
+    ok, row = r.get_trailing_state("YYY")
+    assert row["peak"] == 107.0 and row["peak_source"] == "observed"
+    r.clear_trailing_state("YYY")

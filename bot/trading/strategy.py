@@ -1822,7 +1822,8 @@ class SentimentStrategy:
         db_state = None
         if ok and row and row["entry_ref"] == ref:
             db_state = TrailState(entry_ref=ref, entry_price=entry, armed=row["armed"],
-                                  armed_at=row["armed_at"], peak=row["peak"])
+                                  armed_at=row["armed_at"], peak=row["peak"],
+                                  peak_source=row.get("peak_source", "observed"))
         state = merge(mem_state, db_state)
         if state is None:
             state = self._recover_trail_state(symbol, ref, entry, price, db_readable=ok)
@@ -1834,7 +1835,8 @@ class SentimentStrategy:
         changed = (state.armed != new.armed or abs((state.peak or 0) - new.peak) > 1e-9
                    or db_state is None)
         if changed and hasattr(self.recorder, "upsert_trailing_state"):
-            self.recorder.upsert_trailing_state(symbol, ref, entry, new.armed, new.armed_at, new.peak)
+            self.recorder.upsert_trailing_state(symbol, ref, entry, new.armed, new.armed_at, new.peak,
+                                                new.peak_source)
         if decision.newly_armed:
             logger.info("Trailing v2 ARMED for %s (peak %.2f, entry %.2f)", symbol, new.peak, entry,
                         extra={"symbol": symbol, "decision": "trailing_armed"})
@@ -1872,7 +1874,9 @@ class SentimentStrategy:
         if not db_readable:
             logger.warning("Trailing v2 for %s: DB unreadable and no in-memory state; peak rebuilt "
                            "from %s (%.2f).", symbol, "bars" if recovered else "entry/current price", peak)
-        return TrailState(entry_ref=ref, entry_price=entry, armed=False, peak=peak, recovered=recovered)
+        source = "reconstructed" if (recovered and peak > max(entry, price)) else "observed"
+        return TrailState(entry_ref=ref, entry_price=entry, armed=False, peak=peak, recovered=recovered,
+                          peak_source=source)
 
     def _do_buy(self, symbol, sentiment, price, acct, exposure, open_positions,
                 sector_counts, stats, market_regime=None,

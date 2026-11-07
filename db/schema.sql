@@ -641,3 +641,6 @@ CREATE TABLE IF NOT EXISTS trailing_state (
     peak_price   NUMERIC NOT NULL,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Stage 5: where the peak came from: 'observed' (a live scan) or
+-- 'reconstructed' (completed 15-minute bars after state was lost).
+ALTER TABLE trailing_state ADD COLUMN IF NOT EXISTS peak_source TEXT NOT NULL DEFAULT 'observed';
