@@ -287,6 +287,10 @@ class SentimentStrategy:
         new_entries_allowed = not is_paused and not self.risk.daily_loss_breached(
             acct["equity"], acct["last_equity"]
         )
+        # Why entries are blocked this cycle (first reason wins), recorded
+        # against every would-be entry the block prevents (review 7 Nov).
+        self._entry_block_reason = ("manual_pause" if is_paused
+                                    else None if new_entries_allowed else "daily_loss_limit")
         if not new_entries_allowed and not is_paused:
             logger.warning("Daily loss limit breached; sentiment exits only this cycle.",
                            extra={"decision": "block_new_entries", "reason": "daily_loss_limit"})
@@ -317,6 +321,7 @@ class SentimentStrategy:
             db_ok = self.db_gate.check()
             if not db_ok and new_entries_allowed:
                 new_entries_allowed = False
+                self._entry_block_reason = f"db_unavailable: {self.db_gate.last_reason}"
                 logger.warning("DB health gate: new entries blocked this cycle (%s).",
                                self.db_gate.last_reason,
                                extra={"decision": "block_new_entries", "reason": "db_unavailable"})
@@ -326,17 +331,23 @@ class SentimentStrategy:
         # Reliability v3 (2H/2I): other components that can block NEW entries
         # (protection status unknown or unresolved, lease not fresh). Exits
         # are never blocked here.
+        active_blocks = {}
         for blocker in getattr(self, "entry_blockers", ()):
+            key = "entry_block:" + type(getattr(blocker, "__self__", blocker)).__name__
             try:
                 blocked, why = blocker()
             except Exception as exc:  # noqa: BLE001 - an erroring blocker fails closed
                 blocked, why = True, f"entry check failed: {exc}"
+            if blocked:
+                active_blocks[key] = why
             if blocked and new_entries_allowed:
                 new_entries_allowed = False
+                self._entry_block_reason = str(why)
                 logger.warning("New entries blocked this cycle: %s", why,
                                extra={"decision": "block_new_entries", "reason": why})
                 self.recorder.record_decision(symbol="*", decision="block_new_entries",
                                               reason=str(why)[:120])
+        self._alert_entry_blocks(active_blocks)
 
         # Market filter 1: if the broad market is down hard today, don't open longs.
         if new_entries_allowed and self.cfg.strategy.market_filter_max_drop_pct > 0:
@@ -353,6 +364,7 @@ class SentimentStrategy:
                     reason="intraday_drop", change_pct=mkt,
                 )
                 new_entries_allowed = False
+                self._entry_block_reason = self._entry_block_reason or "intraday_drop"
 
         # Market filter 2 (regime): skip all new entries if the market proxy
         # (SPY by default) is below its own long-term (50-day) SMA — i.e. the
@@ -374,6 +386,7 @@ class SentimentStrategy:
                     reason="regime_data_unavailable",
                 )
                 new_entries_allowed = False
+                self._entry_block_reason = self._entry_block_reason or "regime_data_unavailable"
             elif spy_snap.last < spy_snap.sma:
                 logger.warning(
                     "Market regime filter: %s (%.2f) below its %d-day SMA (%.2f); "
@@ -389,6 +402,7 @@ class SentimentStrategy:
                     reason="below_market_regime_sma", price=spy_snap.last, sma=spy_snap.sma,
                 )
                 new_entries_allowed = False
+                self._entry_block_reason = self._entry_block_reason or "below_market_regime_sma"
 
         # Current sector concentration, so we don't pile into one correlated group.
         sector_counts = Counter(sector_of(s) for s in open_positions)
@@ -415,6 +429,21 @@ class SentimentStrategy:
             stats=stats,
         )
         self.last_cycle_outcome = "ok"
+
+    def _alert_entry_blocks(self, active: dict) -> None:
+        """Safety-gate entry blocks (lease, protection status): alert at once
+        on the first occurrence, de-duplicate while it persists (reminder
+        hourly), and announce recovery. Normal strategy blocks (pause,
+        market filters, daily loss) are not alerted here."""
+        alerts = getattr(self, "alerts", None)
+        previous = self.__dict__.setdefault("_active_entry_blocks", {})
+        if alerts is not None:
+            for key, why in active.items():
+                alerts.raise_(key, f"NEW ENTRIES BLOCKED: {why}. Existing positions and exits are "
+                                   "still managed.", "critical", 3600)
+            for key in set(previous) - set(active):
+                alerts.resolve(key, f"Entries no longer blocked ({previous[key]} resolved).")
+        self._active_entry_blocks = dict(active)
 
     def _compute_market_regime(self):
         """Classify the current market backdrop for Strategy Intelligence's
@@ -1112,6 +1141,16 @@ class SentimentStrategy:
 
         # ---- BUY gates (cheap checks first, API calls last) - shared by both paths ----
         if not new_entries_allowed:
+            # Record the exact reason against a would-be entry (a not-held
+            # symbol whose sentiment clears the buy threshold), so blocked
+            # opportunities are visible, not just the cycle-level block.
+            reason = getattr(self, "_entry_block_reason", None)
+            if reason and sentiment.score >= self.cfg.strategy.buy_threshold:
+                self.recorder.record_decision(
+                    symbol=symbol, decision="buy_blocked", reason=str(reason)[:200],
+                    sentiment_score=sentiment.score, sentiment_label=sentiment.label,
+                    headline_count=sentiment.article_count,
+                )
             return exposure
         if symbol in pending:
             logger.info("BUY %s skipped: an order is already pending", symbol,
@@ -1898,6 +1937,11 @@ class SentimentStrategy:
             if blocked:
                 logger.warning("BUY %s blocked: %s", symbol, why,
                                extra={"symbol": symbol, "decision": "buy_blocked", "reason": why})
+                self.recorder.record_decision(
+                    symbol=symbol, decision="buy_blocked", reason=str(why)[:200],
+                    sentiment_score=getattr(sentiment, "score", None),
+                    sentiment_label=getattr(sentiment, "label", None),
+                )
                 stats.blocked += 1
                 return exposure
 
