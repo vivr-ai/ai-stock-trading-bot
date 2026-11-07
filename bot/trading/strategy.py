@@ -165,6 +165,21 @@ class SentimentStrategy:
         self._mem_peaks = {}
 
     def run_cycle(self, force: bool = False, scheduler_status: str = "scheduled") -> None:
+        # Reliability v3 (2E): what this cycle achieved, read by main.py to
+        # decide whether the external heartbeat gets a success ping. Only
+        # "ok" and "market_closed" count as success.
+        self.last_cycle_outcome = "started"
+        # Reliability v3 (2I): an instance that doesn't hold the trading
+        # lease (or hasn't reconciled since acquiring it) places no orders
+        # and evaluates nothing - it is on standby.
+        lease = getattr(self, "lease", None)
+        if lease is not None:
+            ready, why = lease.ensure_ready()
+            if not ready:
+                logger.warning("Cycle skipped: %s", why,
+                               extra={"decision": "standby", "reason": "lease"})
+                self.last_cycle_outcome = "standby"
+                return
         market_open = self.broker.is_market_open()
         self._maybe_notify_clock_degraded()
         if not force and not market_open:
@@ -177,6 +192,7 @@ class SentimentStrategy:
                 status="running", scheduler_status=scheduler_status, market_open=False,
                 dry_run=self.cfg.risk.dry_run, message="market closed; cycle skipped",
             )
+            self.last_cycle_outcome = "market_closed"
             return
         if force:
             logger.info("FORCE: running one cycle ignoring market hours (test mode).")
@@ -200,6 +216,7 @@ class SentimentStrategy:
                 type_="broker_issue", severity="warning", title="Account snapshot failed",
                 message=str(exc),
             )
+            self.last_cycle_outcome = f"account snapshot failed: {exc}"
             return
 
         market_regime, cached_spy_snap = self._compute_market_regime()
@@ -297,6 +314,21 @@ class SentimentStrategy:
                 self.recorder.record_decision(symbol="*", decision="block_new_entries",
                                               reason="db_unavailable")
 
+        # Reliability v3 (2H/2I): other components that can block NEW entries
+        # (protection status unknown or unresolved, lease not fresh). Exits
+        # are never blocked here.
+        for blocker in getattr(self, "entry_blockers", ()):
+            try:
+                blocked, why = blocker()
+            except Exception as exc:  # noqa: BLE001 - an erroring blocker fails closed
+                blocked, why = True, f"entry check failed: {exc}"
+            if blocked and new_entries_allowed:
+                new_entries_allowed = False
+                logger.warning("New entries blocked this cycle: %s", why,
+                               extra={"decision": "block_new_entries", "reason": why})
+                self.recorder.record_decision(symbol="*", decision="block_new_entries",
+                                              reason=str(why)[:120])
+
         # Market filter 1: if the broad market is down hard today, don't open longs.
         if new_entries_allowed and self.cfg.strategy.market_filter_max_drop_pct > 0:
             mkt = self.broker.market_change_pct(self.cfg.strategy.market_filter_symbol)
@@ -373,6 +405,7 @@ class SentimentStrategy:
             exposure=exposure,
             stats=stats,
         )
+        self.last_cycle_outcome = "ok"
 
     def _compute_market_regime(self):
         """Classify the current market backdrop for Strategy Intelligence's
@@ -1702,6 +1735,16 @@ class SentimentStrategy:
                            extra={"symbol": symbol, "decision": "buy_blocked", "reason": "db_unavailable"})
             stats.blocked += 1
             return exposure
+        for blocker in getattr(self, "entry_blockers", ()):
+            try:
+                blocked, why = blocker()
+            except Exception as exc:  # noqa: BLE001
+                blocked, why = True, f"entry check failed: {exc}"
+            if blocked:
+                logger.warning("BUY %s blocked: %s", symbol, why,
+                               extra={"symbol": symbol, "decision": "buy_blocked", "reason": why})
+                stats.blocked += 1
+                return exposure
 
         decision = self.risk.evaluate(
             symbol, price, acct["portfolio_value"], acct["buying_power"],

@@ -28,6 +28,7 @@ from bot.logging_utils import ClosedTradeLogger, DailySummaryLogger, TradeLogger
 from bot.news import get_news_provider
 from bot.deployment_guard import verify_account_identity
 from bot.reliability.db_gate import DbHealthGate
+from bot.reliability.heartbeat_ping import ExternalHeartbeat
 from bot.reliability.journal import Journal
 from bot.reliability.reconcile import make_reconciler
 from bot.reliability.watchdog import CycleWatchdog
@@ -89,6 +90,18 @@ def _env_label(cfg) -> str:
     production messages are unchanged."""
     env = getattr(getattr(cfg, "deployment", None), "environment", "production")
     return "" if env == "production" else f"[{env.upper()}]"
+
+
+def report_cycle_outcome(heartbeat, outcome) -> None:
+    """2E: success ping only for a completed cycle or a correctly skipped
+    market-closed cycle; a standby instance (no lease) sends nothing, so if
+    no instance is trading the monitor notices the silence."""
+    if outcome in ("ok", "market_closed"):
+        heartbeat.success(outcome)
+    elif outcome == "standby":
+        return
+    else:
+        heartbeat.fail(f"cycle did not complete: {outcome}")
 
 
 def build(cfg):
@@ -484,6 +497,9 @@ def main() -> int:
         timezone=cfg.schedule.market_timezone,
     )
     watchdog.start()
+    # Reliability v3 (2E): outside monitor, pinged only after a genuinely
+    # successful cycle. Disabled until EXTERNAL_HEARTBEAT_URL is set.
+    heartbeat = ExternalHeartbeat(cfg.reliability.heartbeat_url)
 
     def run_cycle_safely():
         # Guards against a bug in a single cycle taking the scheduler job
@@ -496,6 +512,9 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             log.exception("Critical error in scheduled cycle: %s", exc)
             recorder.notify_critical_error("scheduled cycle", str(exc))
+            heartbeat.fail(f"cycle raised: {exc}")
+            return
+        report_cycle_outcome(heartbeat, getattr(strategy, "last_cycle_outcome", None))
 
     def on_scheduler_crash(reason: str) -> None:
         recorder.notify_scheduler_failure(reason)

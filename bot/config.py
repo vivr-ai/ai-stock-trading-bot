@@ -245,6 +245,33 @@ class RetentionConfig:
 
 
 @dataclass
+class ReliabilityConfig:
+    """Reliability plan v3 switches (Stages 2E-2I, 4, 5, 6). Every default
+    keeps today's behaviour; staging turns features on explicitly."""
+    # 2E: Healthchecks.io ping URL (EXTERNAL_HEARTBEAT_URL). Empty = disabled.
+    heartbeat_url: str = ""
+    # 2F: journal directory (JOURNAL_DIR). Empty = <state dir>/journal (ephemeral).
+    journal_dir: str = ""
+    journal_rotate_mb: float = 5.0
+    journal_max_mb: float = 200.0
+    journal_retention_days: int = 30
+    # 2I: single-instance lease (INSTANCE_LEASE_ENABLED). Needs DATABASE_URL.
+    lease_enabled: bool = False
+    lease_ttl_seconds: float = 90.0
+    lease_renew_seconds: float = 20.0
+    lease_max_age_seconds: float = 60.0
+    # 2H: 5-minute protection sweep + restore (PROTECTION_SWEEP_ENABLED).
+    protection_sweep_enabled: bool = False
+    protection_sweep_seconds: float = 300.0
+    # Stage 4: sentiment exit mode (STRATEGY_SENTIMENT_EXIT_MODE): live|shadow|off.
+    sentiment_exit_mode: str = "live"
+    # Stage 5: corrected trailing stop (RISK_TRAILING_V2_ENABLED).
+    trailing_v2_enabled: bool = False
+    # Stage 6: exit state machine (EXIT_MANAGER_ENABLED).
+    exit_manager_enabled: bool = False
+
+
+@dataclass
 class Config:
     alpaca: AlpacaConfig
     universe: UniverseConfig
@@ -261,6 +288,7 @@ class Config:
     dashboard: DashboardConfig
     retention: RetentionConfig
     deployment: DeploymentConfig = field(default_factory=lambda: DeploymentConfig("production", ""))
+    reliability: ReliabilityConfig = field(default_factory=ReliabilityConfig)
     project_root: str = field(default="")
     config_file_used: Optional[str] = field(default=None)
 
@@ -543,6 +571,24 @@ def load_config(path: str = "config.ini") -> Config:
                 parser, "deployment", "expected_account_number", "EXPECTED_ALPACA_ACCOUNT_NUMBER", ""
             ).strip(),
         ),
+        reliability=ReliabilityConfig(
+            heartbeat_url=_get(parser, "reliability", "heartbeat_url", "EXTERNAL_HEARTBEAT_URL", "").strip(),
+            journal_dir=_get(parser, "reliability", "journal_dir", "JOURNAL_DIR", "").strip(),
+            journal_rotate_mb=_get(parser, "reliability", "journal_rotate_mb", "JOURNAL_ROTATE_MB", 5.0, float),
+            journal_max_mb=_get(parser, "reliability", "journal_max_mb", "JOURNAL_MAX_MB", 200.0, float),
+            journal_retention_days=_get(
+                parser, "reliability", "journal_retention_days", "JOURNAL_RETENTION_DAYS", 30, int
+            ),
+            lease_enabled=_get(parser, "reliability", "lease_enabled", "INSTANCE_LEASE_ENABLED", False, bool),
+            protection_sweep_enabled=_get(
+                parser, "reliability", "protection_sweep_enabled", "PROTECTION_SWEEP_ENABLED", False, bool
+            ),
+            sentiment_exit_mode=_get(
+                parser, "strategy", "sentiment_exit_mode", "STRATEGY_SENTIMENT_EXIT_MODE", "live"
+            ).strip().lower(),
+            trailing_v2_enabled=_get(parser, "risk", "trailing_v2_enabled", "RISK_TRAILING_V2_ENABLED", False, bool),
+            exit_manager_enabled=_get(parser, "risk", "exit_manager_enabled", "EXIT_MANAGER_ENABLED", False, bool),
+        ),
         project_root=project_root,
         config_file_used=path if parser is not None else None,
     )
@@ -562,6 +608,16 @@ def _build_telegram_config(parser: Optional[configparser.ConfigParser]) -> "Tele
 
 
 def _validate(cfg: Config) -> None:
+    rel = getattr(cfg, "reliability", None)
+    if rel is not None and rel.sentiment_exit_mode not in ("live", "shadow", "off"):
+        raise ValueError(
+            f"STRATEGY_SENTIMENT_EXIT_MODE must be live, shadow or off (got {rel.sentiment_exit_mode!r})."
+        )
+    if rel is not None and rel.exit_manager_enabled and not rel.lease_enabled:
+        raise ValueError(
+            "EXIT_MANAGER_ENABLED=true requires INSTANCE_LEASE_ENABLED=true (one instance may "
+            "manage orders at a time)."
+        )
     missing = []
     if not cfg.alpaca.api_key:
         missing.append("ALPACA_API_KEY")
