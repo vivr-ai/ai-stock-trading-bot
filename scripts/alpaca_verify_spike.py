@@ -300,9 +300,25 @@ def cleanup(api):
         return api.call("GET", "/v2/orders", params={"status": "open", "symbols": SYMBOL,
                                                       "nested": "true"})[1] or []
 
-    for o in open_orders():
+    # Record exactly how Alpaca lists this symbol's orders before touching
+    # them (Stage 6b input: after a take-profit replacement the bot's
+    # protection read did not see a stop for the leftover share).
+    def brief(o):
+        return {k: o.get(k) for k in ("id", "client_order_id", "type", "side", "status", "qty",
+                                      "limit_price", "stop_price", "order_class", "group_id",
+                                      "group_role", "replaces", "replaced_by")}
+    snap = open_orders()
+    log("cleanup.orders_before", symbol=SYMBOL,
+        open_top_level=[dict(brief(o), legs=[brief(l) for l in (o.get("legs") or [])]) for o in snap],
+        recent_all=[brief(o) for o in (api.call("GET", "/v2/orders", params={
+            "status": "all", "symbols": SYMBOL, "limit": 20, "nested": "false"})[1] or [])])
+    for o in snap:
         if o.get("symbol") == SYMBOL:
             api.call("DELETE", f"/v2/orders/{o['id']}")
+            for leg in o.get("legs") or []:
+                if (leg.get("status") or "") in ("new", "held", "accepted", "pending_new",
+                                                 "partially_filled"):
+                    api.call("DELETE", f"/v2/orders/{leg['id']}")
     wait(lambda: not [o for o in open_orders() if o.get("symbol") == SYMBOL], 20)
     if position_qty(api, SYMBOL) != 0:
         api.call("DELETE", f"/v2/positions/{SYMBOL}")
