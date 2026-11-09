@@ -273,8 +273,11 @@ def v3(api, data):
                              {"limit_price": str(round((bid or last) * 0.995, 2)), "client_order_id": cid("v3d-r1")})
         time.sleep(10)
         code_a, acts = api.call("GET", "/v2/account/activities/FILL", params={"direction": "desc", "page_size": 20})
+        def _t(v):
+            return datetime.fromisoformat(str(v).replace("Z", "+00:00")) if v else None
+        entry_t = _t(full.get("filled_at"))
         sells = [a for a in (acts or []) if a.get("symbol") == SYMBOL and a.get("side") == "sell"
-                 and a.get("transaction_time", "") >= full.get("filled_at", "")]
+                 and entry_t and _t(a.get("transaction_time")) and _t(a.get("transaction_time")) >= entry_t]
         log("V3d.race", replace_http=code, replace_status=(new or {}).get("status"),
             old_tp=order(api, tp["id"]).get("status"),
             new_order=(order(api, new["id"]).get("status") if code == 200 else None),
@@ -287,17 +290,25 @@ def v3(api, data):
 
 
 def cleanup(api):
-    code, orders = api.call("GET", "/v2/orders", params={"status": "open", "symbols": SYMBOL, "nested": "true"})
-    for o in orders or []:
-        if str(o.get("client_order_id", "")).startswith("spike-"):
+    """Cancel EVERY open order on the spike symbol, then flatten it.
+
+    The symbol is outside the bot's universe, so everything on it belongs to
+    the spike. (First run, 9 Nov: cancelling only 'spike-' client IDs left a
+    replaced take-profit leg - Alpaca gives replacements and bracket legs
+    their own IDs - holding the share, so one VZ share was left behind.)"""
+    def open_orders():
+        return api.call("GET", "/v2/orders", params={"status": "open", "symbols": SYMBOL,
+                                                      "nested": "true"})[1] or []
+
+    for o in open_orders():
+        if o.get("symbol") == SYMBOL:
             api.call("DELETE", f"/v2/orders/{o['id']}")
-    wait(lambda: not [o for o in (api.call("GET", "/v2/orders",
-                                           params={"status": "open", "symbols": SYMBOL})[1] or [])
-                      if str(o.get("client_order_id", "")).startswith("spike-")], 20)
+    wait(lambda: not [o for o in open_orders() if o.get("symbol") == SYMBOL], 20)
     if position_qty(api, SYMBOL) != 0:
         api.call("DELETE", f"/v2/positions/{SYMBOL}")
         wait(lambda: position_qty(api, SYMBOL) == 0, 30)
-    log("cleanup", symbol=SYMBOL, position=position_qty(api, SYMBOL))
+    log("cleanup", symbol=SYMBOL, position=position_qty(api, SYMBOL),
+        open_orders=len([o for o in open_orders() if o.get("symbol") == SYMBOL]))
 
 
 def main() -> int:
@@ -312,6 +323,10 @@ def main() -> int:
     if SYMBOL in STATIC_UNIVERSE:
         raise SystemExit(f"REFUSED: {SYMBOL} is in the bot's universe; choose another SPIKE_SYMBOL.")
     log("start", account=masked, symbol=SYMBOL, run=RUN)
+    if "--cleanup-only" in sys.argv:
+        cleanup(api)
+        print(f"SPIKE_DONE run={RUN} cleanup-only", flush=True)
+        return 0
     _, clock = api.call("GET", "/v2/clock")
     bid, last = last_price(data, SYMBOL)
     if not last:

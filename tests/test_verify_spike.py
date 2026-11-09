@@ -62,13 +62,16 @@ def test_guard_refuses_live_endpoint():
         sp.guard(ENV, api)
 
 
-def test_cleanup_only_touches_spike_orders(monkeypatch):
+def test_cleanup_cancels_every_order_on_the_spike_symbol_only(monkeypatch):
+    """9 Nov run: a replaced take-profit leg has Alpaca's own ID, so cleanup
+    must cancel every open order on the (out-of-universe) spike symbol."""
     monkeypatch.setattr(sp.time, "sleep", lambda s: None)
-    api = FakeApi(orders=[{"id": "a", "client_order_id": "spike-x-v1a"},
-                          {"id": "b", "client_order_id": "sP-VZ-abc-1"}], pos=1.0)
+    api = FakeApi(orders=[{"id": "a", "client_order_id": "spike-x-v1a", "symbol": "VZ"},
+                          {"id": "b", "client_order_id": "c7e1-random-leg-id", "symbol": "VZ"},
+                          {"id": "c", "client_order_id": "AAPL-slot", "symbol": "AAPL"}], pos=1.0)
     sp.cleanup(api)
-    deleted = [p for m, p in api.calls if m == "DELETE" and p.startswith("/v2/orders/")]
-    assert deleted == ["/v2/orders/a"]
+    deleted = sorted(p for m, p in api.calls if m == "DELETE" and p.startswith("/v2/orders/"))
+    assert deleted == ["/v2/orders/a", "/v2/orders/b"]
     assert api.pos == 0.0
 
 
