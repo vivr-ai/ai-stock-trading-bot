@@ -165,6 +165,12 @@ class ProtectionManager:
                                                "status verified.")
         self.last_ok_sweep = now if orders.ok else self.last_ok_sweep
         states = classify(pos.data, orders.data if orders.ok else None)
+        all_orders = list(orders.data or []) if orders.ok else None
+        for sym, (state, _) in list(states.items()):
+            if state not in (UNPROTECTED, UNDER_PROTECTED) or all_orders is None:
+                continue
+            states[sym], extra = self._confirm_missing(sym, pos.data, all_orders)
+            all_orders.extend(extra)
         for gone in set(self.tracks) - set(states):
             self._clear(gone, "position closed")
         for sym, (state, covered) in states.items():
@@ -177,10 +183,32 @@ class ProtectionManager:
             else:
                 t.state = state
                 t.unknown_since = None
-                self._missing(sym, t, now, pos.data[sym], orders.data)
+                self._missing(sym, t, now, pos.data[sym], all_orders)
         if not orders.ok:
             self.global_unknown_since = self.global_unknown_since or now
         return {s: t.state for s, t in self.tracks.items()}
+
+    def _confirm_missing(self, sym: str, positions: Dict[str, dict], seen: List[dict]):
+        """Second look before declaring a position under- or unprotected.
+
+        Alpaca's open-orders list does not show a bracket's stop leg once the
+        take-profit leg has been replaced: the replacement is listed on its
+        own (legs=[]) and the still-'held' stop sits under the filled entry
+        order, which is not 'open' (staging, 10 Nov, real order data). So the
+        symbol's full order history is read and any working sell orders not
+        already seen are added. If that read fails the position is UNKNOWN:
+        no protective order is placed on a guess."""
+        hist = self.broker.symbol_orders_snapshot(sym)
+        if not hist.ok:
+            logger.warning("Protection: second read for %s failed (%s); state UNKNOWN", sym, hist.error)
+            return (UNKNOWN, 0.0), []
+        ids = {o.get("id") for o in seen}
+        extra = [o for o in hist.data or [] if o.get("symbol") == sym and o.get("id") not in ids
+                 and o.get("status") in WORKING_STATUSES]
+        if extra:
+            logger.info("Protection: %d working order(s) for %s found only in its order history "
+                        "(e.g. stop leg of a bracket whose take-profit was replaced)", len(extra), sym)
+        return classify({sym: positions[sym]}, list(seen) + extra)[sym], extra
 
     def _global_unknown(self, now: float, why: str) -> None:
         self.global_unknown_since = self.global_unknown_since or now

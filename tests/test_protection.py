@@ -478,3 +478,49 @@ def test_under_protected_below_stop_with_working_stop_escalates_instead_of_selli
     b.positions["AAPL"]["qty_available"] = 4.0
     m.sweep()
     assert b.exits == [] and "prot_manual:AAPL" in keys(a, "critical")
+
+
+# ---- replaced take-profit: real Alpaca order shapes (staging, 10 Nov) ------------------
+_G = "9c884b5c-3c79-4506-aea0-e2915fd2479d"
+_OPEN_AFTER_REPLACE = [  # GET /orders?status=open&nested=true - stop leg absent
+    {"id": "ae073d04", "symbol": "VZ", "side": "sell", "type": "limit", "status": "new", "qty": "1",
+     "limit_price": "55.22", "order_class": "bracket", "group_id": _G, "group_role": "take_profit",
+     "replaces": "63df7613", "legs": []}]
+_HISTORY = [  # GET /orders?status=all&symbols=VZ&nested=true - stop under the filled entry
+    {"id": "49e3e0f4", "symbol": "VZ", "side": "buy", "type": "market", "status": "filled",
+     "qty": "1", "order_class": "bracket", "group_id": _G, "group_role": "entry",
+     "legs": [{"id": "63df7613", "symbol": "VZ", "side": "sell", "type": "limit",
+               "status": "replaced", "qty": "1", "group_id": _G, "group_role": "take_profit",
+               "replaced_by": "ae073d04"},
+              {"id": "c5c17de5", "symbol": "VZ", "side": "sell", "type": "stop", "status": "held",
+               "qty": "1", "stop_price": "41.42", "group_id": _G, "group_role": "stop_loss"}]},
+    _OPEN_AFTER_REPLACE[0]]
+
+
+def _vz_broker(history_ok=True, history=None):
+    b = FakeBroker()
+    b.positions = {"VZ": {"qty": 1.0, "qty_available": 0.0, "avg_entry_price": 46.02, "side": "long"}}
+    b.orders = flatten_orders(_OPEN_AFTER_REPLACE)
+    b.history = flatten_orders(_HISTORY if history is None else history)
+    b.history_ok = history_ok
+    return b
+
+
+def test_stop_hidden_by_tp_replacement_is_found_in_history():
+    m, b, a, *_ = mgr(_vz_broker())
+    assert classify(b.positions_snapshot().data, b.orders)["VZ"][0] == UNPROTECTED  # the 9 Nov bug
+    assert m.sweep()["VZ"] == PROTECTED
+    assert b.submits == [] and "prot_failed:VZ" not in keys(a) and "prot_manual:VZ" not in keys(a)
+
+
+def test_history_without_a_working_stop_stays_unprotected():
+    hist = [dict(_HISTORY[0], legs=[_HISTORY[0]["legs"][0],
+                                    dict(_HISTORY[0]["legs"][1], status="canceled")]),
+            _OPEN_AFTER_REPLACE[0]]
+    m, *_ = mgr(_vz_broker(history=hist))
+    assert m.sweep()["VZ"] == UNPROTECTED
+
+
+def test_failed_second_read_means_unknown_and_no_order():
+    m, b, *_ = mgr(_vz_broker(history_ok=False))
+    assert m.sweep()["VZ"] == UNKNOWN and b.submits == []

@@ -307,21 +307,35 @@ def cleanup(api):
         return {k: o.get(k) for k in ("id", "client_order_id", "type", "side", "status", "qty",
                                       "limit_price", "stop_price", "order_class", "group_id",
                                       "group_role", "replaces", "replaced_by")}
+    recent = api.call("GET", "/v2/orders", params={"status": "all", "symbols": SYMBOL, "limit": 50,
+                                                    "nested": "false"})[1] or []
     snap = open_orders()
     log("cleanup.orders_before", symbol=SYMBOL,
         open_top_level=[dict(brief(o), legs=[brief(l) for l in (o.get("legs") or [])]) for o in snap],
-        recent_all=[brief(o) for o in (api.call("GET", "/v2/orders", params={
-            "status": "all", "symbols": SYMBOL, "limit": 20, "nested": "false"})[1] or [])])
+        recent_all=[brief(o) for o in recent[:20]])
+    _, clock = api.call("GET", "/v2/clock")
+    if position_qty(api, SYMBOL) != 0 and not (clock or {}).get("is_open"):
+        # Cancelling now would strip the stop off a share that can't be sold
+        # until the open. Leave everything in place.
+        log("cleanup.skipped", reason="market closed: position and its orders left untouched; "
+                                      "run --cleanup-only in market hours")
+        return
+    # Cancel every WORKING order on the symbol, taken from the full history:
+    # the open list hides a held stop leg once its take-profit was replaced
+    # (10 Nov). Every response is recorded.
+    working = {"new", "held", "accepted", "pending_new", "partially_filled", "accepted_for_bidding"}
+    targets = [o for o in recent if o.get("symbol") == SYMBOL and (o.get("status") or "") in working]
     for o in snap:
-        if o.get("symbol") == SYMBOL:
-            api.call("DELETE", f"/v2/orders/{o['id']}")
-            for leg in o.get("legs") or []:
-                if (leg.get("status") or "") in ("new", "held", "accepted", "pending_new",
-                                                 "partially_filled"):
-                    api.call("DELETE", f"/v2/orders/{leg['id']}")
+        if o.get("symbol") == SYMBOL and o["id"] not in {t["id"] for t in targets}:
+            targets.append(o)
+    for o in targets:
+        code, body = api.call("DELETE", f"/v2/orders/{o['id']}")
+        log("cleanup.cancel", order=o["id"], role=o.get("group_role"), status=o.get("status"),
+            http=code, body=body)
     wait(lambda: not [o for o in open_orders() if o.get("symbol") == SYMBOL], 20)
     if position_qty(api, SYMBOL) != 0:
-        api.call("DELETE", f"/v2/positions/{SYMBOL}")
+        code, body = api.call("DELETE", f"/v2/positions/{SYMBOL}")
+        log("cleanup.flatten", http=code, body=body)
         wait(lambda: position_qty(api, SYMBOL) == 0, 30)
     log("cleanup", symbol=SYMBOL, position=position_qty(api, SYMBOL),
         open_orders=len([o for o in open_orders() if o.get("symbol") == SYMBOL]))
