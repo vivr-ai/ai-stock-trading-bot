@@ -445,7 +445,7 @@ class ProtectionManager:
                            f"MANUAL ACTION NEEDED: {sym} has been without full stop protection for "
                            f"{since} min ({why or 'restore attempts exhausted'}). Covered "
                            f"{t.covered:g} shares. Check the position in the Alpaca dashboard.",
-                           "critical", 900)
+                           "critical", 3600)
         if self.heartbeat is not None:
             self.heartbeat.fail(f"{sym} unprotected: manual action needed")
 

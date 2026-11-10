@@ -83,13 +83,30 @@ def test_alert_dedup_repeat_and_resolve():
 
 def test_alert_daily_cap_sends_one_storm_notice():
     sent, clock = [], Clock()
-    a = AlertDeduper(lambda t, s: sent.append(t), clock=clock, daily_cap=3)
+    a = AlertDeduper(lambda t, s: sent.append(t), clock=clock, daily_cap=3, new_cap=3)
     for i in range(6):
-        a.raise_(f"k{i}", f"msg{i}")
+        a.raise_(f"k{i}", f"msg{i}")                  # non-critical new problems: own cap
     assert sent[:3] == ["msg0", "msg1", "msg2"]
     assert len(sent) == 4 and sent[3].startswith("Alert storm")
     clock.t += 86400
     assert a.raise_("new", "next day")
+
+
+def test_reminders_hit_the_cap_but_new_critical_and_recovery_still_go_out():
+    """Staging 9 Nov: a 15-minute reminder for one stuck position used up the
+    whole daily cap, which would have silenced any other emergency."""
+    sent, clock = [], Clock()
+    a = AlertDeduper(lambda t, s: sent.append(t), clock=clock, daily_cap=3)
+    a.raise_("prot_manual:VZ", "VZ manual", "critical", 900)
+    for _ in range(6):
+        clock.t += 901
+        a.raise_("prot_manual:VZ", "VZ manual", "critical", 900)
+    assert sent.count("VZ manual") == 4              # first + 3 reminders
+    assert sum(1 for t in sent if t.startswith("Alert storm")) == 1
+    assert a.raise_("db_down", "DB down", "critical")           # new emergency: sent
+    assert a.raise_("prot_missing:AAPL", "AAPL unprotected", "critical")
+    assert a.resolve("prot_manual:VZ", "VZ recovered")           # recovery: sent
+    assert sent[-3:] == ["DB down", "AAPL unprotected", "VZ recovered"]
 
 
 def test_alert_send_failure_never_raises():
