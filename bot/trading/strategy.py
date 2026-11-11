@@ -2078,6 +2078,49 @@ class SentimentStrategy:
         stats.buys += 1
         return exposure + plan.notional
 
+    def _record_managed_exit(self, symbol: str, reason: str, fill: Optional[dict]) -> None:
+        """Ledger for an exit the Stage 6b manager completed, priced from the
+        actual sell fill. If the fill wasn't one of our R/X orders (the stop
+        or the original take-profit filled first), the normal auto-exit path
+        classifies and logs it instead, so nothing is double-counted."""
+        env = getattr(self.broker, "env_tag", "p")
+        cid = (fill or {}).get("client_order_id") or ""
+        if not (cid.startswith(f"{env}R-{symbol}-") or cid.startswith(f"{env}X-{symbol}-")):
+            logger.info("Exit %s closed by %s (not ours); auto-exit logging will record it.",
+                        symbol, cid or "an unknown order")
+            return
+        price = fill.get("filled_avg_price")
+        self.recorder.record_trade(
+            action="sell", symbol=symbol, qty=int(fill.get("filled_qty") or 0), price=price or 0.0,
+            notional=(price or 0.0) * (fill.get("filled_qty") or 0), sentiment=None,
+            stop_price=0.0, take_profit=0.0, reason=reason, rationale="",
+            dry_run=False, order_id=fill.get("id") or "", status="filled", sector=sector_of(symbol),
+            entry_path="exit_manager",
+        )
+        self.recorder.record_notification(type_="trade_executed", title=f"SELL {symbol}", message=reason)
+        self.recorder.clear_position_peak(symbol)
+        self.__dict__.setdefault("_mem_peaks", {}).pop(symbol, None)
+        self.__dict__.setdefault("_trail_mem", {}).pop(symbol, None)
+        if hasattr(self.recorder, "clear_trailing_state"):
+            self.recorder.clear_trailing_state(symbol)
+        self.recorder.clear_stagnation_checkpoint(symbol)
+        if self.closed_trade_logger is None or price is None:
+            return
+        lot = self.state.pop_open(symbol)
+        if lot is None:
+            self._log_closed_trade_from_history(symbol, price, reason)
+            return
+        pnl = self.closed_trade_logger.log(symbol, lot["qty"], lot["entry_price"], price,
+                                           exit_reason=reason, entry_time=lot.get("entry_time"))
+        pnl_pct = (price - lot["entry_price"]) / lot["entry_price"] * 100.0 if lot["entry_price"] else 0.0
+        self.recorder.record_closed_trade(
+            symbol=symbol, qty=lot["qty"], entry_price=lot["entry_price"], exit_price=price, pnl=pnl,
+            pnl_pct=pnl_pct, exit_reason=reason, entry_time=lot.get("entry_time"),
+            buy_reason=lot.get("reason"), news_summary=lot.get("rationale"), sector=lot.get("sector"),
+            confidence_score=lot.get("sentiment_score"), confidence_label=lot.get("sentiment_label"),
+            market_regime=lot.get("market_regime"), strategy_version=lot.get("strategy_version"),
+        )
+
     def _do_sell(self, symbol, sentiment, reason, entry_path: str = "sentiment_momentum") -> bool:
         """Close `symbol`. Returns True if a close was submitted (or simulated
         in dry-run), False if it was skipped or failed - callers must only do
@@ -2165,6 +2208,26 @@ class SentimentStrategy:
                 sentiment_score=sentiment.score, sentiment_label=sentiment.label,
             )
             return False
+
+        # Stage 6b (EXIT_MANAGER_ENABLED, off by default): the exit state
+        # machine executes the decided exit by repricing the take-profit leg
+        # while the stop stays held. While the flag is off this path is
+        # skipped and close_position runs exactly as before.
+        xm = getattr(self, "exit_manager", None)
+        if xm is not None:
+            state = xm.request(symbol, reason)
+            self.recorder.record_decision(
+                symbol=symbol, decision="sell_requested", reason=reason, sentiment_score=sentiment.score,
+                sentiment_label=sentiment.label, headline_count=sentiment.article_count,
+                rationale=sentiment.rationale, extra={"exit_state": state, "entry_path": entry_path},
+            )
+            from ..reliability import exit_manager as _em
+            underway = state in (_em.REPRICING, _em.EXIT_WORKING, _em.FALLBACK_CANCEL, _em.SELLING,
+                                 _em.RECONCILED)
+            logger.info("SELL %s %s via exit manager (state %s): %s", symbol,
+                        "underway" if underway else "not yet started", state, reason,
+                        extra={"symbol": symbol, "decision": "sell_requested", "exit_state": state})
+            return underway
 
         order = self.broker.close_position(symbol)
         if order is None:

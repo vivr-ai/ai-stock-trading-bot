@@ -98,3 +98,23 @@ def test_protection_hook_reconciles_the_lease_off_hours(cfg_env, tmp_path, pg_ur
     assert calls == [1] and strategy.lease.state == "held"
     assert strategy.protection.active() is True and calls == [1]   # cheap once held
     strategy.lease.release()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_exit_manager_wiring_follows_the_flag(cfg_env, tmp_path, pg_url, enabled):
+    cfg_env.setenv("BOT_ENVIRONMENT", "staging")
+    cfg_env.setenv("EXPECTED_ALPACA_ACCOUNT_NUMBER", "PA111111111")
+    cfg_env.setenv("DATABASE_URL", pg_url)
+    cfg_env.setenv("JOURNAL_DIR", str(tmp_path / "journal"))
+    cfg_env.setenv("INSTANCE_LEASE_ENABLED", "true")
+    cfg_env.setenv("PROTECTION_SWEEP_ENABLED", "true")
+    cfg_env.setenv("EXIT_MANAGER_ENABLED", "true" if enabled else "false")
+    broker, _, _, strategy, _ = main.build(load_config("nonexistent.ini"))
+    if not enabled:
+        assert strategy.exit_manager is None                   # today's close_position path
+        assert getattr(strategy.protection, "hold_off", None) is None
+        return
+    xm = strategy.exit_manager
+    assert xm is not None and xm.env_tag == "s" and xm.lock is strategy.order_lock
+    assert strategy.protection.hold_off == xm.holds_protection
+    assert xm.lease_ok() is False                               # lease not held: D8, nothing sent

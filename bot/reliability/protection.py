@@ -260,6 +260,13 @@ class ProtectionManager:
 
     # ---- restoration -----------------------------------------------------------------
     def _missing(self, sym: str, t: Track, now: float, pos: dict, orders: List[dict]) -> None:
+        hold = getattr(self, "hold_off", None)
+        if hold is not None and hold(sym):
+            # Stage 6b: the exit manager is between "legs cancelled" and "sell
+            # filled" for this symbol (bounded to 5 min by the exit manager).
+            # A protective order now would hold the shares the sell needs.
+            logger.info("Protection for %s held off: exit sell in progress", sym)
+            return
         if t.missing_since is None:
             t.missing_since = now
             self.alerts.raise_(f"prot_missing:{sym}",

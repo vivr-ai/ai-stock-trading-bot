@@ -93,6 +93,7 @@ def _order_view(o: dict, parent_id) -> dict:
         "order_class": (o.get("order_class") or "").lower(),
         "status": (o.get("status") or "").lower(),
         "qty": _f(o.get("qty")), "filled_qty": _f(o.get("filled_qty")),
+        "filled_avg_price": _f(o.get("filled_avg_price")) or None,
         "limit_price": _f(o.get("limit_price")) or None, "stop_price": _f(o.get("stop_price")) or None,
         "group_id": o.get("group_id"), "group_role": o.get("group_role"),
         "replaces": o.get("replaces"), "replaced_by": o.get("replaced_by"),
@@ -927,6 +928,52 @@ class AlpacaBroker:
         # Raw single attempt; the protection manager runs its own
         # uncertain-submission protocol across sweeps (no blocking lookups).
         return self._raw("POST", "/orders", body, retry=False)
+
+    # ---- Stage 6b: replace / cancel / quote, single attempt -------------------
+    def replace_order_once(self, order_id: str, limit_price: float, client_order_id: str,
+                           what: str) -> dict:
+        """PATCH one order's limit price, ONE attempt (6a: Alpaca answers 200
+        'new' and the old order becomes 'replaced'; a replace on an already
+        replaced ID is 422 'order already replaced'; qty can't be changed on
+        advanced orders). The response is never proof: the caller re-reads.
+          * definite rejection -> OrderRejected
+          * ambiguous          -> lookup by the new client ID; found -> that
+                                  order; else OrderOutcomeUnknown"""
+        if not self.allow_submit:
+            raise RuntimeError(f"{what} blocked: order submission is disabled in mode={self.mode}")
+        self._guard("exit", what)
+        body = {"limit_price": str(round(limit_price, 2)), "client_order_id": client_order_id}
+        try:
+            return self._raw("PATCH", f"/orders/{order_id}", body, retry=False)
+        except Exception as exc:  # noqa: BLE001
+            if classify_submit_error(exc) == "rejected":
+                raise OrderRejected(f"{what} rejected by Alpaca: {exc}", http_status(exc)) from exc
+            return self._resolve_ambiguous(client_order_id, what, exc)
+
+    def cancel_order_once(self, order_id: str, what: str) -> bool:
+        """DELETE one order, one attempt. True = Alpaca accepted the cancel
+        request (not proof it's cancelled: the caller confirms by re-reading).
+        404/422 (already final) -> False. Anything else raises."""
+        self._guard("exit", what)
+        try:
+            self._raw("DELETE", f"/orders/{order_id}", retry=False)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            if http_status(exc) in (404, 422):
+                return False
+            raise
+
+    def latest_bid(self, symbol: str) -> Optional[float]:
+        from alpaca.data.requests import StockLatestQuoteRequest
+
+        try:
+            req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+            q = self._retry(lambda: self._data.get_stock_latest_quote(req), f"latest_quote({symbol})")
+            bid = float(q[symbol].bid_price or 0)
+            return bid if bid > 0 else None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not fetch bid for %s: %s", symbol, exc)
+            return None
 
     # ---- order placement -----------------------------------------------
     LOOKUP_DELAYS_S = (1.0, 2.0, 4.0, 8.0)

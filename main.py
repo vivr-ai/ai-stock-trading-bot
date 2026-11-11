@@ -242,6 +242,24 @@ def build(cfg):
             # overnight and was only re-protected at 09:00). Cheap when the
             # lease is already held and fresh.
             strategy.protection.active = lambda: strategy.lease.ensure_ready()[0]
+    # Reliability v3 Stage 6b: exit state machine. Off by default; config
+    # validation already requires the lease when it is on. D8: no
+    # submission of any kind unless the lease is verified.
+    strategy.exit_manager = None
+    if rel.exit_manager_enabled:
+        from bot.reliability.exit_manager import ExitManager
+
+        _j = getattr(strategy, "journal", None)
+        strategy.exit_manager = ExitManager(
+            broker, alerts, "s" if cfg.deployment.is_staging else "p",
+            lock=strategy.order_lock, protection=strategy.protection,
+            lease_ok=lambda: strategy.lease.can_submit("exit")[0],
+            journal=(lambda kind, payload: _j.append(kind, payload)) if _j is not None else None,
+            on_closed=strategy._record_managed_exit,
+            market_tz=cfg.schedule.market_timezone,
+        )
+        if strategy.protection is not None:
+            strategy.protection.hold_off = strategy.exit_manager.holds_protection
     return broker, summary_logger, reporter, strategy, recorder
 
 
@@ -589,6 +607,8 @@ def main() -> int:
     if getattr(strategy, "protection", None) is not None:
         strategy.protection.heartbeat = heartbeat
         strategy.protection.start()
+    if getattr(strategy, "exit_manager", None) is not None:
+        strategy.exit_manager.start()
     order_lock = getattr(strategy, "order_lock", None)
 
     def run_cycle_safely():
