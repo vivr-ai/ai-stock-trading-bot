@@ -456,12 +456,20 @@ def v5(api, data, qty=5, tries=3):
                 break
             if fq >= qty:
                 break
-            time.sleep(0.3)
+            time.sleep(0.1)
         if partial is not None:
-            time.sleep(2)
+            # Sample at once (11 Nov run: after a 2 s pause the partial had
+            # already completed and the stop was gone, so nothing could be
+            # concluded about the stop's quantity DURING the partial).
             work = _working_for_symbol(api)
             stops = [w for w in work if w["type"] in ("stop", "stop_limit")]
             held = position_qty(api, SYMBOL)
+            if held <= 0 or not stops:
+                log("V5.partial_fill", attempt=n, tp_filled=partial.get("filled_qty"), position=held,
+                    stops=stops, conclusion="partial completed before the stop could be observed - "
+                                            "NOT VERIFIED")
+                cleanup(api)
+                continue
             log("V5.partial_fill", attempt=n, tp_filled=partial.get("filled_qty"), position=held,
                 stops=stops, stop_qty_vs_position=[(float(s_["qty"]) - float(s_["filled_qty"] or 0), held)
                                                    for s_ in stops],
