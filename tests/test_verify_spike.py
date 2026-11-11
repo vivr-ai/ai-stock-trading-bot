@@ -123,3 +123,10 @@ def test_vz_regression_cleanup_reports_a_share_left_without_a_stop(monkeypatch):
     sp.cleanup(api)
     rec = [r for r in sp.RESULTS if r["check"] == "cleanup.reconcile"]
     assert rec and rec[0]["incident"].startswith("CRITICAL")
+
+
+def test_oco_body_matches_what_protection_sends():
+    body = sp._oco_body(1, 50.6, 41.4, "v4-oco")
+    assert body["order_class"] == "oco" and body["type"] == "limit" and body["side"] == "sell"
+    assert body["take_profit"] == {"limit_price": "50.6"} and body["stop_loss"] == {"stop_price": "41.4"}
+    assert body["client_order_id"].startswith("spike-") and body["time_in_force"] == "gtc"

@@ -18,6 +18,11 @@ Safety
     Every order carries a 'spike-' client_order_id. Cleanup cancels only
     this symbol's spike orders and flattens only this symbol.
   * V3 needs the market open; outside hours it runs V1 and V2 only.
+  * --oco-partial (review 11 Nov): V4 replaces the take-profit of the exact
+    OCO the protection manager places (1 share) and checks the stop; V5
+    tries to produce a partial take-profit fill (5 shares, up to 3 tries)
+    and records what Alpaca does to the linked stop's quantity. Market
+    hours only.
   * Run it while the staging bot is NOT running (e.g. as a one-off start
     command), so the two never act on the account at the same time.
 
@@ -357,6 +362,119 @@ def reconcile_after_cancel(api, left):
         incident=None if stops else "CRITICAL: position left WITHOUT a working stop")
 
 
+# ---- V4 / V5 (review 11 Nov): OCO replacement and partial take-profit fills ---------
+def _oco_body(qty, tp, stop, tag):
+    # Exactly the body AlpacaBroker.submit_oco_once sends for protection.
+    return {"symbol": SYMBOL, "qty": str(qty), "side": "sell", "type": "limit", "time_in_force": "gtc",
+            "order_class": "oco", "limit_price": str(round(tp, 2)),
+            "take_profit": {"limit_price": str(round(tp, 2))},
+            "stop_loss": {"stop_price": str(round(stop, 2))}, "client_order_id": cid(tag)}
+
+
+def _buy(api, qty, tag):
+    code, o = api.call("POST", "/v2/orders", {"symbol": SYMBOL, "qty": str(qty), "side": "buy",
+                                              "type": "market", "time_in_force": "day",
+                                              "client_order_id": cid(tag)})
+    if code != 200 or not wait(lambda: position_qty(api, SYMBOL) >= qty, 60):
+        raise RuntimeError(f"buy {qty} {SYMBOL} failed: {code} {o}")
+    time.sleep(1)
+
+
+def _oco_view(api, oid):
+    o = order(api, oid)
+    legs = o.get("legs") or []
+    view = lambda x: {k: x.get(k) for k in ("id", "client_order_id", "type", "status", "qty",  # noqa: E731
+                                           "filled_qty", "limit_price", "stop_price", "group_id",
+                                           "group_role", "order_class", "replaces", "replaced_by")}
+    return view(o), [view(l) for l in legs]
+
+
+def _working_for_symbol(api):
+    hist = api.call("GET", "/v2/orders", params={"status": "all", "symbols": SYMBOL, "limit": 100,
+                                                 "nested": "false"})[1] or []
+    return [{k: o.get(k) for k in ("id", "client_order_id", "type", "status", "qty", "filled_qty",
+                                    "group_id", "group_role", "replaces")}
+            for o in hist if o.get("status") in ("new", "held", "accepted", "pending_new",
+                                                  "partially_filled", "pending_replace")]
+
+
+def v4(api, data):
+    """Replace the take-profit of the exact OCO the protection manager places."""
+    bid, last = last_price(data, SYMBOL)
+    _buy(api, 1, "v4-buy")
+    code, o = api.call("POST", "/v2/orders", _oco_body(1, last * 1.10, last * 0.90, "v4-oco"))
+    if code != 200:
+        return log("V4.oco_submit", http=code, body=o, conclusion="OCO refused")
+    time.sleep(2)
+    parent, legs = _oco_view(api, o["id"])
+    log("V4.oco_shape", parent=parent, legs=legs)
+    c1, r1 = api.call("PATCH", f"/v2/orders/{o['id']}",
+                      {"limit_price": str(round(last * 1.12, 2)), "client_order_id": cid("v4-r1")})
+    time.sleep(2)
+    old, _ = _oco_view(api, o["id"])
+    new, new_legs = _oco_view(api, (r1 or {}).get("id") or "") if c1 == 200 else ({}, [])
+    work = _working_for_symbol(api)
+    stops = [w for w in work if w["type"] in ("stop", "stop_limit")]
+    log("V4.replace_tp", http=c1, response_status=(r1 or {}).get("status"), old=old, new=new,
+        new_legs=new_legs, working=work,
+        stop_still_working=len(stops) == 1, stop_qty=stops[0]["qty"] if stops else None,
+        stop_group_matches=bool(stops) and stops[0]["group_id"] == parent.get("group_id"),
+        conclusion=("stop kept, same group, qty 1" if c1 == 200 and len(stops) == 1
+                    and stops[0]["group_id"] == parent.get("group_id") and float(stops[0]["qty"]) == 1
+                    else "CHECK: stop not as expected after OCO replace"))
+    # Marketable replacement -> fill -> linked stop should be cancelled.
+    if c1 == 200:
+        bid2, _ = last_price(data, SYMBOL)
+        c2, r2 = api.call("PATCH", f"/v2/orders/{r1['id']}",
+                          {"limit_price": str(round((bid2 or last) * 0.995, 2)), "client_order_id": cid("v4-r2")})
+        filled = wait(lambda: position_qty(api, SYMBOL) == 0, 30)
+        log("V4.replace_marketable", http=c2, filled=bool(filled), working_after=_working_for_symbol(api),
+            position_after=position_qty(api, SYMBOL))
+
+
+def v5(api, data, qty=5, tries=3):
+    """Partial take-profit fill: what does Alpaca do to the linked stop's qty?
+    Paper fills are simulated; partial fills can't be forced, so this tries a
+    few times and reports 'not reproduced' if none happens."""
+    for n in range(1, tries + 1):
+        bid, last = last_price(data, SYMBOL)
+        _buy(api, qty, f"v5-buy{n}")
+        code, o = api.call("POST", "/v2/orders", _oco_body(qty, last * 1.10, last * 0.90, f"v5-oco{n}"))
+        if code != 200:
+            return log("V5.oco_submit", http=code, body=o)
+        time.sleep(2)
+        bid2, _ = last_price(data, SYMBOL)
+        c, r = api.call("PATCH", f"/v2/orders/{o['id']}",
+                        {"limit_price": str(round((bid2 or last) * 0.999, 2)), "client_order_id": cid(f"v5-r{n}")})
+        partial = None
+        end = time.time() + 20
+        while time.time() < end:
+            tp = order(api, (r or {}).get("id") or o["id"])
+            fq = float(tp.get("filled_qty") or 0)
+            if 0 < fq < qty:
+                partial = tp
+                break
+            if fq >= qty:
+                break
+            time.sleep(0.3)
+        if partial is not None:
+            time.sleep(2)
+            work = _working_for_symbol(api)
+            stops = [w for w in work if w["type"] in ("stop", "stop_limit")]
+            held = position_qty(api, SYMBOL)
+            log("V5.partial_fill", attempt=n, tp_filled=partial.get("filled_qty"), position=held,
+                stops=stops, stop_qty_vs_position=[(float(s_["qty"]) - float(s_["filled_qty"] or 0), held)
+                                                   for s_ in stops],
+                conclusion=("stop shrank to the remaining position" if stops and
+                            abs(float(stops[0]["qty"]) - held) < 1e-6 else
+                            "STOP DID NOT SHRINK (or is missing): over/under-protection after a partial fill"))
+            return
+        log("V5.attempt", attempt=n, http=c, result="filled in full (no partial)",
+            position_after=position_qty(api, SYMBOL))
+        cleanup(api)
+    log("V5.partial_fill", conclusion=f"not reproduced in {tries} tries on paper (fills simulated)")
+
+
 def main() -> int:
     env = os.environ
     key, secret = env.get("ALPACA_API_KEY"), env.get("ALPACA_SECRET_KEY")
@@ -372,6 +490,19 @@ def main() -> int:
     if "--cleanup-only" in sys.argv:
         cleanup(api)
         print(f"SPIKE_DONE run={RUN} cleanup-only", flush=True)
+        return 0
+    if "--oco-partial" in sys.argv:
+        _, clock = api.call("GET", "/v2/clock")
+        if not (clock or {}).get("is_open"):
+            log("V4V5.skipped", reason="market closed; V4/V5 need market hours")
+        else:
+            try:
+                v4(api, data)
+                cleanup(api)
+                v5(api, data)
+            finally:
+                cleanup(api)
+        print(f"SPIKE_DONE run={RUN} oco-partial", flush=True)
         return 0
     _, clock = api.call("GET", "/v2/clock")
     bid, last = last_price(data, SYMBOL)
