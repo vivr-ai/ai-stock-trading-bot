@@ -590,3 +590,117 @@ def test_history_paging_complete_returns_all_pages():
     br._raw = raw
     snap = br.symbol_orders_snapshot("X")
     assert snap.ok and len(snap.data) == 503 and len(calls) == 2
+
+
+# ---- review 12 Nov item 1: orphan protective orders ---------------------------------
+def _orphan_broker():
+    b = FakeBroker()
+    b.positions = {}                                         # VZ fully closed
+    b.orders = []
+    g = "grp-oco"
+    b.history = [
+        {"id": "tp", "symbol": "VZ", "side": "sell", "type": "limit", "status": "filled", "qty": 1.0,
+         "client_order_id": "sR-VZ-abc-1", "group_id": g, "group_role": "take_profit", "order_class": "oco"},
+        {"id": "st", "symbol": "VZ", "side": "sell", "type": "stop", "status": "held", "qty": 1.0,
+         "client_order_id": "alpaca-uuid-1", "group_id": g, "group_role": "stop_loss", "order_class": "oco"},
+    ]
+    b.cancels = []
+    b.cancel_ok = True
+
+    def cancel(oid, what):
+        b.cancels.append(oid)
+        if b.cancel_ok:
+            for o in b.history:
+                if o["id"] == oid:
+                    o["status"] = "canceled"
+        return True
+    b.cancel_order_once = cancel
+    b.recent = {"VZ"}
+    b.recent_order_symbols = lambda hours: b.recent
+    return b
+
+
+def test_orphan_stop_cancelled_after_grace_and_confirmed():
+    m, b, a, c, *_ = mgr(_orphan_broker())
+    m.sweep()
+    assert b.cancels == []                                   # first sight: grace
+    c.t += 61
+    m.sweep()
+    assert b.cancels == ["st"] and b.history[1]["status"] == "canceled"
+    assert "orphan_failed:VZ" not in keys(a)
+
+
+def test_delayed_oco_cancel_by_alpaca_needs_no_action():
+    m, b, a, c, *_ = mgr(_orphan_broker())
+    m.sweep()
+    b.history[1]["status"] = "canceled"                     # Alpaca's own OCO cancel, 20 s later
+    c.t += 61
+    m.sweep()
+    assert b.cancels == [] and m._orphan_seen == {}
+
+
+def test_restart_restarts_the_grace_period():
+    m, b, a, c, *_ = mgr(_orphan_broker())
+    m.sweep()
+    c.t += 61
+    m2, *_ = mgr(b)                                          # new process, nothing remembered
+    m2.clock = c
+    m2.sweep()
+    assert b.cancels == []
+
+
+def test_manual_or_unrelated_orders_are_never_touched():
+    b = _orphan_broker()
+    b.history = [
+        {"id": "man", "symbol": "VZ", "side": "sell", "type": "limit", "status": "new", "qty": 1.0,
+         "client_order_id": "my-manual-order", "group_id": None, "group_role": None},
+        {"id": "oth", "symbol": "VZ", "side": "sell", "type": "stop", "status": "held", "qty": 1.0,
+         "client_order_id": "x", "group_id": "someone-elses", "group_role": "stop_loss"},
+        {"id": "buy", "symbol": "VZ", "side": "buy", "type": "limit", "status": "new", "qty": 1.0,
+         "client_order_id": "sP-VZ-abc-1", "group_id": None},
+    ]
+    m, b, a, c, *_ = mgr(b)
+    m.sweep()
+    c.t += 61
+    m.sweep()
+    assert b.cancels == []
+
+
+def test_bracket_leg_of_our_entry_is_identified():
+    b = _orphan_broker()
+    b.history = [
+        {"id": "e", "symbol": "VZ", "side": "buy", "type": "market", "status": "filled", "qty": 1.0,
+         "client_order_id": "VZ-2026111215" + "30", "group_id": "gb", "group_role": "entry"},
+        {"id": "st", "symbol": "VZ", "side": "sell", "type": "stop", "status": "held", "qty": 1.0,
+         "client_order_id": "alpaca-2", "group_id": "gb", "group_role": "stop_loss"},
+    ]
+    m, b, a, c, *_ = mgr(b)
+    m.sweep()
+    c.t += 61
+    m.sweep()
+    assert b.cancels == ["st"]
+
+
+@pytest.mark.parametrize("what", ["history", "recent", "position_back"])
+def test_unknown_state_or_position_back_cancels_nothing(what):
+    m, b, a, c, *_ = mgr(_orphan_broker())
+    m.sweep()
+    c.t += 61
+    if what == "history":
+        b.history_ok = False
+    elif what == "recent":
+        b.recent = None
+    else:
+        b.positions = {"VZ": {"qty": 1.0, "qty_available": 0.0, "avg_entry_price": 46.0, "side": "long"}}
+    m.sweep()
+    assert b.cancels == []
+
+
+def test_failed_cleanup_is_alerted():
+    b = _orphan_broker()
+    b.cancel_ok = False                                      # cancel accepted but order stays working
+    m, b, a, c, *_ = mgr(b)
+    m.sweep()
+    c.t += 61
+    m.sweep()
+    assert b.cancels == ["st"] and ("orphan_failed:VZ", "critical") in [(k, s) for k, s, _ in a.raised]

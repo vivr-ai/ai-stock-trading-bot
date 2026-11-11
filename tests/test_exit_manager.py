@@ -269,9 +269,12 @@ def test_replace_rejected_twice_goes_to_fallback_and_a_stop_is_always_working():
 
 # 4 ---------------------------------------------------------------------------------------
 def test_partial_fill_never_replaced_then_fallback_after_5_min():
+    """Alpaca shrinks the stop to the remainder (7): never replaced, and the
+    stalled remainder goes to the fallback after 5 min."""
     t = make()
     t.m.request("AAPL", "sentiment")
     t.b.fill_live_tp(99.9, qty=3)
+    t.b.stop["qty"] = 7.0                                   # stop resized by the broker
     t.c.t += 30
     t.m.step("AAPL")
     replaces = [c for c in t.b.calls if c[0] == "replace"]
@@ -284,6 +287,19 @@ def test_partial_fill_never_replaced_then_fallback_after_5_min():
     t.c.t += 1
     t.m.step("AAPL")
     assert sells(t.b) == [("submit", "sX-AAPL-abcdef123456-1", "7")]       # the remainder only
+
+
+def test_partial_fill_with_stop_not_shrunk_is_over_protected_no_order():
+    """Review 12 Nov: never assume the stop shrinks. Stop still 10 with 7 held
+    -> OVER_PROTECTED: escalate, no blind sell, no cancel-and-recreate."""
+    t = make()
+    t.m.request("AAPL", "sentiment")
+    t.b.fill_live_tp(99.9, qty=3)
+    n = len(t.b.calls)
+    t.c.t += 400
+    t.m.step("AAPL")
+    assert t.m.active()["AAPL"] == em.ESCALATED and "exit_escalated:AAPL" in keys(t.a)
+    assert len(t.b.calls) == n and len(t.b.working_stop()) == 1
 
 
 # 5 ---------------------------------------------------------------------------------------
@@ -343,10 +359,17 @@ def test_follows_the_live_order_never_a_dead_id():
 # 8 ---------------------------------------------------------------------------------------
 def test_qty_mismatch_goes_to_fallback_not_a_patch():
     t = make()
-    t.b.qty = 7.0                                        # position smaller than the legs
+    t.b.qty = 12.0                                       # more held than the legs cover
     t.m.request("AAPL", "x")
     assert not [c for c in t.b.calls if c[0] == "replace"]
     assert t.m.active()["AAPL"] == em.FALLBACK_CANCEL
+
+
+def test_legs_for_more_than_held_escalate_without_orders():
+    t = make()
+    t.b.qty = 7.0                                        # stop and take-profit for 10, 7 held
+    t.m.request("AAPL", "x")
+    assert t.b.calls == [] and t.m.active()["AAPL"] == em.ESCALATED
 
 
 # 9 ---------------------------------------------------------------------------------------

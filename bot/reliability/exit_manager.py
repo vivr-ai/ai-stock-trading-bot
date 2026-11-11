@@ -209,6 +209,14 @@ class ExitManager:
                 return self._defer(e, "broker unreadable after resolving")
         if v["pending"]:
             return   # replace/cancel in flight at Alpaca: wait, never stack a request
+        stop_cov = sum(max(0.0, (o.get("qty") or 0.0) - (o.get("filled_qty") or 0.0)) for o in v["working"]
+                       if o.get("group_role") == "stop_loss" or o.get("type") in STOP_TYPES)
+        if stop_cov > v["qty"] + 1e-6:
+            # Review 12 Nov item 2: OVER_PROTECTED (stops for more shares than
+            # held, e.g. after a partial take-profit fill). No blind sell and no
+            # untested cancel-and-recreate: operator intervention.
+            return self._escalate(e, f"{e.symbol}: OVER_PROTECTED - stops cover {stop_cov:g} shares but "
+                                     f"{v['qty']:g} are held; no order sent, operator intervention needed")
 
         if v["x"]:
             return self._selling(e, v, now)
@@ -255,6 +263,9 @@ class ExitManager:
             if now - e.partial_since >= PARTIAL_WAIT_S:
                 return self._fallback_cancel(e, v, now, why="partial fill stalled 5 min")
             return
+        if (tp.get("qty") or 0.0) - (tp.get("filled_qty") or 0.0) > v["qty"] + 1e-6:
+            return self._escalate(e, f"{e.symbol}: take-profit for {tp.get('qty'):g} but only {v['qty']:g} "
+                                     "held; no order sent, operator intervention needed")
         if abs((tp.get("qty") or 0.0) - v["qty"]) > 1e-6:
             return self._fallback_cancel(e, v, now, why=f"take-profit qty {tp.get('qty'):g} != position "
                                                         f"{v['qty']:g} (qty can't be changed by replace)")

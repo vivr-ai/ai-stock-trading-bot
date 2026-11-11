@@ -213,6 +213,11 @@ class ProtectionManager:
                 self._missing(sym, t, now, pos.data[sym], all_orders)
         if not orders.ok:
             self.global_unknown_since = self.global_unknown_since or now
+        if orders.ok:
+            try:
+                self.orphan_sweep(now, pos.data or {})
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Orphan-order sweep failed: %s", exc)
         return {s: t.state for s, t in self.tracks.items()}
 
     def _confirm_missing(self, sym: str, positions: Dict[str, dict], seen: List[dict]):
@@ -236,6 +241,91 @@ class ProtectionManager:
             logger.info("Protection: %d working order(s) for %s found only in its order history "
                         "(e.g. stop leg of a bracket whose take-profit was replaced)", len(extra), sym)
         return classify({sym: positions[sym]}, list(seen) + extra)[sym], extra
+
+    # ---- orphan protective orders (review 12 Nov item 1) -------------------------------
+    ORPHAN_GRACE_S = 60.0          # Alpaca's own OCO cancel can lag the fill (V4, 11 Nov)
+    ORPHAN_LOOKBACK_H = 48
+
+    def _ours(self, o: dict, sym: str) -> bool:
+        import re
+
+        cid = o.get("client_order_id") or ""
+        env = self.env_tag
+        return (cid.startswith((f"{env}P-", f"{env}R-", f"{env}X-", f"{env}TEST-", "adopt-", "spike-", "drill-"))
+                or re.fullmatch(rf"{re.escape(sym)}-\d{{10}}(00|30)", cid) is not None)
+
+    def find_orphans(self, sym: str, history: List[dict]) -> List[dict]:
+        """Working SELL protective orders of a bot-managed position that is
+        now closed. Positively identified only: the order is one of ours by
+        client ID, or a stop/take-profit leg of a bracket/OCO group that
+        contains one of our orders. Anything else (a manual order, an order
+        with no group, a buy) is never touched."""
+        rows = [o for o in history if o.get("symbol") == sym]
+        our_groups = {o.get("group_id") for o in rows if o.get("group_id") and self._ours(o, sym)}
+        out = []
+        for o in rows:
+            if o.get("side") != "sell" or o.get("status") not in WORKING_STATUSES:
+                continue
+            leg = o.get("group_role") in ("stop_loss", "take_profit") and o.get("group_id") in our_groups
+            if self._ours(o, sym) or leg:
+                out.append(o)
+        return out
+
+    def orphan_sweep(self, now: float, positions: Dict[str, dict]) -> List[str]:
+        """Cancel working protective orders left behind by a fully closed
+        managed position (broker-side fill, manual close, restart, an OCO
+        sibling Alpaca hasn't cancelled). Needs fresh, successful reads; a
+        candidate must still be orphaned after ORPHAN_GRACE_S; after the
+        cancel, positions and the order history are re-read to confirm.
+        Returns the IDs cancelled and confirmed."""
+        recent = getattr(self.broker, "recent_order_symbols", None)
+        if recent is None:
+            return []
+        syms = recent(self.ORPHAN_LOOKBACK_H)
+        if syms is None:                         # unreadable: cancel nothing
+            return []
+        seen = getattr(self, "_orphan_seen", None)
+        if seen is None:
+            seen = self._orphan_seen = {}
+        live_ids, done = set(), []
+        for sym in sorted(set(syms) - set(positions)):
+            hist = self.broker.symbol_orders_snapshot(sym)
+            if not hist.ok:
+                continue                          # UNKNOWN for this symbol: nothing cancelled
+            for o in self.find_orphans(sym, hist.data or []):
+                live_ids.add(o["id"])
+                first = seen.setdefault(o["id"], now)
+                if now - first < self.ORPHAN_GRACE_S:
+                    continue
+                done += self._cancel_orphan(sym, o, now)
+        for oid in list(seen):
+            if oid not in live_ids:
+                seen.pop(oid, None)               # gone by itself (e.g. Alpaca's OCO cancel)
+        return done
+
+    def _cancel_orphan(self, sym: str, o: dict, now: float) -> List[str]:
+        pos = self.broker.positions_snapshot()   # fresh re-read right before acting
+        if not pos.ok or sym in (pos.data or {}):
+            return []
+        what = f"orphan {o.get('group_role') or o.get('type')} {o.get('client_order_id')} on closed {sym}"
+        try:
+            accepted = self.broker.cancel_order_once(o["id"], f"cancel {what}")
+        except Exception as exc:  # noqa: BLE001
+            accepted, err = None, str(exc)
+        else:
+            err = "" if accepted else "already final"
+        after_pos, after = self.broker.positions_snapshot(), self.broker.symbol_orders_snapshot(sym)
+        still = (not after.ok) or any(x.get("id") == o["id"] and x.get("status") in WORKING_STATUSES
+                                      for x in after.data or [])
+        if still or not after_pos.ok:
+            self.alerts.raise_(f"orphan_failed:{sym}",
+                               f"Could not confirm cancellation of {what} ({err or 'still working'}). "
+                               "Check it in the Alpaca dashboard.", "critical", 3600)
+            return []
+        logger.warning("Cancelled %s (confirmed: no position, order no longer working)", what)
+        self.alerts.resolve(f"orphan_failed:{sym}", f"{sym}: orphan order cleanup confirmed.")
+        self._orphan_seen.pop(o["id"], None)
+        return [o["id"]]
 
     def _global_unknown(self, now: float, why: str) -> None:
         self.global_unknown_since = self.global_unknown_since or now

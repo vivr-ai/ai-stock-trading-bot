@@ -909,6 +909,20 @@ class AlpacaBroker:
 
     HISTORY_MAX_PAGES = 6
 
+    def recent_order_symbols(self, hours: float = 48) -> Optional[Set[str]]:
+        """Symbols with any order in the last `hours` (orphan sweep). None if
+        unreadable or too many to be sure the list is complete."""
+        after = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        try:
+            rows = self._raw("GET", "/orders", {"status": "all", "after": after, "limit": 500,
+                                                "nested": "false", "direction": "desc"}) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("recent_order_symbols failed: %s", exc)
+            return None
+        if len(rows) >= 500:
+            return None
+        return {r.get("symbol") for r in rows if r.get("symbol")}
+
     def order_by_client_id(self, client_order_id: str) -> "BrokerSnapshot":
         """ok=True + data=order dict (found), ok=True + data=None (Alpaca says
         404 not found), ok=False (couldn't tell)."""

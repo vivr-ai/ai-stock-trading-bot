@@ -45,6 +45,7 @@ DATA = "https://data.alpaca.markets"
 SYMBOL = os.environ.get("SPIKE_SYMBOL", "VZ")
 RUN = uuid.uuid4().hex[:6]
 RESULTS = []
+LEAVE: set = set()      # orphan orders deliberately left for the bot's sweep (--leave-orphan-for-bot)
 
 
 def log(check, **kw):
@@ -334,6 +335,9 @@ def cleanup(api):
         if o.get("symbol") == SYMBOL and o["id"] not in {t["id"] for t in targets}:
             targets.append(o)
     for o in targets:
+        if o["id"] in LEAVE and position_qty(api, SYMBOL) == 0:
+            log("cleanup.left_for_bot", order=o["id"], role=o.get("group_role"))
+            continue
         code, body = api.call("DELETE", f"/v2/orders/{o['id']}")
         log("cleanup.cancel", order=o["id"], role=o.get("group_role"), status=o.get("status"),
             http=code, body=body)
@@ -393,7 +397,8 @@ def _working_for_symbol(api):
     hist = api.call("GET", "/v2/orders", params={"status": "all", "symbols": SYMBOL, "limit": 100,
                                                  "nested": "false"})[1] or []
     return [{k: o.get(k) for k in ("id", "client_order_id", "type", "status", "qty", "filled_qty",
-                                    "group_id", "group_role", "replaces")}
+                                    "group_id", "group_role", "replaces", "created_at", "updated_at",
+                                    "filled_at")}
             for o in hist if o.get("status") in ("new", "held", "accepted", "pending_new",
                                                   "partially_filled", "pending_replace")]
 
@@ -434,16 +439,27 @@ def v4(api, data):
         # still 'held' 0.4 s after; the clean-up then cancelled it.) Wait up
         # to 30 s WITHOUT cancelling anything and record what happens.
         gone = wait(lambda: not [w for w in _working_for_symbol(api) if w["type"] in ("stop", "stop_limit")], 30)
-        log("V4.stop_after_fill", auto_cancelled_within_30s=bool(gone),
+        if not gone and "--leave-orphan-for-bot" in sys.argv:
+            # Review 12 Nov item 1: leave this orphan (0 shares held, stop far
+            # below the price) for the bot's orphan sweep to find and cancel
+            # after this script ends; the follow-up check reads the bot's logs.
+            for w in _working_for_symbol(api):
+                if w["type"] in ("stop", "stop_limit"):
+                    LEAVE.add(w["id"])
+        log("V4.stop_after_fill", auto_cancelled_within_30s=bool(gone), left_for_bot=sorted(LEAVE),
             working=_working_for_symbol(api),
             conclusion="Alpaca cancelled the OCO stop itself" if gone else
                        "STOP STILL WORKING 30 s after the take-profit filled (0 shares held)")
 
 
-def v5(api, data, qty=5, tries=3):
+def v5(api, data, qty=None, tries=None):
     """Partial take-profit fill: what does Alpaca do to the linked stop's qty?
     Paper fills are simulated; partial fills can't be forced, so this tries a
-    few times and reports 'not reproduced' if none happens."""
+    few times and reports 'not reproduced' if none happens. Review 12 Nov: a
+    separate, controlled multi-share test (SPIKE_V5_QTY, default 20 shares,
+    SPIKE_V5_TRIES default 5) - the 1-share test entries can't partial."""
+    qty = qty or int(os.environ.get("SPIKE_V5_QTY", "20"))
+    tries = tries or int(os.environ.get("SPIKE_V5_TRIES", "5"))
     for n in range(1, tries + 1):
         bid, last = last_price(data, SYMBOL)
         _buy(api, qty, f"v5-buy{n}")
@@ -469,10 +485,22 @@ def v5(api, data, qty=5, tries=3):
             # Sample at once (11 Nov run: after a 2 s pause the partial had
             # already completed and the stop was gone, so nothing could be
             # concluded about the stop's quantity DURING the partial).
-            work = _working_for_symbol(api)
-            stops = [w for w in work if w["type"] in ("stop", "stop_limit")]
-            held = position_qty(api, SYMBOL)
-            if held <= 0 or not stops:
+            # Sample the stop repeatedly while the take-profit is partially filled.
+            samples = []
+            t_end = time.time() + 3
+            while time.time() < t_end:
+                tp_now = order(api, partial["id"])
+                work = _working_for_symbol(api)
+                samples.append({"at": datetime.now(timezone.utc).isoformat(),
+                                "tp_status": tp_now.get("status"), "tp_filled": tp_now.get("filled_qty"),
+                                "tp_qty": tp_now.get("qty"), "position": position_qty(api, SYMBOL),
+                                "stops": [w for w in work if w["type"] in ("stop", "stop_limit")]})
+                if tp_now.get("status") != "partially_filled":
+                    break
+            log("V5.partial_samples", attempt=n, samples=samples)
+            stops = samples[0]["stops"]
+            held = samples[0]["position"]
+            if held <= 0 or not stops or samples[0]["tp_status"] != "partially_filled":
                 log("V5.partial_fill", attempt=n, tp_filled=partial.get("filled_qty"), position=held,
                     stops=stops, conclusion="partial completed before the stop could be observed - "
                                             "NOT VERIFIED")
