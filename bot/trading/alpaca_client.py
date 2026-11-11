@@ -892,11 +892,22 @@ class AlpacaBroker:
                   "direction": "desc"}
         if after_iso:
             params["after"] = after_iso
+        rows: list = []
         try:
-            rows = self._raw("GET", "/orders", params)
+            for _page in range(self.HISTORY_MAX_PAGES):
+                page = self._raw("GET", "/orders", params) or []
+                rows.extend(page)
+                if len(page) < params["limit"]:
+                    return BrokerSnapshot(True, flatten_orders(rows), "")
+                # Next (older) page: everything submitted before the oldest row so far.
+                params = dict(params, until=min(o.get("submitted_at") or o.get("created_at") for o in page))
         except Exception as exc:  # noqa: BLE001
             return BrokerSnapshot(False, None, str(exc))
-        return BrokerSnapshot(True, flatten_orders(rows or []), "")
+        # Too much history to be sure it's complete: callers must treat as UNKNOWN.
+        return BrokerSnapshot(False, None, f"order history for {symbol} exceeds "
+                                           f"{self.HISTORY_MAX_PAGES} pages")
+
+    HISTORY_MAX_PAGES = 6
 
     def order_by_client_id(self, client_order_id: str) -> "BrokerSnapshot":
         """ok=True + data=order dict (found), ok=True + data=None (Alpaca says

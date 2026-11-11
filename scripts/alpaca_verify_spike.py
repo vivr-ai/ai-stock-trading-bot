@@ -337,8 +337,24 @@ def cleanup(api):
         code, body = api.call("DELETE", f"/v2/positions/{SYMBOL}")
         log("cleanup.flatten", http=code, body=body)
         wait(lambda: position_qty(api, SYMBOL) == 0, 30)
-    log("cleanup", symbol=SYMBOL, position=position_qty(api, SYMBOL),
+    left = position_qty(api, SYMBOL)
+    log("cleanup", symbol=SYMBOL, position=left,
         open_orders=len([o for o in open_orders() if o.get("symbol") == SYMBOL]))
+    reconcile_after_cancel(api, left)
+
+
+def reconcile_after_cancel(api, left):
+    """Review 11 Nov (VZ incident): after any cancel that could affect
+    protection, check the broker straight away - don't wait for a sweep. A
+    share left with no working stop is reported as a critical incident."""
+    if left <= 0:
+        return
+    hist = api.call("GET", "/v2/orders", params={"status": "all", "symbols": SYMBOL, "limit": 100,
+                                                 "nested": "false"})[1] or []
+    stops = [o for o in hist if o.get("side") == "sell" and o.get("type") in ("stop", "stop_limit")
+             and o.get("status") in ("new", "held", "accepted", "pending_new", "partially_filled")]
+    log("cleanup.reconcile", symbol=SYMBOL, position=left, working_stops=len(stops),
+        incident=None if stops else "CRITICAL: position left WITHOUT a working stop")
 
 
 def main() -> int:

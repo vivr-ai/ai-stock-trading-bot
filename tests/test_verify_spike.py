@@ -103,3 +103,23 @@ def test_default_symbol_is_outside_the_universe():
     from bot.universe.static_universe import STATIC_UNIVERSE
 
     assert sp.SYMBOL not in STATIC_UNIVERSE
+
+
+def test_vz_regression_cleanup_reports_a_share_left_without_a_stop(monkeypatch):
+    """Permanent regression case for the 10 Nov VZ incident: if a share is
+    left after cleanup with no working stop, it is reported as critical."""
+    monkeypatch.setattr(sp.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sp, "wait", lambda pred, timeout=60, every=0.5: pred())
+    api = FakeApi(orders=[], pos=1.0)
+    api.call_orig = api.call
+
+    def call(method, path, body=None, params=None, timeout=15):
+        if method == "DELETE" and path.startswith("/v2/positions/"):
+            api.calls.append((method, path))
+            return 403, {"message": "flatten refused"}        # share can't be sold
+        return api.call_orig(method, path, body, params, timeout)
+    api.call = call
+    sp.RESULTS.clear()
+    sp.cleanup(api)
+    rec = [r for r in sp.RESULTS if r["check"] == "cleanup.reconcile"]
+    assert rec and rec[0]["incident"].startswith("CRITICAL")

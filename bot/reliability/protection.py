@@ -51,6 +51,11 @@ from ..trading.order_ids import attempts_at_broker, order_id, position_ref  # no
 logger = logging.getLogger(__name__)
 
 PROTECTED, UNDER_PROTECTED, UNPROTECTED, UNKNOWN = "PROTECTED", "UNDER_PROTECTED", "UNPROTECTED", "UNKNOWN"
+# Working stops cover MORE shares than are held (e.g. a take-profit partly
+# filled and Alpaca did not shrink the linked stop). Never assumed fine: a
+# stop for more than is held could sell more than is held. Alert + block
+# entries; no automatic order until Alpaca's behaviour is verified (6c V5).
+OVER_PROTECTED = "OVER_PROTECTED"
 STOP_TYPES = {"stop", "stop_limit", "trailing_stop"}
 ATTEMPT_OFFSETS_S = (0.0, 60.0, 120.0)
 CONFIRM_AFTER_S = 30.0
@@ -59,11 +64,19 @@ EPS = 1e-6
 
 # ---- pure classification ---------------------------------------------------
 def stop_coverage(orders: List[dict], symbol: str) -> float:
-    covered = 0.0
-    for o in orders:
-        if o.get("symbol") != symbol or o.get("side") != "sell":
+    """Shares covered by WORKING stop orders (stop legs of brackets/OCOs and
+    stand-alone stops), remaining quantity only. Replaced/cancelled/filled/
+    rejected orders don't count, and an order being replaced is counted once
+    (its replacement, when both show as working)."""
+    rows = [o for o in orders if o.get("symbol") == symbol and o.get("side") == "sell"]
+    replaced_by_working = {o.get("replaces") for o in rows
+                           if o.get("replaces") and o.get("status") in WORKING_STATUSES}
+    covered, seen = 0.0, set()
+    for o in rows:
+        if o.get("status") not in WORKING_STATUSES or o.get("id") in seen:
             continue
-        if o.get("status") not in WORKING_STATUSES:
+        seen.add(o.get("id"))
+        if o.get("id") in replaced_by_working:
             continue
         if o.get("group_role") == "stop_loss" or o.get("type") in STOP_TYPES:
             covered += max(0.0, (o.get("qty") or 0.0) - (o.get("filled_qty") or 0.0))
@@ -80,7 +93,9 @@ def classify(positions: Optional[Dict[str, dict]], orders: Optional[List[dict]])
             out[sym] = (UNKNOWN, 0.0)
             continue
         cov = stop_coverage(orders, sym)
-        if cov + EPS >= qty:
+        if cov > qty + EPS:
+            out[sym] = (OVER_PROTECTED, cov)
+        elif cov + EPS >= qty:
             out[sym] = (PROTECTED, cov)
         elif cov > EPS:
             out[sym] = (UNDER_PROTECTED, cov)
@@ -146,6 +161,8 @@ class ProtectionManager:
         for sym, t in self.tracks.items():
             if t.state == UNKNOWN:
                 return True, f"{sym} protection status UNKNOWN"
+            if t.state == OVER_PROTECTED:
+                return True, f"{sym} stop covers more shares than are held"
             if t.state in (UNPROTECTED, UNDER_PROTECTED) and t.missing_since is not None \
                     and now - t.missing_since > 300:
                 return True, f"{sym} unprotected for {int(now - t.missing_since)}s"
@@ -178,6 +195,16 @@ class ProtectionManager:
             t.covered = covered
             if state == PROTECTED:
                 self._protected(sym, t, now)
+            elif state == OVER_PROTECTED:
+                t.state, t.unknown_since = OVER_PROTECTED, None
+                t.missing_since = t.missing_since or now
+                self.alerts.raise_(
+                    f"prot_over:{sym}",
+                    f"{sym}: working stop orders cover {covered:g} shares but only "
+                    f"{pos.data[sym].get('qty'):g} are held (e.g. after a partial take-profit fill). "
+                    "A stop for more than is held could sell more than is held. New entries are "
+                    "blocked; nothing is changed automatically - check it in the Alpaca dashboard.",
+                    "critical", 3600)
             elif state == UNKNOWN:
                 self._unknown(sym, t, now, orders.error or "position state anomalous")
             else:
@@ -269,10 +296,13 @@ class ProtectionManager:
             return
         if t.missing_since is None:
             t.missing_since = now
+            # Confirmed (after the order-history second look) with no stop at
+            # all = a critical incident (VZ, 10 Nov); partial cover = warning.
             self.alerts.raise_(f"prot_missing:{sym}",
                                f"{sym} is {t.state.replace('_', ' ').lower()} at the broker "
                                f"({t.covered:g} of {pos.get('qty'):g} shares covered by a stop). "
-                               "Restoring protection now.", "warning", 900)
+                               "Restoring protection now.",
+                               "critical" if t.state == UNPROTECTED else "warning", 900)
         if t.escalated:
             self._escalate(sym, t, now, None)
             return

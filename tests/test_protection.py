@@ -180,7 +180,7 @@ def test_missing_protection_restored_immediately_with_deterministic_id():
     assert len(b.submits) == 1
     sym, qty, stop, tp, cid = b.submits[0]
     assert (sym, qty, stop, tp, cid) == ("AAPL", 10.0, 90.0, 150.0, "sP-AAPL-3f2a9c1e5b7d-1")
-    assert ("prot_missing:AAPL", "warning") in [(k, s) for k, s, _ in a.raised]
+    assert ("prot_missing:AAPL", "critical") in [(k, s) for k, s, _ in a.raised]   # confirmed no stop: critical (VZ, 10 Nov)
     b.orders = [stop_leg("AAPL", 10, cid="sP-AAPL-3f2a9c1e5b7d-1")]   # broker now shows it
     c.t += 30
     assert m.sweep() == {"AAPL": PROTECTED}
@@ -524,3 +524,69 @@ def test_history_without_a_working_stop_stays_unprotected():
 def test_failed_second_read_means_unknown_and_no_order():
     m, b, *_ = mgr(_vz_broker(history_ok=False))
     assert m.sweep()["VZ"] == UNKNOWN and b.submits == []
+
+
+# ---- review 11 Nov: second-look hardening ------------------------------------------
+def test_replaced_order_counted_once_and_dead_statuses_ignored():
+    from bot.reliability.protection import stop_coverage
+
+    rows = [
+        {"id": "s1", "symbol": "X", "side": "sell", "type": "stop", "status": "pending_replace", "qty": 10.0},
+        {"id": "s2", "symbol": "X", "side": "sell", "type": "stop", "status": "pending_new", "qty": 10.0,
+         "replaces": "s1"},
+        {"id": "s0", "symbol": "X", "side": "sell", "type": "stop", "status": "replaced", "qty": 10.0},
+        {"id": "s3", "symbol": "X", "side": "sell", "type": "stop", "status": "canceled", "qty": 10.0},
+        {"id": "s4", "symbol": "X", "side": "sell", "type": "stop", "status": "rejected", "qty": 10.0},
+        {"id": "s5", "symbol": "X", "side": "sell", "type": "stop", "status": "filled", "qty": 10.0},
+        {"id": "s6", "symbol": "X", "side": "sell", "type": "stop", "status": "partially_filled", "qty": 4.0,
+         "filled_qty": 1.0},
+    ]
+    assert stop_coverage(rows, "X") == 13.0     # s2 (10) + s6 remaining (3)
+
+
+def test_stop_covering_more_than_held_is_over_protected_alerted_and_blocks_entries():
+    """Partial take-profit fill: 6 held, linked stop still for 10 (review 11 Nov:
+    never assume Alpaca shrinks it)."""
+    from bot.reliability.protection import OVER_PROTECTED
+
+    m, b, a, *_ = mgr()
+    b.positions["AAPL"]["qty"] = 6.0
+    b.orders = [{"id": "st", "symbol": "AAPL", "side": "sell", "type": "stop", "status": "held",
+                 "qty": 10.0, "filled_qty": 0.0, "group_role": "stop_loss"}]
+    assert m.sweep()["AAPL"] == OVER_PROTECTED
+    assert ("prot_over:AAPL", "critical") in [(k, s) for k, s, _ in a.raised]
+    assert b.submits == [] and m.entry_blocker()[0]
+
+
+def test_history_paging_incomplete_means_unknown():
+    from types import SimpleNamespace as NS
+
+    from bot.trading.alpaca_client import AlpacaBroker
+
+    br = AlpacaBroker.__new__(AlpacaBroker)
+    pages = []
+
+    def raw(method, path, params=None, retry=True):
+        pages.append(dict(params))
+        return [{"id": f"o{len(pages)}-{i}", "symbol": "X", "submitted_at": f"2026-11-{10 - len(pages):02d}T00:00:0{i % 10}Z"}
+                for i in range(500)]
+    br._raw = raw
+    snap = br.symbol_orders_snapshot("X")
+    assert not snap.ok and "exceeds" in snap.error and len(pages) == AlpacaBroker.HISTORY_MAX_PAGES
+    assert "until" in pages[1] and pages[1]["until"] < pages[0].get("until", "9999")
+
+
+def test_history_paging_complete_returns_all_pages():
+    from bot.trading.alpaca_client import AlpacaBroker
+
+    br = AlpacaBroker.__new__(AlpacaBroker)
+    calls = []
+
+    def raw(method, path, params=None, retry=True):
+        calls.append(params)
+        n = 500 if len(calls) == 1 else 3
+        return [{"id": f"p{len(calls)}-{i}", "symbol": "X", "status": "filled",
+                 "submitted_at": f"2026-11-0{len(calls)}T00:00:00Z"} for i in range(n)]
+    br._raw = raw
+    snap = br.symbol_orders_snapshot("X")
+    assert snap.ok and len(snap.data) == 503 and len(calls) == 2

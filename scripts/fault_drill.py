@@ -107,6 +107,10 @@ def flatten(api):
     if position_qty(api, SYMBOL) > 0:
         api.call("DELETE", f"/v2/positions/{SYMBOL}")
         wait(lambda: position_qty(api, SYMBOL) == 0, 30)
+    left = position_qty(api, SYMBOL)
+    if left > 0:
+        out("flatten_incomplete", position=left,
+            incident="CRITICAL: drill symbol still held after cleanup; check for a working stop")
 
 
 def open_bracket(api, data, tag):
