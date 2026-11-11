@@ -159,17 +159,36 @@ def test_13_two_instances_only_the_lease_holder_acts():
 
 # 14 -------------------------------------------------------------------------------------
 def test_14_failed_exit_then_failed_restores_escalate():
-    b, c, al = FakeAlpaca(), Clock(), Alerts()
-    b.replace_behaviour = ["reject"] * 10
-    b.submit_behaviour = ["reject"] * 10
-    m = manager(b, c, alerts=al)
+    """Live drill 11 Nov: while protection is being restored the exit waits
+    (one sweep request a minute, no inflated failure count); once protection
+    is back it exits again; three real exit failures raise a critical alert."""
+    b, c, al = SharedBroker(), Clock(), Alerts()
+    from bot.reliability.protection import ProtectionManager
+    from tests.test_protection import RISK
+
+    pm = ProtectionManager(b, RISK, "s", al, clock=c)
+    sweeps = []
+    real_sweep = pm.sweep
+    pm.sweep = lambda: sweeps.append(c.t) or real_sweep()
+    m = em.ExitManager(b, al, "s", protection=pm, clock=c, market_open=lambda: True)
+    pm.hold_off = m.holds_protection
+    b.replace_behaviour = ["reject", "reject"] * 3
+    b.submit_behaviour = ["reject"] * 3
     m.request("AAPL", "x")
-    for _ in range(12):
-        c.t += 30
+    for _ in range(60):
+        c.t += 10
+        if "AAPL" not in m.exits:
+            break
         m.step("AAPL")
         invariants(b)
-    assert m.protection.sweeps >= 3 and "exit_failed:AAPL" in keys(al)
-    assert all(sev == "critical" for k, sev, _ in al.raised if k == "exit_failed:AAPL")
+    e = m.exits.get("AAPL")
+    # Each cycle: reject, reject, fallback, sell rejected -> protection restored
+    # by the protection manager -> exit tried again.
+    assert len([x for x in b.calls if x[0] == "oco"]) >= 2          # protection put back each time
+    assert "exit_failed:AAPL" in keys(al)                             # after 3 real failures
+    gaps = [b_ - a_ for a_, b_ in zip(sweeps, sweeps[1:])]
+    assert all(g >= 10 for g in gaps)                                 # no tight loop
+    assert e is None or e.failed_exits <= 3
 
 
 # 15 broker outage -----------------------------------------------------------------------

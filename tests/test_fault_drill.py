@@ -48,3 +48,11 @@ def test_guard_refuses_wrong_environment_and_wrong_account():
         fd.guard({"BOT_ENVIRONMENT": "production"}, Api(0, []))
     with pytest.raises(SystemExit, match="identity"):
         fd.guard({"BOT_ENVIRONMENT": "staging", "EXPECTED_ALPACA_ACCOUNT_NUMBER": "PA0000N70Z"}, Api(0, []))
+
+
+def test_replacement_chain_counts_as_one_sell():
+    seen = {"since": "2026-11-12T15:00:00Z"}
+    old = dict(o("tp", "pending_replace"), id="a")
+    new = dict(o("sR-1", "pending_new"), id="b", replaces="a")
+    fd.invariant_check(Api(1, [old, new]), 1.0, seen)
+    assert "breaches" not in seen and seen["max_live"] == 1

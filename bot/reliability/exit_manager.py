@@ -57,6 +57,7 @@ QUOTE_MAX_AGE_S = 30.0        # a price is only computed from a fresh quote (IEX
 QUOTE_MAX_SPREAD = 0.01       # wider than 1% of mid = illiquid: don't price into it
 MAX_DRIFT_FROM_FIRST = 0.03   # bid >3% below the first exit quote: stop chasing, escalate
 QUOTE_DEFER_ESCALATE_S = 300.0
+RESTORE_WAIT_S = 60.0         # between extra protection-sweep requests while waiting
 
 
 @dataclass
@@ -77,6 +78,7 @@ class Exit:
     uncertain: Optional[dict] = None      # {cid, kind, at, sweeps}
     first_bid: Optional[float] = None     # bid at the first price; the anti-chase reference
     quote_bad_since: Optional[float] = None
+    restore_at: Optional[float] = None
     history: List[dict] = field(default_factory=list)
 
 
@@ -222,11 +224,25 @@ class ExitManager:
                     return self._uncertain_cancel(e, "shares still held for orders after cancels")
                 return
             return self._sell(e, v, now)
-        if e.state in (SELLING, RESTORE_PROTECTION):
+        if e.state == SELLING:
             return self._restore(e, "fallback sell did not complete")
-        # Exit requested on a position with no protection at all: protect first,
-        # the exit is re-decided at the next cycle (design: reconciliation table).
-        return self._restore(e, "position had no working orders; protecting before exiting")
+        # No working orders and shares held: protect first; the exit is retried
+        # once protection is back (design: reconciliation table). 6c live drill,
+        # 11 Nov: while the protection manager was between its own restore
+        # attempts (0/60/120 s) this re-ran every step and counted each one as
+        # a failed exit. Now: one hand-back, then wait for protection, at most
+        # one extra sweep request a minute, and no failure counted for waiting.
+        if e.state == RESTORE_PROTECTION and e.restore_at is not None:
+            if now - e.restore_at < RESTORE_WAIT_S:
+                return
+            e.restore_at = now
+            if self.protection is not None:
+                try:
+                    self.protection.sweep()
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Protection sweep (%s) failed: %s", e.symbol, exc)
+            return
+        return self._restore(e, "position had no working orders; protecting before exiting", count=False)
 
     # ---- the take-profit path ------------------------------------------------------
     def _with_tp(self, e: Exit, v: dict, tp: dict, now: float) -> None:
@@ -248,8 +264,11 @@ class ExitManager:
             # take-profit is already one of our replacements. Adopt it rather
             # than sending another price straight away (6c test 12/13).
             e.last_cid, e.priced_at = cid_live, now
-            e.prices = sum(1 for o in v["orders"]
-                           if (o.get("client_order_id") or "").startswith(f"{self.env_tag}R-{e.symbol}-"))
+            # Count only THIS position's R series (6c live drill, 11 Nov: counting
+            # every sR-<symbol>- order in the history picked up earlier
+            # positions' replacements and reported 3 prices instead of 1).
+            series = cid_live.rsplit("-", 1)[0] + "-"
+            e.prices = sum(1 for o in v["orders"] if (o.get("client_order_id") or "").startswith(series))
             self._note(e, EXIT_WORKING, f"adopted live replacement {cid_live} after restart "
                                         f"({e.prices} price(s) already tried)")
             return
@@ -370,21 +389,25 @@ class ExitManager:
                 logger.error("Cancel of unfilled exit %s failed: %s", x.get("id"), exc)
 
     # ---- protection hand-back, uncertainty, closing --------------------------------------
-    def _restore(self, e: Exit, why: str) -> None:
-        e.failed_exits += 1
+    def _restore(self, e: Exit, why: str, count: bool = True) -> None:
+        if count:
+            e.failed_exits += 1
         self._note(e, RESTORE_PROTECTION, why)
+        e.restore_at = self.clock()
         if self.protection is not None:
             try:
                 self.protection.sweep()     # same sweep: restores if confirmed missing
             except Exception as exc:  # noqa: BLE001
                 logger.error("Protection sweep after failed exit (%s) failed: %s", e.symbol, exc)
-        if e.failed_exits >= MAX_FAILED_EXITS:
+        if count and e.failed_exits >= MAX_FAILED_EXITS:
             self.alerts.raise_(f"exit_failed:{e.symbol}",
                                f"{e.symbol}: exit failed {e.failed_exits} times ({why}). Position kept "
                                "under protection; check it in the Alpaca dashboard.", "critical", 3600)
-        # Exit retried from the next step with the next attempt number.
+        # The exit is retried (next attempt number) as soon as working
+        # protection is seen again: RESTORE_PROTECTION + a take-profit leg
+        # goes straight back to repricing.
         e.prices, e.rejects, e.priced_at, e.cancel_at, e.sell_at, e.partial_since = 0, 0, None, None, None, None
-        e.state = EXIT_REQUESTED
+        e.first_bid = None
 
     def _resolve_uncertain(self, e: Exit, v: dict) -> bool:
         u = e.uncertain

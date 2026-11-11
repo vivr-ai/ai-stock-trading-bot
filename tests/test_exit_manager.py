@@ -383,7 +383,7 @@ def test_failed_fallback_sell_restores_protection_in_the_same_step():
     t.m.step("AAPL")
     t.c.t += 1
     t.m.step("AAPL")
-    assert t.prot.sweeps == 1 and t.m.active()["AAPL"] == em.EXIT_REQUESTED
+    assert t.prot.sweeps == 1 and t.m.active()["AAPL"] == em.RESTORE_PROTECTION
 
 
 def test_unfilled_fallback_sell_is_cancelled_then_protection_restored():
@@ -503,3 +503,15 @@ def test_does_not_chase_a_falling_price():
     assert t.m.active()["AAPL"] == em.ESCALATED
     assert len([c for c in t.b.calls if c[0] == "replace"]) == 1   # no lower reprice
     assert len(t.b.working_stop()) == 1
+
+
+def test_adoption_counts_only_this_positions_replacements():
+    """Live drill 11 Nov: an earlier position's sR-AAPL-<other ref>- orders
+    were counted as prices already tried."""
+    t = make()
+    t.b._add(side="sell", type="limit", status="filled", qty=1.0, cid="sR-AAPL-0ldp0s1t10n0-1")
+    t.b._add(side="sell", type="limit", status="filled", qty=1.0, cid="sR-AAPL-0ldp0s1t10n0-2")
+    t.m.request("AAPL", "x")                                   # R-1 for this position
+    m2 = em.ExitManager(t.b, t.a, "s", protection=t.prot, clock=t.c, market_open=lambda: True)
+    m2.request("AAPL", "x")
+    assert m2.exits["AAPL"].prices == 1 and m2.active()["AAPL"] == em.EXIT_WORKING

@@ -86,6 +86,10 @@ def invariant_check(api, bought, seen):
                if o.get("side") == "sell" and o.get("filled_at") and o.get("created_at", "") >= seen["since"])
     live = [o for o in hist if o.get("side") == "sell" and o.get("type") != "stop"
             and o.get("status") in WORKING and o.get("created_at", "") >= seen["since"]]
+    # An order being replaced and its replacement are ONE sell (live drill
+    # 11 Nov: a read mid-replace saw both and reported "2 working sells").
+    replacing = {o.get("replaces") for o in live if o.get("replaces")}
+    live = [o for o in live if o.get("id") not in replacing]
     bad = []
     if pos < 0:
         bad.append("short position")
