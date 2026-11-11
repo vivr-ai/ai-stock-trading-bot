@@ -376,3 +376,16 @@ def test_health_check_fails_when_schema_not_applied():
     assert "decisions" in rec.last_error and "heartbeats" in rec.last_error
     gate = DbHealthGate(rec, alert=_Alerts())
     assert gate.check() is False and "schema not applied" in gate.last_reason
+
+
+def test_reconcile_second_look_finds_hidden_stop():
+    from bot.trading.alpaca_client import BrokerSnapshot
+
+    b = _ReconBroker(positions=("VZ",), protected=())
+    b.symbol_orders_snapshot = lambda s: BrokerSnapshot(True, [
+        {"symbol": "VZ", "side": "sell", "status": "held", "type": "stop", "group_role": "stop_loss"}], "")
+    ok, summary = make_reconciler(_ReconRecorder(rows=("VZ",)), b, None)()
+    assert ok and "UNPROTECTED" not in summary and "stop found in order history: VZ" in summary
+    b.symbol_orders_snapshot = lambda s: BrokerSnapshot(True, [], "")
+    ok, summary = make_reconciler(_ReconRecorder(rows=("VZ",)), b, None)()
+    assert "UNPROTECTED (adoption will re-protect): VZ" in summary

@@ -235,7 +235,13 @@ def build(cfg):
         strategy.entry_blockers.append(strategy.protection.entry_blocker)
         strategy.protection.emergency_exit_enabled = rel.exit_manager_enabled
         if strategy.lease is not None:
-            strategy.protection.active = lambda: strategy.lease.can_submit("protect")[0]
+            # ensure_ready, not just can_submit: after a redeploy outside
+            # market hours the lease would otherwise stay un-reconciled until
+            # the first trading cycle (09:00 New York), and no protection
+            # sweep would run in between (staging, 10 Nov: VZ lost its stop
+            # overnight and was only re-protected at 09:00). Cheap when the
+            # lease is already held and fresh.
+            strategy.protection.active = lambda: strategy.lease.ensure_ready()[0]
     return broker, summary_logger, reporter, strategy, recorder
 
 

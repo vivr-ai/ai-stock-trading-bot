@@ -38,10 +38,26 @@ def make_reconciler(recorder, broker, journal):
         if protected is None:
             return False, "could not read broker protective orders"
         unprotected = sorted(s for s in positions if s not in protected)
+        # Second look (10 Nov): a stop leg whose take-profit was replaced is
+        # missing from the open-orders list; it is in the symbol's history.
+        hidden = []
+        if unprotected and hasattr(broker, "symbol_orders_snapshot"):
+            from ..trading.alpaca_client import WORKING_STATUSES
+            for sym in list(unprotected):
+                snap = broker.symbol_orders_snapshot(sym)
+                if snap.ok and any(o.get("symbol") == sym and o.get("side") == "sell"
+                                   and o.get("status") in WORKING_STATUSES
+                                   and (o.get("group_role") == "stop_loss"
+                                        or o.get("type") in ("stop", "stop_limit", "trailing_stop"))
+                                   for o in snap.data or []):
+                    unprotected.remove(sym)
+                    hidden.append(sym)
         no_row = sorted(s for s in positions if recorder.get_last_buy_trade(s) is None)
         parts.append(f"{len(positions)} positions held")
         if unprotected:
             parts.append(f"UNPROTECTED (adoption will re-protect): {', '.join(unprotected)}")
+        if hidden:
+            parts.append(f"stop found in order history: {', '.join(hidden)}")
         if no_row:
             parts.append(f"no DB buy row (adoption will backfill): {', '.join(no_row)}")
         return True, "; ".join(parts)

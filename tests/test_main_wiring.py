@@ -3,6 +3,7 @@ and the Stage 2 gate/journal, with a fake broker (no network)."""
 import os
 import sys
 
+import psycopg2
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -75,3 +76,25 @@ def test_exit_manager_requires_lease(cfg_env):
     cfg_env.setenv("EXIT_MANAGER_ENABLED", "true")
     with pytest.raises(ValueError, match="INSTANCE_LEASE_ENABLED"):
         load_config("nonexistent.ini")
+
+
+def test_protection_hook_reconciles_the_lease_off_hours(cfg_env, tmp_path, pg_url):
+    """10 Nov: after an off-hours redeploy the lease stayed un-reconciled
+    until 09:00 New York, so no protection sweep ran overnight. The
+    protection manager's 'active' hook now runs the lease's ensure_ready."""
+    cfg_env.setenv("BOT_ENVIRONMENT", "staging")
+    cfg_env.setenv("EXPECTED_ALPACA_ACCOUNT_NUMBER", "PA111111111")
+    cfg_env.setenv("DATABASE_URL", pg_url)
+    cfg_env.setenv("JOURNAL_DIR", str(tmp_path / "journal"))
+    cfg_env.setenv("INSTANCE_LEASE_ENABLED", "true")
+    cfg_env.setenv("PROTECTION_SWEEP_ENABLED", "true")
+    broker, _, _, strategy, _ = main.build(load_config("nonexistent.ini"))
+    with psycopg2.connect(pg_url) as c, c.cursor() as cur:
+        cur.execute("DELETE FROM bot_lease WHERE name = %s", (strategy.lease.name,))
+    calls = []
+    strategy.lease.reconcile = lambda: (calls.append(1) or True, "0 positions held")
+    assert strategy.lease.try_acquire() and strategy.lease.state == "reconciling"
+    assert strategy.protection.active() is True          # reconciled here, no cycle needed
+    assert calls == [1] and strategy.lease.state == "held"
+    assert strategy.protection.active() is True and calls == [1]   # cheap once held
+    strategy.lease.release()
