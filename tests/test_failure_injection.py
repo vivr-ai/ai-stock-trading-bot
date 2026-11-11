@@ -12,6 +12,7 @@ import pytest
 
 from bot.reliability import exit_manager as em
 from bot.reliability.fault_injection import FaultInjector, from_env
+from tests.pg_fixture import pg_url  # noqa: F401 - fixture
 from tests.test_exit_manager import Alerts, Clock, FakeAlpaca, Prot, keys, sells
 
 
@@ -241,3 +242,44 @@ def test_injected_sell_lost_retries_with_the_same_id():
     run(m, b, c, steps=4, dt=2)
     ids = [x[1] for x in b.calls if x[0] == "submit"]
     assert ids == ["sX-AAPL-abcdef123456-1"] and m.faults.fired[0][0] == "sell_lost"
+
+
+# DB outage drill via injection ----------------------------------------------------------
+def test_db_outage_window_refuses_connections_only_inside_the_window():
+    import psycopg2
+
+    f = FaultInjector("db_outage:1-3", allow=True)
+    t = {"now": 0.0}
+    rec = SimpleNamespace(_psycopg2=psycopg2)
+    store = SimpleNamespace(_pg=psycopg2)
+    proxy = f.wrap_db(recorder=rec, lease_store=store, clock=lambda: t["now"])
+    assert rec._psycopg2 is proxy and store._pg is proxy
+    assert not f.db_down(30) and f.db_down(61) and f.db_down(179) and not f.db_down(181)
+    t["now"] = 90
+    with pytest.raises(psycopg2.OperationalError, match="injected DB outage"):
+        proxy.connect("postgresql://x")
+    assert proxy.OperationalError is psycopg2.OperationalError     # the rest passes through
+    assert [n for n, _ in f.fired] == ["db_outage"]
+    with pytest.raises(ValueError):
+        FaultInjector("db_outage:5-2", allow=True)
+
+
+def test_db_outage_drill_end_to_end_with_real_postgres(pg_url, tmp_path):
+    """The recorder and the lease both lose the DB inside the window and get
+    it back after - against a real throwaway Postgres."""
+    from bot.persistence.db import Recorder
+    from bot.reliability.lease import InstanceLease, PgLeaseStore
+
+    f = FaultInjector("db_outage:1-2", allow=True)
+    t = {"now": 0.0}
+    rec = Recorder(database_url=pg_url)
+    store = PgLeaseStore(pg_url)
+    f.wrap_db(recorder=rec, lease_store=store, clock=lambda: t["now"])
+    assert rec.health_check()
+    t["now"] = 70
+    assert not rec.health_check()
+    from bot.reliability.lease import LeaseStoreError
+    with pytest.raises(LeaseStoreError):
+        store.acquire("trader:drill", "A", 90)
+    t["now"] = 130
+    assert rec.health_check() and store.acquire("trader:drill", "A", 90) is not None

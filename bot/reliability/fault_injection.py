@@ -17,6 +17,11 @@ Faults
   restore_reject[:n]        protective OCO -> rejected                      test 14
   read_errors[:n]           positions/orders reads fail                     broker outage
   kill_at:<STATE>           process exits right after entering STATE       test 12
+  db_outage:<start_min>-<end_min>
+                            every NEW database connection (bot recorder AND
+                            trading lease) fails with OperationalError from
+                            <start_min> to <end_min> minutes after start-up.
+                            The DB outage drill, with no Railway changes.
 """
 from __future__ import annotations
 
@@ -29,7 +34,7 @@ from ..trading.alpaca_client import OrderOutcomeUnknown, OrderRejected
 logger = logging.getLogger(__name__)
 
 KNOWN = {"replace_reject", "replace_drop_response", "sell_reject", "sell_drop_response", "sell_lost",
-         "restore_reject", "read_errors", "kill_at"}
+         "restore_reject", "read_errors", "kill_at", "db_outage"}
 
 
 class FaultInjector:
@@ -40,12 +45,18 @@ class FaultInjector:
             raise RuntimeError("STAGING_FAULTS is only allowed when BOT_ENVIRONMENT=staging")
         self.counts: Dict[str, int] = {}
         self.kill_states = set()
+        self.db_window = None
         for part in filter(None, (p.strip() for p in (spec or "").split(","))):
             name, _, arg = part.partition(":")
             if name not in KNOWN:
                 raise ValueError(f"unknown fault {name!r}; known: {sorted(KNOWN)}")
             if name == "kill_at":
                 self.kill_states.add(arg)
+            elif name == "db_outage":
+                a, _, b = arg.partition("-")
+                self.db_window = (float(a) * 60.0, float(b) * 60.0)
+                if not 0 <= self.db_window[0] < self.db_window[1] <= 180 * 60:
+                    raise ValueError("db_outage window must be within 0-180 minutes, start < end")
             else:
                 self.counts[name] = self.counts.get(name, 0) + (int(arg) if arg else 1)
         self.kill = kill
@@ -66,9 +77,10 @@ class FaultInjector:
     def wrap(self, broker):
         """Patch the broker instance's order and read methods in place."""
         inj = self
-        orig_replace, orig_submit = broker.replace_order_once, broker.submit_order_once
+        orig_replace = getattr(broker, "replace_order_once", None)
+        orig_submit = getattr(broker, "submit_order_once", None)
         orig_oco = getattr(broker, "submit_oco_once", None)
-        orig_pos, orig_hist = broker.positions_snapshot, broker.symbol_orders_snapshot
+        orig_pos = getattr(broker, "positions_snapshot", None)
 
         def replace_order_once(order_id, limit_price, client_order_id, what):
             if inj._take("replace_reject"):
@@ -108,12 +120,12 @@ class FaultInjector:
                 return BrokerSnapshot(False, None, "injected read error")
             return orig_pos()
 
-        broker.replace_order_once = replace_order_once
-        broker.submit_order_once = submit_order_once
-        if orig_oco is not None:
-            broker.submit_oco_once = submit_oco_once
-        broker.positions_snapshot = positions_snapshot
-        broker.symbol_orders_snapshot = orig_hist
+        for name, orig, fn in (("replace_order_once", orig_replace, replace_order_once),
+                               ("submit_order_once", orig_submit, submit_order_once),
+                               ("submit_oco_once", orig_oco, submit_oco_once),
+                               ("positions_snapshot", orig_pos, positions_snapshot)):
+            if orig is not None:
+                setattr(broker, name, fn)
         return broker
 
     def on_transition(self, state: str) -> None:
@@ -122,6 +134,55 @@ class FaultInjector:
             self.kill_states.discard(state)
             self._fire("kill_at", state)
             self.kill(17)
+
+
+class _PgProxy:
+    """Stands in for the psycopg2 module: connect() fails inside the window."""
+
+    def __init__(self, real, injector, clock):
+        self._real, self._inj, self._clock = real, injector, clock
+
+    def connect(self, *a, **k):
+        if self._inj.db_down(self._clock()):
+            if not self._inj.__dict__.get("_db_announced"):
+                self._inj._db_announced = True
+                self._inj._fire("db_outage", "window open: DB connections refused")
+            raise self._real.OperationalError("injected DB outage (STAGING_FAULTS db_outage)")
+        return self._real.connect(*a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _db_down(self, now: float) -> bool:
+    if self.db_window is None:
+        return False
+    t = now - self.started
+    return self.db_window[0] <= t < self.db_window[1]
+
+
+def _wrap_db(self, recorder=None, lease_store=None, clock=None):
+    """Route the recorder's and the lease store's connections through the
+    outage window. Logs once when the window opens and closes."""
+    import time as _t
+
+    import psycopg2 as _pg
+
+    clock = clock or _t.time
+    self.started = getattr(self, "started", None) or clock()
+    proxy = _PgProxy(_pg, self, clock)
+    if recorder is not None and getattr(recorder, "_psycopg2", None) is not None:
+        recorder._psycopg2 = proxy
+    if lease_store is not None and hasattr(lease_store, "_pg"):
+        lease_store._pg = proxy
+    a, b = self.db_window
+    logger.warning("STAGING_FAULTS db_outage: DB connections will fail from +%.0f to +%.0f min", a / 60, b / 60)
+    return proxy
+
+
+FaultInjector.db_down = _db_down
+FaultInjector.wrap_db = _wrap_db
+FaultInjector.started = None
 
 
 def from_env(env: Optional[Dict[str, str]] = None) -> Optional[FaultInjector]:

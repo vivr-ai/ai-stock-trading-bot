@@ -266,6 +266,9 @@ def build(cfg):
     faults = _faults_from_env()
     if faults is not None:
         faults.wrap(broker)
+        if faults.db_window is not None:
+            faults.wrap_db(recorder=base_recorder,
+                           lease_store=getattr(strategy.lease, "store", None) if strategy.lease else None)
         if strategy.exit_manager is not None:
             strategy.exit_manager.faults = faults
         logging.getLogger("main").warning("STAGING_FAULTS active: %s kill_at=%s", faults.counts,

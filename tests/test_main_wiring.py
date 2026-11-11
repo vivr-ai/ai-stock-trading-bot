@@ -118,3 +118,17 @@ def test_exit_manager_wiring_follows_the_flag(cfg_env, tmp_path, pg_url, enabled
     assert xm is not None and xm.env_tag == "s" and xm.lock is strategy.order_lock
     assert strategy.protection.hold_off == xm.holds_protection
     assert xm.lease_ok() is False                               # lease not held: D8, nothing sent
+
+
+def test_staging_db_outage_fault_wires_recorder_and_lease(cfg_env, tmp_path, pg_url):
+    cfg_env.setenv("BOT_ENVIRONMENT", "staging")
+    cfg_env.setenv("EXPECTED_ALPACA_ACCOUNT_NUMBER", "PA111111111")
+    cfg_env.setenv("DATABASE_URL", pg_url)
+    cfg_env.setenv("JOURNAL_DIR", str(tmp_path / "journal"))
+    cfg_env.setenv("INSTANCE_LEASE_ENABLED", "true")
+    cfg_env.setenv("STAGING_FAULTS", "db_outage:10-20")
+    broker, _, _, strategy, recorder = main.build(load_config("nonexistent.ini"))
+    from bot.reliability.fault_injection import _PgProxy
+
+    assert isinstance(strategy.lease.store._pg, _PgProxy)
+    assert strategy.recorder.health_check() is not None
