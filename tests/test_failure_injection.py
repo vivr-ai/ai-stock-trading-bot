@@ -283,3 +283,88 @@ def test_db_outage_drill_end_to_end_with_real_postgres(pg_url, tmp_path):
         store.acquire("trader:drill", "A", 90)
     t["now"] = 130
     assert rec.health_check() and store.acquire("trader:drill", "A", 90) is not None
+
+
+# Review 11 Nov 2B: protection manager x exit manager on ONE fake broker ---------------
+class SharedBroker(FakeAlpaca):
+    """FakeAlpaca plus the reads/writes the protection manager uses."""
+
+    def latest_price(self, sym):
+        return self.bid
+
+    def last_fill(self, sym, side="buy"):
+        return SimpleNamespace(order_id="abcdef1234567890")
+
+    def open_orders_snapshot(self):
+        from bot.trading.alpaca_client import BrokerSnapshot
+        return BrokerSnapshot(True, [dict(o) for o in self.orders if o["status"] in
+                                     ("new", "held", "partially_filled", "accepted", "pending_new")], "")
+
+    def submit_oco_once(self, symbol, qty, stop_price, take_profit_price, client_order_id):
+        self.calls.append(("oco", client_order_id, qty))
+        avail = self.positions_snapshot().data["AAPL"]["qty_available"]
+        if avail + 1e-6 < qty:
+            from bot.trading.alpaca_client import OrderRejected
+            raise OrderRejected("insufficient qty available", 403)
+        g = f"oco{self.n}"
+        tp = self._add(side="sell", type="limit", status="new", qty=qty, role="take_profit", group=g,
+                       limit=take_profit_price, cid=client_order_id, oclass="oco")
+        self._add(side="sell", type="stop", status="held", qty=qty, role="stop_loss", group=g,
+                  stop=stop_price, oclass="oco")
+        self.held_for_orders = qty
+        return dict(tp)
+
+
+def _pair():
+    from bot.reliability.protection import ProtectionManager
+    from tests.test_protection import RISK
+
+    b, c, al = SharedBroker(), Clock(), Alerts()
+    pm = ProtectionManager(b, RISK, "s", al, clock=c)
+    xm = em.ExitManager(b, al, "s", protection=pm, clock=c, market_open=lambda: True)
+    pm.hold_off = xm.holds_protection
+    return b, c, al, pm, xm
+
+
+def test_no_conflicting_stop_while_the_exit_sell_is_working():
+    b, c, al, pm, xm = _pair()
+    b.replace_behaviour = ["reject", "reject"]
+    xm.request("AAPL", "x")
+    xm.step("AAPL")                         # legs cancelled
+    pm.sweep()                              # FALLBACK_CANCEL window: held off
+    c.t += 1
+    xm.step("AAPL")                         # X sell for 10 sent
+    for _ in range(3):
+        c.t += 10
+        pm.sweep()                          # X covers the whole position: held off
+        invariants(b)
+    assert not [x for x in b.calls if x[0] == "oco"]
+
+
+def test_remaining_shares_are_protected_when_the_exit_covers_fewer_than_held():
+    b, c, al, pm, xm = _pair()
+    b.replace_behaviour = ["reject", "reject"]
+    xm.request("AAPL", "x")
+    xm.step("AAPL")
+    c.t += 1
+    xm.step("AAPL")
+    x = next(o for o in b.orders if o["client_order_id"].startswith("sX-"))
+    b._fill(x, 99.0, qty=4)                 # 4 sold, X partially filled
+    x["status"] = "canceled"                # ...and the rest of the X is cancelled
+    b.held_for_orders = 0.0
+    c.t += 61
+    pm.sweep()
+    ocos = [x for x in b.calls if x[0] == "oco"]
+    assert ocos and ocos[0][2] == 6.0        # the confirmed remainder, not the original 10
+    invariants(b)
+
+
+def test_stuck_exit_never_leaves_a_position_unprotected_beyond_the_cap():
+    b, c, al, pm, xm = _pair()
+    b.replace_behaviour = ["reject", "reject"]
+    b.cancel_behaviour = ["ok", "ok"]
+    xm.request("AAPL", "x")
+    xm.step("AAPL")                         # legs cancelled; exit then stalls (no more steps)
+    c.t += 90                               # past the cancel window
+    pm.sweep()
+    assert [x for x in b.calls if x[0] == "oco"]

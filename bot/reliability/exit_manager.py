@@ -53,6 +53,10 @@ CANCEL_CONFIRM_S = 20.0
 SELL_WAIT_S = 60.0
 MAX_FAILED_EXITS = 3
 BID_DISCOUNT = 0.001          # marketable sell limit: 0.1% under the bid
+QUOTE_MAX_AGE_S = 15.0        # a price is only computed from a fresh quote
+QUOTE_MAX_SPREAD = 0.01       # wider than 1% of mid = illiquid: don't price into it
+MAX_DRIFT_FROM_FIRST = 0.03   # bid >3% below the first exit quote: stop chasing, escalate
+QUOTE_DEFER_ESCALATE_S = 300.0
 
 
 @dataclass
@@ -71,6 +75,8 @@ class Exit:
     failed_exits: int = 0
     deferred: int = 0
     uncertain: Optional[dict] = None      # {cid, kind, at, sweeps}
+    first_bid: Optional[float] = None     # bid at the first price; the anti-chase reference
+    quote_bad_since: Optional[float] = None
     history: List[dict] = field(default_factory=list)
 
 
@@ -113,15 +119,40 @@ class ExitManager:
     HOLD_OFF_STATES = (FALLBACK_CANCEL, SELLING, UNCERTAIN)
     HOLD_OFF_MAX_S = 300.0
 
-    def holds_protection(self, symbol: str) -> bool:
-        """True while this exit is between cancelling the legs and the sell
-        filling, so the protection manager doesn't put a new protective order
-        on the shares the sell needs. Never longer than 5 minutes after the
-        last transition: a stuck exit must not leave a position unprotected."""
+    def holds_protection(self, symbol: str, position: Optional[dict] = None,
+                         orders: Optional[List[dict]] = None) -> bool:
+        """Should the protection manager hold off placing a protective order?
+
+        Review 11 Nov: decided from broker QUANTITIES, not elapsed time:
+          * a working exit sell (our X, or our R take-profit replacement)
+            whose unfilled quantity covers the whole remaining position ->
+            hold off (a protective order would hold the shares the sell needs);
+          * the exit is between "legs cancelled" and "sell sent" (FALLBACK_CANCEL)
+            -> hold off, for at most the cancel-confirm window plus 60 s;
+          * anything else - including a working exit for FEWER shares than
+            are held (e.g. after a partial fill) - is not held off: the
+            uncovered remainder is protected as normal.
+        The 5-minute cap stays as a final backstop. Without broker data the
+        answer is no (never leave a position unprotected on a guess)."""
         e = self.exits.get(symbol)
-        if e is None or e.state not in self.HOLD_OFF_STATES or not e.history:
+        if e is None or not e.history:
             return False
-        return self.clock() - e.history[-1]["at"] < self.HOLD_OFF_MAX_S
+        since = self.clock() - e.history[-1]["at"]
+        if since >= self.HOLD_OFF_MAX_S:
+            return False
+        if position is None or orders is None:
+            return False
+        held = float(position.get("qty") or 0.0)
+        if held <= 0:
+            return False
+        if e.state == FALLBACK_CANCEL:
+            return since < CANCEL_CONFIRM_S + 60.0
+        ours = (f"{self.env_tag}X-{symbol}-", f"{self.env_tag}R-{symbol}-")
+        exit_qty = sum(max(0.0, (o.get("qty") or 0.0) - (o.get("filled_qty") or 0.0)) for o in orders
+                       if o.get("symbol") == symbol and o.get("side") == "sell"
+                       and o.get("status") in WORKING_STATUSES
+                       and (o.get("client_order_id") or "").startswith(ours))
+        return exit_qty + 1e-6 >= held
 
     def active(self) -> Dict[str, str]:
         return {s: e.state for s, e in self.exits.items()}
@@ -248,9 +279,25 @@ class ExitManager:
         return self._reprice(e, v, tp, now)
 
     def _reprice(self, e: Exit, v: dict, tp: dict, now: float) -> None:
-        bid = self.broker.latest_bid(e.symbol)
-        if not bid:
-            return self._defer(e, "no bid available for a marketable price")
+        # Review 11 Nov: every price comes from a FRESH, valid quote; halts,
+        # stale quotes, illiquidity and fast markets are handled explicitly,
+        # and the exit never blindly chases the price down. A bad quote is
+        # not a price attempt; the take-profit and stop stay as they are.
+        q = self.broker.latest_quote(e.symbol) if hasattr(self.broker, "latest_quote") else None
+        why = _quote_problem(q)
+        if why:
+            e.quote_bad_since = e.quote_bad_since or now
+            if now - e.quote_bad_since >= QUOTE_DEFER_ESCALATE_S:
+                return self._escalate(e, f"{e.symbol}: no usable quote for 5 min ({why}) - possible halt "
+                                         "or illiquid market; take-profit and stop left as they are")
+            return self._defer(e, f"quote not usable: {why}", count=False)
+        e.quote_bad_since = None
+        bid = q["bid"]
+        if e.first_bid is None:
+            e.first_bid = bid
+        elif bid < e.first_bid * (1 - MAX_DRIFT_FROM_FIRST):
+            return self._escalate(e, f"{e.symbol}: bid {bid:.2f} is more than 3% below the first exit "
+                                     f"quote {e.first_bid:.2f}; not chasing it down (stop stays held)")
         price = max(0.01, math.floor(bid * (1 - BID_DISCOUNT) * 100) / 100)
         cid = self._next_cid(e, v, "R")
         if cid is None:
@@ -439,6 +486,22 @@ class ExitManager:
         faults = getattr(self, "faults", None)
         if faults is not None:
             faults.on_transition(state)     # 6c kill points (staging only)
+
+
+def _quote_problem(q: Optional[dict]) -> Optional[str]:
+    if not q:
+        return "no quote"
+    bid, ask, age = q.get("bid") or 0.0, q.get("ask") or 0.0, q.get("age_s")
+    if bid <= 0 or ask <= 0:
+        return "no bid/ask (halted or no market)"
+    if ask < bid:
+        return "crossed quote"
+    if age is None or age > QUOTE_MAX_AGE_S:
+        return f"stale quote ({age if age is None else round(age)} s old)"
+    mid = (bid + ask) / 2
+    if (ask - bid) / mid > QUOTE_MAX_SPREAD:
+        return f"spread {100 * (ask - bid) / mid:.1f}% (illiquid)"
+    return None
 
 
 def _regular_hours(t: datetime) -> bool:

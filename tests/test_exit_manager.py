@@ -36,6 +36,7 @@ class FakeAlpaca:
         self.orders = []
         self.sells_filled = []
         self.bid = 100.0
+        self.quote = None              # override the quote (stale / halted / wide)
         self.read_ok = True
         self.replace_behaviour = []    # queue: "ok" | "reject" | "unknown" | "fill_first"
         self.cancel_behaviour = []     # queue: "ok" | "stuck"
@@ -92,6 +93,11 @@ class FakeAlpaca:
 
     def latest_bid(self, sym):
         return self.bid
+
+    def latest_quote(self, sym):
+        if self.quote is not None:
+            return dict(self.quote)
+        return {"bid": self.bid, "ask": round(self.bid * 1.001, 2), "age_s": 1.0}
 
     # --- writes ---
     def replace_order_once(self, oid, price, cid, what):
@@ -442,8 +448,58 @@ def test_protection_held_off_only_during_the_sell_window_and_at_most_5_min():
     t = make()
     t.b.replace_behaviour = ["reject", "reject"]
     t.m.request("AAPL", "x")
-    assert not t.m.holds_protection("AAPL")              # REPRICING: stop still held, no hold-off
-    t.m.step("AAPL")                                     # -> FALLBACK_CANCEL
-    assert t.m.holds_protection("AAPL")
+    pos = lambda: t.b.positions_snapshot().data.get("AAPL")          # noqa: E731
+    hist = lambda: t.b.symbol_orders_snapshot("AAPL").data           # noqa: E731
+    assert not t.m.holds_protection("AAPL", pos(), hist())   # REPRICING: stop still held
+    t.m.step("AAPL")                                          # -> FALLBACK_CANCEL
+    assert t.m.holds_protection("AAPL", pos(), hist())
+    assert not t.m.holds_protection("AAPL")                   # no broker data: never hold off
+    t.c.t += 81
+    assert not t.m.holds_protection("AAPL", pos(), hist())    # cancel window over
+
+
+def test_hold_off_follows_quantities_not_time():
+    """Review 11 Nov: a working exit sell covering the whole position holds
+    protection off; one covering FEWER shares than held does not."""
+    t = make()
+    t.b.replace_behaviour = ["reject", "reject"]
+    t.m.request("AAPL", "x")
+    t.m.step("AAPL")
+    t.c.t += 1
+    t.m.step("AAPL")                                          # X market sell for 10 working
+    assert t.m.active()["AAPL"] == em.SELLING
+    pos = t.b.positions_snapshot().data["AAPL"]
+    assert t.m.holds_protection("AAPL", pos, t.b.symbol_orders_snapshot("AAPL").data)
+    x = next(o for o in t.b.orders if o["client_order_id"].startswith("sX-"))
+    x["qty"] = 6.0                                            # exit only covers 6 of 10
+    assert not t.m.holds_protection("AAPL", pos, t.b.symbol_orders_snapshot("AAPL").data)
+
+
+@pytest.mark.parametrize("quote,why", [
+    ({"bid": 100.0, "ask": 100.1, "age_s": 60.0}, "stale"),
+    ({"bid": 0.0, "ask": 0.0, "age_s": 1.0}, "halted"),
+    ({"bid": 100.0, "ask": 103.0, "age_s": 1.0}, "illiquid"),
+    (None, "no quote"),
+])
+def test_bad_quotes_are_not_priced_and_escalate_after_5_min(quote, why):
+    t = make()
+    t.b.quote = quote if quote is not None else {}
+    if quote is None:
+        t.b.latest_quote = lambda s: None
+    t.m.request("AAPL", "x")
+    assert not [c for c in t.b.calls if c[0] == "replace"]       # nothing priced
     t.c.t += 301
-    assert not t.m.holds_protection("AAPL")              # stuck exit never blocks protection
+    t.m.step("AAPL")
+    assert t.m.active()["AAPL"] == em.ESCALATED and len(t.b.working_stop()) == 1
+    assert not [c for c in t.b.calls if c[0] in ("replace", "cancel")]
+
+
+def test_does_not_chase_a_falling_price():
+    t = make()
+    t.m.request("AAPL", "x")                                      # first price at bid 100
+    t.b.bid = 96.5                                                # -3.5% within the window
+    t.c.t += 121
+    t.m.step("AAPL")
+    assert t.m.active()["AAPL"] == em.ESCALATED
+    assert len([c for c in t.b.calls if c[0] == "replace"]) == 1   # no lower reprice
+    assert len(t.b.working_stop()) == 1

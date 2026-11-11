@@ -974,6 +974,23 @@ class AlpacaBroker:
                 return False
             raise
 
+    def latest_quote(self, symbol: str) -> Optional[dict]:
+        """{'bid', 'ask', 'age_s'} from the latest quote, or None if unavailable.
+        age_s is measured against this machine's clock (UTC)."""
+        from alpaca.data.requests import StockLatestQuoteRequest
+
+        try:
+            req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+            q = self._retry(lambda: self._data.get_stock_latest_quote(req), f"latest_quote({symbol})")[symbol]
+            ts = q.timestamp
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return {"bid": float(q.bid_price or 0), "ask": float(q.ask_price or 0),
+                    "age_s": (datetime.now(timezone.utc) - ts).total_seconds()}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not fetch quote for %s: %s", symbol, exc)
+            return None
+
     def latest_bid(self, symbol: str) -> Optional[float]:
         from alpaca.data.requests import StockLatestQuoteRequest
 
