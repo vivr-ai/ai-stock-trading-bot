@@ -430,6 +430,14 @@ def v4(api, data):
         filled = wait(lambda: position_qty(api, SYMBOL) == 0, 30)
         log("V4.replace_marketable", http=c2, filled=bool(filled), working_after=_working_for_symbol(api),
             position_after=position_qty(api, SYMBOL))
+        # Does Alpaca cancel the OCO stop on its own after the fill? (11 Nov:
+        # still 'held' 0.4 s after; the clean-up then cancelled it.) Wait up
+        # to 30 s WITHOUT cancelling anything and record what happens.
+        gone = wait(lambda: not [w for w in _working_for_symbol(api) if w["type"] in ("stop", "stop_limit")], 30)
+        log("V4.stop_after_fill", auto_cancelled_within_30s=bool(gone),
+            working=_working_for_symbol(api),
+            conclusion="Alpaca cancelled the OCO stop itself" if gone else
+                       "STOP STILL WORKING 30 s after the take-profit filled (0 shares held)")
 
 
 def v5(api, data, qty=5, tries=3):
