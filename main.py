@@ -260,6 +260,16 @@ def build(cfg):
         )
         if strategy.protection is not None:
             strategy.protection.hold_off = strategy.exit_manager.holds_protection
+    # Stage 6c: staging-only fault injection (refuses to load outside staging).
+    from bot.reliability.fault_injection import from_env as _faults_from_env
+
+    faults = _faults_from_env()
+    if faults is not None:
+        faults.wrap(broker)
+        if strategy.exit_manager is not None:
+            strategy.exit_manager.faults = faults
+        logging.getLogger("main").warning("STAGING_FAULTS active: %s kill_at=%s", faults.counts,
+                                          sorted(faults.kill_states))
     return broker, summary_logger, reporter, strategy, recorder
 
 

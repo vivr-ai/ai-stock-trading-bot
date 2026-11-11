@@ -211,7 +211,18 @@ class ExitManager:
         if abs((tp.get("qty") or 0.0) - v["qty"]) > 1e-6:
             return self._fallback_cancel(e, v, now, why=f"take-profit qty {tp.get('qty'):g} != position "
                                                         f"{v['qty']:g} (qty can't be changed by replace)")
-        mine = e.last_cid is not None and tp.get("client_order_id") == e.last_cid
+        cid_live = tp.get("client_order_id") or ""
+        if e.last_cid is None and cid_live.startswith(f"{self.env_tag}R-{e.symbol}-"):
+            # Rebuilt after a restart (or by a new instance): the live
+            # take-profit is already one of our replacements. Adopt it rather
+            # than sending another price straight away (6c test 12/13).
+            e.last_cid, e.priced_at = cid_live, now
+            e.prices = sum(1 for o in v["orders"]
+                           if (o.get("client_order_id") or "").startswith(f"{self.env_tag}R-{e.symbol}-"))
+            self._note(e, EXIT_WORKING, f"adopted live replacement {cid_live} after restart "
+                                        f"({e.prices} price(s) already tried)")
+            return
+        mine = e.last_cid is not None and cid_live == e.last_cid
         if e.state == REPRICING and not mine:
             if e.priced_at is None:
                 return self._reprice(e, v, tp, now)          # after one rejection
@@ -425,6 +436,9 @@ class ExitManager:
             self.journal("exit_transition", {"symbol": e.symbol, "reason": e.reason, **row})
         except Exception as exc:  # noqa: BLE001
             logger.error("Exit journal write failed: %s", exc)
+        faults = getattr(self, "faults", None)
+        if faults is not None:
+            faults.on_transition(state)     # 6c kill points (staging only)
 
 
 def _regular_hours(t: datetime) -> bool:
