@@ -132,3 +132,18 @@ def test_staging_db_outage_fault_wires_recorder_and_lease(cfg_env, tmp_path, pg_
 
     assert isinstance(strategy.lease.store._pg, _PgProxy)
     assert strategy.recorder.health_check() is not None
+
+
+def test_staging_test_entries_wired_only_with_staging_and_protection(cfg_env, tmp_path, pg_url):
+    cfg_env.setenv("BOT_ENVIRONMENT", "staging")
+    cfg_env.setenv("EXPECTED_ALPACA_ACCOUNT_NUMBER", "PA111111111")
+    cfg_env.setenv("DATABASE_URL", pg_url)
+    cfg_env.setenv("JOURNAL_DIR", str(tmp_path / "journal"))
+    cfg_env.setenv("INSTANCE_LEASE_ENABLED", "true")
+    cfg_env.setenv("PROTECTION_SWEEP_ENABLED", "true")
+    cfg_env.setenv("STAGING_TEST_ENTRIES_ENABLED", "true")
+    cfg_env.setenv("STAGING_TEST_ENTRY_REQUEST", "t01:VZ:20")
+    broker, _, _, strategy, _ = main.build(load_config("nonexistent.ini"))
+    r = strategy.test_entries
+    assert r is not None and r.state_dir == str(tmp_path / "test_entries")
+    assert r.lease_ok() is False            # lease not held yet: no test entry possible

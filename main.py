@@ -95,6 +95,9 @@ def _env_label(cfg) -> str:
     return "" if env == "production" else f"[{env.upper()}]"
 
 
+from contextlib import nullcontext as _nullcontext  # noqa: E402
+
+
 def report_cycle_outcome(heartbeat, outcome) -> None:
     """2E: success ping only for a completed cycle or a correctly skipped
     market-closed cycle; a standby instance (no lease) sends nothing, so if
@@ -273,6 +276,27 @@ def build(cfg):
             strategy.exit_manager.faults = faults
         logging.getLogger("main").warning("STAGING_FAULTS active: %s kill_at=%s", faults.counts,
                                           sorted(faults.kill_states))
+    # Review 11 Nov item 5: staging-only TEST entries, operator-triggered.
+    # Outside staging the variable is ignored (the runner can't be built).
+    strategy.test_entries = None
+    if os.environ.get("STAGING_TEST_ENTRIES_ENABLED", "").strip().lower() in ("1", "true", "yes"):
+        if not cfg.deployment.is_staging:
+            logging.getLogger("main").error("STAGING_TEST_ENTRIES_ENABLED ignored: not a staging deployment")
+        else:
+            from bot.reliability.test_entries import TestEntryRunner
+            from bot.universe.static_universe import STATIC_UNIVERSE
+
+            _j = getattr(strategy, "journal", None)
+            strategy.test_entries = TestEntryRunner(
+                broker, strategy, env=dict(os.environ),
+                state_dir=os.path.normpath(os.path.join(rel.journal_dir or "logs", "..", "test_entries")),
+                account_verified=bool(account_masked), universe=STATIC_UNIVERSE,
+                protection=strategy.protection,
+                lease_ok=(lambda: strategy.lease.can_submit("entry")[0]) if strategy.lease else (lambda: False),
+                journal=(lambda kind, payload: _j.append(kind, payload)) if _j is not None else None,
+            )
+            logging.getLogger("main").warning("STAGING TEST ENTRIES enabled (request=%r)",
+                                              os.environ.get("STAGING_TEST_ENTRY_REQUEST", ""))
     return broker, summary_logger, reporter, strategy, recorder
 
 
@@ -642,6 +666,13 @@ def main() -> int:
             heartbeat.fail(f"cycle raised: {exc}")
             return
         report_cycle_outcome(heartbeat, getattr(strategy, "last_cycle_outcome", None))
+        runner = getattr(strategy, "test_entries", None)
+        if runner is not None and getattr(strategy, "last_cycle_outcome", None) == "ok":
+            try:
+                with (order_lock if order_lock is not None else _nullcontext()):
+                    log.info("TEST entries: %s", runner.tick())
+            except Exception as exc:  # noqa: BLE001
+                log.exception("TEST entry runner failed: %s", exc)
 
     def on_scheduler_crash(reason: str) -> None:
         recorder.notify_scheduler_failure(reason)
