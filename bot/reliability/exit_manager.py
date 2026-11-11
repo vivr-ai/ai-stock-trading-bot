@@ -53,7 +53,7 @@ CANCEL_CONFIRM_S = 20.0
 SELL_WAIT_S = 60.0
 MAX_FAILED_EXITS = 3
 BID_DISCOUNT = 0.001          # marketable sell limit: 0.1% under the bid
-QUOTE_MAX_AGE_S = 15.0        # a price is only computed from a fresh quote
+QUOTE_MAX_AGE_S = 30.0        # a price is only computed from a fresh quote (IEX feed: quotes can lag)
 QUOTE_MAX_SPREAD = 0.01       # wider than 1% of mid = illiquid: don't price into it
 MAX_DRIFT_FROM_FIRST = 0.03   # bid >3% below the first exit quote: stop chasing, escalate
 QUOTE_DEFER_ESCALATE_S = 300.0
