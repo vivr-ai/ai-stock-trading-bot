@@ -519,6 +519,175 @@ def v5(api, data, qty=None, tries=None):
     log("V5.partial_fill", conclusion=f"not reproduced in {tries} tries on paper (fills simulated)")
 
 
+# ---- review 13 Nov: real-broker orphan sweep and partial take-profit recovery -------
+class _PrintAlerts:
+    def __init__(self):
+        self.raised = []
+
+    def raise_(self, key, text, severity="warning", repeat_s=None):
+        self.raised.append((key, severity))
+        log("alert", key=key, severity=severity, text=text)
+        return True
+
+    def resolve(self, key, text=None, severity="warning"):
+        return True
+
+
+def _real_parts():
+    from bot.config import load_config
+    from bot.reliability.protection import ProtectionManager
+    from bot.trading.alpaca_client import AlpacaBroker
+
+    env = os.environ
+    broker = AlpacaBroker(env["ALPACA_API_KEY"], env["ALPACA_SECRET_KEY"], mode="paper", allow_submit=True)
+    broker.env_tag = "s"
+    alerts = _PrintAlerts()
+    pm = ProtectionManager(broker, load_config("nonexistent.ini").risk, "s", alerts)
+    return broker, pm, alerts
+
+
+def _history(api):
+    return api.call("GET", "/v2/orders", params={"status": "all", "symbols": SYMBOL, "limit": 100,
+                                                 "nested": "false"})[1] or []
+
+
+WORKING = {"new", "held", "accepted", "pending_new", "partially_filled", "pending_replace", "pending_cancel"}
+
+
+def _guard_symbol_clean(api):
+    if position_qty(api, SYMBOL) != 0 or [o for o in _history(api) if o.get("status") in WORKING]:
+        log("refused", reason=f"{SYMBOL} not flat or has working orders - not starting")
+        return False
+    return True
+
+
+def _emergency_check(api, where):
+    q = position_qty(api, SYMBOL)
+    if q < 0:
+        log("EMERGENCY", where=where, position=q, action="short detected: cancelling all and closing")
+        for o in _history(api):
+            if o.get("status") in WORKING:
+                api.call("DELETE", f"/v2/orders/{o['id']}")
+        api.call("DELETE", f"/v2/positions/{SYMBOL}")
+        return True
+    return False
+
+
+def orphan_test(api, data):
+    """1 share, a stand-alone stop, then a SEPARATE market sell. If Alpaca
+    refuses the sell because the stop reserves the share, stop and report.
+    If it allows it and the stop is left working on a flat position, run the
+    real orphan sweep and confirm from Alpaca that exactly that stop is
+    cancelled."""
+    if not _guard_symbol_clean(api):
+        return
+    bid, last = last_price(data, SYMBOL)
+    _buy(api, 1, "orph-buy")
+    c, stop = api.call("POST", "/v2/orders", {"symbol": SYMBOL, "qty": "1", "side": "sell", "type": "stop",
+                                              "time_in_force": "gtc", "stop_price": str(round(last * 0.90, 2)),
+                                              "client_order_id": cid("orph-stop")})
+    if c != 200 or not wait(lambda: order(api, stop["id"]).get("status") in WORKING, 15):
+        log("ORPHAN.setup_failed", http=c, body=stop)
+        return
+    c2, sell = api.call("POST", "/v2/orders", {"symbol": SYMBOL, "qty": "1", "side": "sell", "type": "market",
+                                               "time_in_force": "day", "client_order_id": cid("orph-sell")})
+    if c2 != 200:
+        log("ORPHAN.separate_sell", http=c2, body=sell, verified=False,
+            conclusion="Alpaca refused the separate sell (shares reserved by the stop) - test stopped, "
+                       "no workaround attempted")
+        return
+    flat = wait(lambda: position_qty(api, SYMBOL) == 0, 30)
+    if _emergency_check(api, "after separate sell"):
+        return
+    st = order(api, stop["id"])
+    log("ORPHAN.established", position=position_qty(api, SYMBOL), flat=bool(flat),
+        stop={k: st.get(k) for k in ("id", "client_order_id", "status", "qty", "stop_price")})
+    if not flat or st.get("status") not in WORKING:
+        log("ORPHAN.not_established", conclusion="no orphan to test (position not flat or stop not working)")
+        return
+    broker, pm, alerts = _real_parts()
+    pos = broker.positions_snapshot()
+    first = pm.orphan_sweep(time.time(), pos.data or {})
+    time.sleep(pm.ORPHAN_GRACE_S + 2)
+    if _emergency_check(api, "during grace"):
+        return
+    pos = broker.positions_snapshot()
+    done = pm.orphan_sweep(time.time(), pos.data or {})
+    st = order(api, stop["id"])
+    others = [o for o in _history(api) if o.get("status") in WORKING]
+    log("ORPHAN.sweep", first_pass=first, cancelled=done, stop_status_now=st.get("status"),
+        position=position_qty(api, SYMBOL), working_after=len(others), alerts=alerts.raised,
+        verified=bool(done == [stop["id"]] and st.get("status") in ("canceled", "pending_cancel")
+                      and not others and position_qty(api, SYMBOL) == 0))
+
+
+def partial_recovery_test(api, data, qty=None, tries=None):
+    """Controlled multi-share test of the protection manager's partial
+    take-profit recovery with the REAL ProtectionManager and Alpaca client."""
+    qty = qty or int(os.environ.get("SPIKE_V5_QTY", "20"))
+    tries = tries or int(os.environ.get("SPIKE_V5_TRIES", "5"))
+    for n in range(1, tries + 1):
+        if not _guard_symbol_clean(api):
+            return
+        bid, last = last_price(data, SYMBOL)
+        _buy(api, qty, f"prc-buy{n}")
+        c, o = api.call("POST", "/v2/orders", _oco_body(qty, last * 1.10, last * 0.90, f"prc-oco{n}"))
+        if c != 200:
+            return log("PRC.oco_submit", http=c, body=o)
+        time.sleep(2)
+        bid2, _ = last_price(data, SYMBOL)
+        c, r = api.call("PATCH", f"/v2/orders/{o['id']}",
+                        {"limit_price": str(round((bid2 or last) * 0.999, 2)), "client_order_id": cid(f"prc-r{n}")})
+        tp_id = (r or {}).get("id") or o["id"]
+        partial = None
+        end = time.time() + 20
+        while time.time() < end:
+            tp = order(api, tp_id)
+            fq = float(tp.get("filled_qty") or 0)
+            if 0 < fq < qty:
+                partial = tp
+                break
+            if fq >= qty:
+                break
+            time.sleep(0.05)
+        if partial is None:
+            log("PRC.attempt", attempt=n, result="filled in full (no partial)")
+            cleanup(api)
+            continue
+        broker, pm, alerts = _real_parts()
+        trace = []
+        t_end = time.time() + 90
+        while time.time() < t_end:
+            states = pm.sweep()
+            hist = _working_for_symbol(api)
+            trace.append({"at": datetime.now(timezone.utc).isoformat(), "state": states.get(SYMBOL),
+                          "position": position_qty(api, SYMBOL),
+                          "tp_status": order(api, tp_id).get("status"),
+                          "working": [{k: w.get(k) for k in ("client_order_id", "type", "status", "qty",
+                                                              "filled_qty", "group_id", "group_role")}
+                                      for w in hist]})
+            if _emergency_check(api, "during recovery"):
+                break
+            held = trace[-1]["position"]
+            stops = [w for w in hist if w["type"] in ("stop", "stop_limit")]
+            if held == 0 or (states.get(SYMBOL) == "PROTECTED" and stops
+                             and abs(sum(float(s_["qty"]) for s_ in stops) - held) < 1e-6):
+                break
+            time.sleep(2)
+        held = trace[-1]["position"] if trace else position_qty(api, SYMBOL)
+        stops = [w for w in trace[-1]["working"] if w["type"] in ("stop", "stop_limit")] if trace else []
+        log("PRC.result", attempt=n, tp_partial_filled=partial.get("filled_qty"), qty=qty,
+            position_at_partial=qty - float(partial.get("filled_qty") or 0), position_after=held,
+            stop_qty_after=sum(float(s_["qty"]) for s_ in stops), alerts=alerts.raised, trace=trace,
+            outcome=("flat - the take-profit completed (race: fill during recovery)" if held == 0 else
+                     "PROTECTED with an exact-quantity stop" if stops and
+                     abs(sum(float(s_["qty"]) for s_ in stops) - held) < 1e-6 else
+                     "NOT PROTECTED - recovery did not complete"))
+        cleanup(api)
+        return
+    log("PRC.result", outcome=f"no partial fill in {tries} tries (paper fills simulated) - NOT VERIFIED")
+
+
 def main() -> int:
     env = os.environ
     key, secret = env.get("ALPACA_API_KEY"), env.get("ALPACA_SECRET_KEY")
@@ -535,6 +704,22 @@ def main() -> int:
         cleanup(api)
         print(f"SPIKE_DONE run={RUN} cleanup-only", flush=True)
         return 0
+    if "--orphan-test" in sys.argv or "--partial-recovery" in sys.argv:
+        _, clock = api.call("GET", "/v2/clock")
+        if not (clock or {}).get("is_open"):
+            log("skipped", reason="market closed; these tests need market hours")
+        else:
+            try:
+                if "--orphan-test" in sys.argv:
+                    orphan_test(api, data)
+                    cleanup(api)
+                if "--partial-recovery" in sys.argv:
+                    partial_recovery_test(api, data)
+            finally:
+                cleanup(api)
+        if "--oco-partial" not in sys.argv:
+            print(f"SPIKE_DONE run={RUN} orphan/partial-recovery", flush=True)
+            return 0
     if "--oco-partial" in sys.argv:
         _, clock = api.call("GET", "/v2/clock")
         if not (clock or {}).get("is_open"):

@@ -263,6 +263,9 @@ def build(cfg):
         )
         if strategy.protection is not None:
             strategy.protection.hold_off = strategy.exit_manager.holds_protection
+            # Review 13 Nov: one owner per recovery - while an exit is active the
+            # exit manager owns the position, the protection manager stands back.
+            strategy.protection.exit_owns = strategy.exit_manager.owns_recovery
     # Stage 6c: staging-only fault injection (refuses to load outside staging).
     from bot.reliability.fault_injection import from_env as _faults_from_env
 

@@ -117,6 +117,7 @@ class Track:
     uncertain: Optional[dict] = None                      # {cid, at, qty, stop, tp}
     escalated: bool = False
     emergency: Optional[dict] = None                      # {cid, at} once an emergency exit was sent
+    ptp: Optional[dict] = None                            # partial take-profit recovery {tp, at, tries}
 
 
 class ProtectionManager:
@@ -384,6 +385,15 @@ class ProtectionManager:
             # A protective order now would hold the shares the sell needs.
             logger.info("Protection for %s held off: exit sell in progress", sym)
             return
+        owns = getattr(self, "exit_owns", None)
+        if owns is not None and owns(sym):
+            # Review 13 Nov: one owner per recovery. While the exit manager is
+            # closing this position it owns the remaining exit (bounded
+            # fallback); the protection manager sends nothing competing.
+            logger.info("Protection for %s: exit manager owns this position's recovery", sym)
+            return
+        if self._partial_tp_recovery(sym, t, now, pos, orders):
+            return
         if t.missing_since is None:
             t.missing_since = now
             # Confirmed (after the order-history second look) with no stop at
@@ -415,6 +425,72 @@ class ProtectionManager:
         if now < t.missing_since + ATTEMPT_OFFSETS_S[n_done]:
             return
         self._restore(sym, t, now, pos, orders)
+
+    # ---- partial take-profit recovery (review 13 Nov item 1) ----------------------------
+    PTP_RETRY_CANCEL_S = 20.0
+    PTP_ESCALATE_S = 90.0
+
+    def _partial_tp_recovery(self, sym: str, t: Track, now: float, pos: dict,
+                             orders: Optional[List[dict]]) -> bool:
+        """A NORMAL take-profit partly filled and the remaining shares are not
+        covered by a stop (staging 12 Nov: Alpaca removed the OCO stop ~0.2 s
+        after a partial take-profit fill while 1 of 20 shares was still held).
+        The take-profit remainder holds the shares, so a new stop can't be
+        placed until it is gone. Steps, each from fresh broker data:
+          1. confirm a working take-profit with filled_qty > 0 for this symbol
+             (and, by being here, stop cover below the position);
+          2. cancel the take-profit remainder (one request; a cancel may be
+             repeated - it is idempotent and never a sell);
+          3. wait for the take-profit to reach a terminal status (cancelled or
+             filled) - a full fill during the cancel simply closes the position;
+          4. then hand back to the normal restore path, which re-reads the
+             position and places an OCO for the confirmed REMAINING, AVAILABLE
+             quantity and confirms both legs.
+        Returns True while this recovery owns the step (no other order sent)."""
+        rows = [o for o in (orders or []) if o.get("symbol") == sym and o.get("side") == "sell"]
+        if t.ptp is None:
+            tp = next((o for o in rows if o.get("group_role") == "take_profit"
+                       and o.get("status") in WORKING_STATUSES and (o.get("filled_qty") or 0) > 0), None)
+            if tp is None:
+                return False
+            t.ptp = {"tp": tp["id"], "at": now, "tries": 0, "filled": tp.get("filled_qty"),
+                     "qty": tp.get("qty")}
+            self.alerts.raise_(f"prot_partial_tp:{sym}",
+                               f"{sym}: take-profit partly filled ({tp.get('filled_qty'):g} of {tp.get('qty'):g}) "
+                               f"and the remaining {pos.get('qty'):g} share(s) have no stop. Cancelling the "
+                               "take-profit remainder, then placing a stop for the shares still held.",
+                               "critical", 3600)
+            logger.warning("Partial take-profit recovery for %s started: %s", sym, t.ptp)
+            return self._ptp_cancel(sym, t, now)
+        tp = next((o for o in rows if o.get("id") == t.ptp["tp"]), None)
+        if tp is None or tp.get("status") not in WORKING_STATUSES:
+            # Terminal (cancelled / filled / replaced). Hand back to the normal
+            # restore path with the position as re-read this sweep.
+            logger.warning("Partial take-profit recovery for %s: take-profit %s is %s; restoring "
+                           "protection for the %g share(s) still held", sym, t.ptp["tp"],
+                           (tp or {}).get("status", "gone"), pos.get("qty") or 0)
+            t.ptp = None
+            t.missing_since = t.missing_since or now
+            t.attempts = []                      # the take-profit held the shares; not a failed restore
+            return False
+        if now - t.ptp["at"] >= self.PTP_ESCALATE_S:
+            self._escalate(sym, t, now, f"take-profit remainder {t.ptp['tp']} still working "
+                                        f"{self.PTP_ESCALATE_S:.0f} s after cancelling")
+            return True
+        if now - t.ptp.get("sent_at", t.ptp["at"]) >= self.PTP_RETRY_CANCEL_S:
+            return self._ptp_cancel(sym, t, now)
+        return True
+
+    def _ptp_cancel(self, sym: str, t: Track, now: float) -> bool:
+        t.ptp["tries"] += 1
+        t.ptp["sent_at"] = now
+        try:
+            self.broker.cancel_order_once(t.ptp["tp"], f"cancel partly filled take-profit {sym}")
+        except Exception as exc:  # noqa: BLE001
+            # Ambiguous: nothing else is sent; the next sweep re-reads the order.
+            logger.error("Cancel of partly filled take-profit %s for %s: outcome unknown (%s)",
+                         t.ptp["tp"], sym, exc)
+        return True
 
     def _restore(self, sym: str, t: Track, now: float, pos: dict, orders: Optional[List[dict]] = None) -> None:
         qty, covered = pos.get("qty") or 0.0, t.covered

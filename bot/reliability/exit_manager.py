@@ -156,6 +156,25 @@ class ExitManager:
                        and (o.get("client_order_id") or "").startswith(ours))
         return exit_qty + 1e-6 >= held
 
+    OWN_STATES = (REPRICING, EXIT_WORKING, FALLBACK_CANCEL, SELLING, UNCERTAIN)
+    OWN_MAX_S = 600.0
+
+    def owns_recovery(self, symbol: str) -> bool:
+        """Review 13 Nov: one owner per recovery. True while this exit is
+        actively closing the position (it owns the remaining exit, including a
+        partly filled take-profit). False in RESTORE_PROTECTION, EXIT_REQUESTED
+        and ESCALATED - there the protection manager must be free to restore
+        protection - and never longer than 10 min after the exit's last
+        transition, so a stuck exit can't block protection."""
+        e = self.exits.get(symbol)
+        if e is None or e.state not in self.OWN_STATES or not e.history:
+            return False
+        # Bounded ownership per state: the protection gap while legs are
+        # cancelled or a fallback sell works is short by design.
+        cap = {FALLBACK_CANCEL: CANCEL_CONFIRM_S + 60.0, SELLING: SELL_WAIT_S + 60.0}.get(e.state,
+                                                                                         self.OWN_MAX_S)
+        return self.clock() - e.history[-1]["at"] < cap
+
     def active(self) -> Dict[str, str]:
         return {s: e.state for s, e in self.exits.items()}
 

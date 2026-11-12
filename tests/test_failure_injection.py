@@ -172,6 +172,7 @@ def test_14_failed_exit_then_failed_restores_escalate():
     pm.sweep = lambda: sweeps.append(c.t) or real_sweep()
     m = em.ExitManager(b, al, "s", protection=pm, clock=c, market_open=lambda: True)
     pm.hold_off = m.holds_protection
+    pm.exit_owns = m.owns_recovery
     b.replace_behaviour = ["reject", "reject"] * 3
     b.submit_behaviour = ["reject"] * 3
     m.request("AAPL", "x")
@@ -342,6 +343,7 @@ def _pair():
     pm = ProtectionManager(b, RISK, "s", al, clock=c)
     xm = em.ExitManager(b, al, "s", protection=pm, clock=c, market_open=lambda: True)
     pm.hold_off = xm.holds_protection
+    pm.exit_owns = xm.owns_recovery
     return b, c, al, pm, xm
 
 
@@ -372,7 +374,9 @@ def test_remaining_shares_are_protected_when_the_exit_covers_fewer_than_held():
     x["status"] = "canceled"                # ...and the rest of the X is cancelled
     b.held_for_orders = 0.0
     c.t += 61
-    pm.sweep()
+    pm.sweep()                              # exit still owns the position: nothing competing
+    assert not [x for x in b.calls if x[0] == "oco"]
+    xm.step("AAPL")                         # exit sees its sell is gone -> hands back to protection
     ocos = [x for x in b.calls if x[0] == "oco"]
     assert ocos and ocos[0][2] == 6.0        # the confirmed remainder, not the original 10
     invariants(b)

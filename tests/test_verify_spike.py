@@ -130,3 +130,20 @@ def test_oco_body_matches_what_protection_sends():
     assert body["order_class"] == "oco" and body["type"] == "limit" and body["side"] == "sell"
     assert body["take_profit"] == {"limit_price": "50.6"} and body["stop_loss"] == {"stop_price": "41.4"}
     assert body["client_order_id"].startswith("spike-") and body["time_in_force"] == "gtc"
+
+
+def test_orphan_and_partial_tests_refuse_unless_the_symbol_is_clean(monkeypatch):
+    monkeypatch.setattr(sp.time, "sleep", lambda s: None)
+    api = FakeApi(orders=[{"id": "x", "symbol": "VZ", "status": "held", "client_order_id": "m"}], pos=0.0)
+    sp.RESULTS.clear()
+    sp.orphan_test(api, api)
+    sp.partial_recovery_test(api, api, qty=20, tries=1)
+    assert [r["check"] for r in sp.RESULTS] == ["refused", "refused"]
+    assert not [c for c in api.calls if c[0] in ("POST", "DELETE")]
+
+
+def test_emergency_check_closes_a_short():
+    api = FakeApi(orders=[{"id": "s", "symbol": "VZ", "status": "held", "client_order_id": "x"}], pos=-1.0)
+    sp.RESULTS.clear()
+    assert sp._emergency_check(api, "test") is True
+    assert ("DELETE", "/v2/positions/VZ") in api.calls and ("DELETE", "/v2/orders/s") in api.calls
