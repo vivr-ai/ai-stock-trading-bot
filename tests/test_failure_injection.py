@@ -387,3 +387,22 @@ def test_stuck_exit_never_leaves_a_position_unprotected_beyond_the_cap():
     c.t += 90                               # past the cancel window
     pm.sweep()
     assert [x for x in b.calls if x[0] == "oco"]
+
+
+def test_db_outage_recorder_only_leaves_the_lease_working():
+    import psycopg2
+
+    f = FaultInjector("db_outage_recorder:1-3", allow=True)
+    rec = SimpleNamespace(_psycopg2=psycopg2)
+    store = SimpleNamespace(_pg=psycopg2)
+    proxy = f.wrap_db(recorder=rec, lease_store=store, clock=lambda: 0.0)
+    assert rec._psycopg2 is proxy and store._pg is psycopg2      # lease untouched
+
+
+def test_alert_sends_are_logged_for_evidence(caplog):
+    from bot.reliability.alerts import AlertDeduper
+
+    a = AlertDeduper(lambda t, s: None)
+    with caplog.at_level("WARNING"):
+        a.raise_("lease_unverified", "TRADING LEASE CANNOT BE CONFIRMED", "critical")
+    assert any("ALERT_SENT [critical] TRADING LEASE" in r.message for r in caplog.records)

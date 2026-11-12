@@ -22,6 +22,13 @@ Faults
                             trading lease) fails with OperationalError from
                             <start_min> to <end_min> minutes after start-up.
                             The DB outage drill, with no Railway changes.
+  db_outage_recorder:<start_min>-<end_min>
+                            as db_outage, but ONLY the bot's recorder loses
+                            the DB (the trading lease keeps working), so the
+                            DB health gate, entry blocking and the local
+                            journal + replay are exercised (12 Nov drill: with
+                            the lease down too, D8 paused the whole cycle
+                            before the gate ran, so those weren't reached).
 """
 from __future__ import annotations
 
@@ -34,7 +41,7 @@ from ..trading.alpaca_client import OrderOutcomeUnknown, OrderRejected
 logger = logging.getLogger(__name__)
 
 KNOWN = {"replace_reject", "replace_drop_response", "sell_reject", "sell_drop_response", "sell_lost",
-         "restore_reject", "read_errors", "kill_at", "db_outage"}
+         "restore_reject", "read_errors", "kill_at", "db_outage", "db_outage_recorder"}
 
 
 class FaultInjector:
@@ -46,13 +53,15 @@ class FaultInjector:
         self.counts: Dict[str, int] = {}
         self.kill_states = set()
         self.db_window = None
+        self.db_recorder_only = False
         for part in filter(None, (p.strip() for p in (spec or "").split(","))):
             name, _, arg = part.partition(":")
             if name not in KNOWN:
                 raise ValueError(f"unknown fault {name!r}; known: {sorted(KNOWN)}")
             if name == "kill_at":
                 self.kill_states.add(arg)
-            elif name == "db_outage":
+            elif name in ("db_outage", "db_outage_recorder"):
+                self.db_recorder_only = name == "db_outage_recorder"
                 a, _, b = arg.partition("-")
                 self.db_window = (float(a) * 60.0, float(b) * 60.0)
                 if not 0 <= self.db_window[0] < self.db_window[1] <= 180 * 60:
@@ -173,7 +182,7 @@ def _wrap_db(self, recorder=None, lease_store=None, clock=None):
     proxy = _PgProxy(_pg, self, clock)
     if recorder is not None and getattr(recorder, "_psycopg2", None) is not None:
         recorder._psycopg2 = proxy
-    if lease_store is not None and hasattr(lease_store, "_pg"):
+    if lease_store is not None and hasattr(lease_store, "_pg") and not self.db_recorder_only:
         lease_store._pg = proxy
     a, b = self.db_window
     logger.warning("STAGING_FAULTS db_outage: DB connections will fail from +%.0f to +%.0f min", a / 60, b / 60)

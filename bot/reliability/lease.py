@@ -229,7 +229,13 @@ class InstanceLease:
             except LeaseStoreError as exc:
                 a = self.age() or 0.0
                 self.last_reason = f"lease renewal failing for {a:.0f}s: {exc}"
-                logger.warning("Lease renewal failed (%.0fs since last confirmation): %s", a, exc)
+                # DB outage drill 12 Nov: two callers (renew thread + the
+                # protection hook) logged this ~4 times a minute for 45 min.
+                # Log the first failure, then at most once a minute.
+                now_m = self.mono()
+                if now_m - getattr(self, "_last_fail_log", -1e9) >= 60.0:
+                    self._last_fail_log = now_m
+                    logger.warning("Lease renewal failed (%.0fs since last confirmation): %s", a, exc)
                 if a >= self.max_age_s:
                     self.alerts.raise_("lease_unverified",
                                        "TRADING LEASE CANNOT BE CONFIRMED (database unreachable). All "
@@ -248,6 +254,7 @@ class InstanceLease:
                 logger.warning("Lease renewed after a %.0fs gap; re-reconciling before trading.", before)
             elif self.state == HELD:
                 self.last_reason = "held"
+            self._last_fail_log = -1e9
             self.alerts.resolve("lease_unverified", "Trading lease confirmed again.")
 
     def _lose(self, why: str) -> None:

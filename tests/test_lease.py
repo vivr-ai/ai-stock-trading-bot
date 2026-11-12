@@ -6,6 +6,7 @@ Scenario tests use an in-memory store with the same semantics as the SQL
 can be simulated deterministically. tests/test_lease_pg.py runs the real SQL.
 """
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -288,3 +289,27 @@ def test_run_cycle_on_standby_touches_nothing():
     s.lease = type("L", (), {"ensure_ready": lambda self: (False, "standby: another instance")})()
     s.run_cycle()
     assert s.last_cycle_outcome == "standby"
+
+
+def test_renewal_failure_logged_at_most_once_a_minute(caplog):
+    """DB outage drill 12 Nov: ~4 warnings a minute for 45 minutes."""
+    from bot.reliability.lease import LeaseStoreError
+
+    class Down:
+        def renew(self, *a):
+            raise LeaseStoreError("db down")
+
+    t = {"m": 0.0}
+    lease = InstanceLease.__new__(InstanceLease)
+    from bot.reliability import lease as L
+    import threading
+    lease.store, lease.name, lease.holder, lease.epoch, lease.ttl_s = Down(), "n", "h", 1, 90
+    lease.state, lease.max_age_s, lease.last_ok = L.HELD, 60, 0.0
+    lease.mono = lambda: t["m"]
+    lease.alerts = SimpleNamespace(raise_=lambda *a, **k: None, resolve=lambda *a, **k: None)
+    lease._lock = threading.RLock()
+    with caplog.at_level("WARNING"):
+        for i in range(12):                     # 12 renew attempts over 2 minutes
+            t["m"] = 10.0 * i
+            lease.renew()
+    assert sum("Lease renewal failed" in r.message for r in caplog.records) == 2

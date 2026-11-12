@@ -104,6 +104,9 @@ class AlertDeduper:
     def _safe_send(self, text: str, severity: str) -> bool:
         try:
             self._send_raw(text, severity)
+            # Evidence trail (DB outage drill 12 Nov: sends were not logged,
+            # so delivery couldn't be shown from the logs).
+            logger.warning("ALERT_SENT [%s] %s", severity, text[:160])
             return True
         except Exception as exc:  # noqa: BLE001
             logger.error("Alert could not be sent (%s): %s", exc, text)
