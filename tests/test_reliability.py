@@ -389,3 +389,12 @@ def test_reconcile_second_look_finds_hidden_stop():
     b.symbol_orders_snapshot = lambda s: BrokerSnapshot(True, [], "")
     ok, summary = make_reconciler(_ReconRecorder(rows=("VZ",)), b, None)()
     assert "UNPROTECTED (adoption will re-protect): VZ" in summary
+
+
+def test_gate_alert_sends_are_logged_for_evidence(caplog):
+    """Recorder-only drill 13 Nov: gate alerts go straight to Telegram, so the
+    critical 'database unreachable' alert left no ALERT_SENT log line."""
+    gate, rec, alerts, clock, calls = _gate(ok=False)
+    with caplog.at_level("WARNING"):
+        gate.check()
+    assert any("ALERT_SENT [critical] DATABASE UNREACHABLE" in r.message for r in caplog.records)

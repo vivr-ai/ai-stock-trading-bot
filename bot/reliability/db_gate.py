@@ -140,5 +140,8 @@ class DbHealthGate:
     def _send(self, text: str, severity: str) -> None:
         try:
             self.alert(text, severity)
+            # Evidence trail (recorder-only drill 13 Nov: the gate sends straight
+            # to Telegram, so its critical alert left no ALERT_SENT line).
+            logger.warning("ALERT_SENT [%s] %s", severity, text.replace("\n", " ")[:160])
         except Exception as exc:  # noqa: BLE001 - alerting must never break a cycle
             logger.error("DB health alert could not be sent: %s", exc)
