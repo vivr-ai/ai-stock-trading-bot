@@ -10,7 +10,7 @@ Flow
   1. Right after a buy is accepted, `resolve_entry_fill` looks the order up
      (GET only, a few times over at most `timeout_s`). Paper market orders
      normally finish in well under a second.
-  2. Final status (filled / canceled / expired / rejected / done_for_day):
+  2. Final status (filled / canceled / expired / rejected):
      the row is written with the broker's numbers, `fill_confirmed=TRUE` and
      the decision-time price kept separately in `requested_price`.
   3. Not final yet (still new / partially filled) or the lookup failed: the
@@ -31,7 +31,10 @@ from typing import Callable, Optional
 logger = logging.getLogger(__name__)
 
 # Statuses after which Alpaca will not add more fills to the order.
-FINAL_STATUSES = frozenset({"filled", "canceled", "cancelled", "expired", "rejected", "done_for_day"})
+# "done_for_day" is deliberately NOT final: the entry is a GTC order, and
+# Alpaca says such an order can resume and fill further on the next trading
+# day, so it stays provisional until it really ends.
+FINAL_STATUSES = frozenset({"filled", "canceled", "cancelled", "expired", "rejected"})
 
 
 def _status(order: dict) -> str:

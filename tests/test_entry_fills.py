@@ -333,3 +333,28 @@ def test_correction_sql_is_insert_only_and_idempotent(pg_url):  # noqa: F811
         got = [tuple(x.values()) for x in cur.fetchall()]
         assert got == [("trades.price", "51.54", "51.53"), ("closed_trades.pnl", "-0.06", "-0.05")]
         assert (m._checksum(cur, "trades"), m._checksum(cur, "closed_trades")) == before
+
+
+# ---- review 19 Nov: terminal partial outcomes, GTC done_for_day, restart ----------------------
+def test_partially_filled_then_expired_keeps_broker_aggregate():
+    b = PartialFillBroker([(7, 20.00), (5, 20.24)], final_status="expired")
+    f = resolve(b, req_price=19.9, req_qty=20)
+    assert f.confirmed and f.status == "expired"
+    assert f.qty == 12 and f.price == pytest.approx((7 * 20.00 + 5 * 20.24) / 12)
+
+
+def test_done_for_day_is_not_final_for_a_gtc_entry():
+    f = fl.fill_from_order({"status": "done_for_day", "filled_qty": "5", "filled_avg_price": "10.00"}, 9.9, 10)
+    assert not f.confirmed and f.price == 9.9 and f.qty == 10       # stays provisional; sync finishes it
+
+
+def test_sync_after_restart_with_lost_open_lot_creates_no_lot(tmp_path):
+    b = PartialFillBroker([(30, 100.42)])
+    s, rec = fake_strategy(tmp_path, b)
+    s.state = BotState(str(tmp_path / "fresh.json"))               # restart: local state gone
+    confirmed = []
+    s.recorder.pending_entry_fills = lambda: [{"order_id": "o1", "symbol": "AAPL", "requested_price": 100.0, "qty": 30}]
+    s.recorder.confirm_entry_fill = lambda **k: confirmed.append(k)
+    SentimentStrategy._sync_pending_entry_fills(s)
+    assert len(confirmed) == 1 and confirmed[0]["price"] == pytest.approx(100.42)
+    assert s.state.peek_open("AAPL") is None and rec.trades == []  # no lot invented, no new trade row
