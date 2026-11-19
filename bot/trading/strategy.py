@@ -69,6 +69,7 @@ from typing import Optional, Set
 
 from ..sentiment.base import SentimentResult
 from ..universe.static_universe import sector_of
+from .fills import fill_from_order, resolve_entry_fill
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,10 @@ class _NullRecorder:
 
 
 class SentimentStrategy:
+    # DQ3: how long a live buy waits for Alpaca to report its final fill before
+    # the row is written as provisional (completed by a later cycle).
+    ENTRY_FILL_WAIT_S = 10.0
+
     def __init__(self, cfg, broker, universe, news, analyzer, risk,
                  trade_logger, summary_logger, state, closed_trade_logger=None,
                  recorder=None, version_provider=None, bot_control_provider=None,
@@ -247,6 +252,7 @@ class SentimentStrategy:
                 protection.sweep()
             except Exception as exc:  # noqa: BLE001 - blocker below fails closed
                 logger.error("Protection sweep failed: %s", exc)
+        self._sync_pending_entry_fills()
         self._adopt_legacy_positions()
 
         exited = self.state.detect_exits(list(open_positions.keys()))
@@ -1965,6 +1971,9 @@ class SentimentStrategy:
             reason = (f"score {sentiment.score:.1f} >= {self.cfg.strategy.buy_threshold}, "
                       f"{sentiment.article_count} headlines")
         tagged_reason = f"[{entry_path}] {reason}"
+        # Simulated (dry-run) entries keep the planned figures; a live entry
+        # replaces them with the broker's fill below (DQ3).
+        entry_price, entry_qty = plan.price, plan.qty
 
         if self.cfg.risk.dry_run:
             logger.info("[DRY RUN] would BUY %d %s @ ~%.2f (stop %.2f / tp %.2f) via %s",
@@ -2018,41 +2027,61 @@ class SentimentStrategy:
                     message=str(exc),
                 )
                 return exposure
-            logger.info("Submitted BUY %s: order %s status %s via %s",
-                        symbol, order.order_id, order.status, entry_path,
+            # DQ3: record what Alpaca actually executed (filled_avg_price,
+            # filled_qty), never the decision-time quote. Provisional if the
+            # order hasn't finished yet; _sync_pending_entry_fills completes it.
+            fill = resolve_entry_fill(self.broker, order.order_id, plan.price, plan.qty,
+                                      timeout_s=self.ENTRY_FILL_WAIT_S)
+            logger.info("Submitted BUY %s: order %s status %s via %s; %s %g @ %.4f "
+                        "(requested %g @ %.2f)",
+                        symbol, order.order_id, fill.status, entry_path,
+                        "filled" if fill.confirmed else "provisional", fill.qty, fill.price,
+                        plan.qty, plan.price,
                         extra={"symbol": symbol, "decision": "buy", "dry_run": False,
-                               "qty": plan.qty, "price": plan.price, "notional": plan.notional,
-                               "order_id": order.order_id, "status": order.status,
+                               "qty": fill.qty, "price": fill.price, "notional": fill.notional,
+                               "requested_price": plan.price, "fill_confirmed": fill.confirmed,
+                               "order_id": order.order_id, "status": fill.status,
                                "entry_path": entry_path})
-            self.trade_logger.log("buy", symbol, plan.qty, plan.price, plan.notional,
+            self.trade_logger.log("buy", symbol, fill.qty, fill.price, fill.notional,
                                   sentiment, plan.stop_price, plan.take_profit_price,
                                   tagged_reason, dry_run=False, order_id=order.order_id,
-                                  status=order.status, entry_path=entry_path)
+                                  status=fill.status, entry_path=entry_path)
             self.recorder.record_trade(
-                action="buy", symbol=symbol, qty=plan.qty, price=plan.price, notional=plan.notional,
+                action="buy", symbol=symbol, qty=fill.qty, price=fill.price, notional=fill.notional,
                 sentiment=sentiment, stop_price=plan.stop_price, take_profit=plan.take_profit_price,
                 reason=tagged_reason, rationale=sentiment.rationale, dry_run=False,
-                order_id=order.order_id, status=order.status,
+                order_id=order.order_id, status=fill.status,
                 sector=sector_of(symbol), market_regime=market_regime, entry_path=entry_path,
                 strategy_version=self.version_provider.current_version(),
+                requested_price=plan.price, fill_confirmed=fill.confirmed,
             )
             self.recorder.record_decision(
                 symbol=symbol, decision="buy", reason=tagged_reason, sentiment_score=sentiment.score,
                 sentiment_label=sentiment.label, headline_count=sentiment.article_count,
                 rationale=sentiment.rationale, price=plan.price,
-                extra={"dry_run": False, "order_id": order.order_id, "status": order.status},
+                extra={"dry_run": False, "order_id": order.order_id, "status": fill.status,
+                       "fill_price": fill.price, "fill_qty": fill.qty,
+                       "fill_confirmed": fill.confirmed},
                 entry_path=entry_path,
             )
             self.recorder.record_notification(
                 type_="trade_executed", title=f"BUY {symbol}",
-                message=f"{plan.qty} shares @ ~{plan.price:.2f} ({tagged_reason})",
+                message=(f"{fill.qty:g} shares @ {fill.price:.2f} ({tagged_reason})" if fill.confirmed
+                         else f"{plan.qty} shares @ ~{plan.price:.2f}, fill pending ({tagged_reason})"),
             )
+            if not fill.filled:
+                # Final with nothing filled (rejected/canceled before any
+                # fill): nothing is held, so no open lot or peak/checkpoint.
+                logger.warning("BUY %s order %s ended %s with no shares filled.",
+                               symbol, order.order_id, fill.status)
+                return exposure
+            entry_price, entry_qty = fill.price, fill.qty
 
         # Remember what we paid (real or simulated) so the performance report
         # can compute P/L whenever this position eventually closes. Also keep
         # the reason/confidence and entry_path so the dashboard can show why
         # we bought it, and so the exit logic above knows which rule to use.
-        self.state.record_open(symbol, plan.price, plan.qty, reason=tagged_reason,
+        self.state.record_open(symbol, entry_price, entry_qty, reason=tagged_reason,
                                sentiment_score=sentiment.score, sentiment_label=sentiment.label,
                                rationale=sentiment.rationale, sector=sector_of(symbol),
                                market_regime=market_regime,
@@ -2065,18 +2094,53 @@ class SentimentStrategy:
         # stop sell moments after this fresh entry. Harmless no-op when
         # risk.trailing_stop_enabled is off - _maybe_trailing_stop_exit
         # never reads this table in that case.
-        self.recorder.reset_position_peak(symbol, plan.price)
-        self.__dict__.setdefault("_mem_peaks", {})[symbol] = plan.price
+        self.recorder.reset_position_peak(symbol, entry_price)
+        self.__dict__.setdefault("_mem_peaks", {})[symbol] = entry_price
         # Same hard-reset logic, for the momentum-exit stagnation gate's
         # checkpoint (see _momentum_time_exit_reason): a fresh entry must
         # start its own clean checkpoint, never inherit a stale one left
         # over from this symbol's prior holding period.
-        self.recorder.reset_stagnation_checkpoint(symbol, plan.price)
+        self.recorder.reset_stagnation_checkpoint(symbol, entry_price)
 
         open_positions[symbol] = plan.qty
         sector_counts[sector_of(symbol)] += 1
         stats.buys += 1
         return exposure + plan.notional
+
+    def _sync_pending_entry_fills(self) -> None:
+        """DQ3: complete provisional buy rows once Alpaca reports the order's
+        final fill. GET-only on the broker side; on the ledger side it only
+        touches rows still marked provisional (fill_confirmed = FALSE), so a
+        confirmed fill price is never replaced by a requested one."""
+        if self.cfg.risk.dry_run:
+            return
+        lister = getattr(self.recorder, "pending_entry_fills", None)
+        reader = getattr(self.broker, "order_snapshot", None)
+        if lister is None or reader is None:
+            return
+        pending = lister()
+        for row in pending or ():
+            oid, sym = row.get("order_id"), row.get("symbol")
+            req = float(row.get("requested_price") or 0.0)
+            q = float(row.get("qty") or 0.0)
+            try:
+                snap = reader(oid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Pending fill check for %s (%s) failed: %s", sym, oid, exc)
+                continue
+            if not getattr(snap, "ok", False) or not snap.data:
+                continue
+            f = fill_from_order(snap.data, req, q)
+            if not f.confirmed:
+                continue
+            self.recorder.confirm_entry_fill(order_id=oid, price=f.price, qty=f.qty, status=f.status)
+            if f.qty > 0:
+                self.state.update_open_fill(sym, f.price, f.qty)
+            else:
+                self.state.pop_open(sym)
+            logger.warning("Entry fill confirmed for %s (order %s): %g @ %.4f, status %s "
+                           "(provisional row was %g @ %.2f)", sym, oid, f.qty, f.price, f.status, q, req,
+                           extra={"symbol": sym, "decision": "entry_fill_confirmed", "order_id": oid})
 
     def _record_managed_exit(self, symbol: str, reason: str, fill: Optional[dict]) -> None:
         """Ledger for an exit the Stage 6b manager completed, priced from the

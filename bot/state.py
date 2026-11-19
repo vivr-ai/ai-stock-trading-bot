@@ -120,6 +120,15 @@ class BotState:
         }
         self._save()
 
+    def update_open_fill(self, symbol: str, entry_price: float, qty: float) -> None:
+        """DQ3: put the broker's confirmed fill into an existing open lot
+        (everything else in the lot is kept). No lot, no change."""
+        lot = self._data["open_lots"].get(symbol)
+        if lot is None:
+            return
+        lot["entry_price"], lot["qty"] = entry_price, qty
+        self._save()
+
     def pop_open(self, symbol: str) -> Optional[Dict]:
         """Remove and return the open-lot record for symbol, if any."""
         lot = self._data["open_lots"].pop(symbol, None)

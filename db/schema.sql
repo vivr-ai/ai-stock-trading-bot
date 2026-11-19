@@ -131,6 +131,12 @@ ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry_path TEXT;
 -- Added so strategy_version survives a Railway redeploy wiping bot/state.py's
 -- local JSON - see trades.strategy_version above.
 ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy_version TEXT;
+-- DQ3 (19 Nov): live buy rows record Alpaca's filled_avg_price/filled_qty.
+-- requested_price = the decision-time price; fill_confirmed = TRUE once the
+-- broker's final fill is in price/qty, FALSE while provisional, NULL for
+-- older rows and for rows that are not live buys (left untouched).
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS requested_price NUMERIC;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS fill_confirmed BOOLEAN;
 
 -- ---------------------------------------------------------------------
 -- closed_trades: one row per completed round-trip (mirrors closed_trades.csv)

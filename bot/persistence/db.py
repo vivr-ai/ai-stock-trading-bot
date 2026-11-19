@@ -390,20 +390,28 @@ class Recorder:
                       dry_run: bool, order_id: str, status: str,
                       sector: Optional[str] = None, market_regime: Optional[str] = None,
                       entry_path: Optional[str] = None,
-                      strategy_version: Optional[str] = None) -> None:
+                      strategy_version: Optional[str] = None,
+                      requested_price: Optional[float] = None,
+                      fill_confirmed: Optional[bool] = None) -> None:
+        """One row per order. For a live buy (DQ3, 19 Nov): `price`/`qty` are
+        Alpaca's filled_avg_price/filled_qty when `fill_confirmed` is True;
+        when it is False the row is provisional (requested figures) and is
+        completed once by confirm_entry_fill. `requested_price` keeps the
+        decision-time price. Both None for every other kind of row."""
         self._execute(
             """
             INSERT INTO trades
                 (action, symbol, qty, price, notional, stop_price, take_profit,
                  sentiment_score, sentiment_label, headline_count, positive_headlines,
                  negative_headlines, reason, rationale, dry_run, order_id, status,
-                 sector, market_regime, entry_path, strategy_version)
+                 sector, market_regime, entry_path, strategy_version,
+                 requested_price, fill_confirmed)
             VALUES
                 (%(action)s, %(symbol)s, %(qty)s, %(price)s, %(notional)s, %(stop_price)s,
                  %(take_profit)s, %(sentiment_score)s, %(sentiment_label)s, %(headline_count)s,
                  %(positive_headlines)s, %(negative_headlines)s, %(reason)s, %(rationale)s,
                  %(dry_run)s, %(order_id)s, %(status)s, %(sector)s, %(market_regime)s, %(entry_path)s,
-                 %(strategy_version)s)
+                 %(strategy_version)s, %(requested_price)s, %(fill_confirmed)s)
             """,
             dict(action=action, symbol=symbol, qty=qty, price=price, notional=notional,
                  stop_price=stop_price, take_profit=take_profit,
@@ -414,9 +422,58 @@ class Recorder:
                  negative_headlines=getattr(sentiment, "negative_count", None),
                  reason=reason, rationale=rationale, dry_run=dry_run, order_id=order_id,
                  status=status, sector=sector, market_regime=market_regime, entry_path=entry_path,
-                 strategy_version=strategy_version),
+                 strategy_version=strategy_version, requested_price=requested_price,
+                 fill_confirmed=fill_confirmed),
             critical=True,
         )
+
+    def confirm_entry_fill(self, *, order_id: str, price: float, qty: float, status: str) -> None:
+        """Complete a PROVISIONAL buy row with the broker's final fill (DQ3).
+        Touches only the row for this order that is still fill_confirmed =
+        FALSE: a confirmed row, a legacy row (NULL) and every other trade are
+        left exactly as they are, so it can run any number of times."""
+        self._execute(
+            """
+            UPDATE trades
+               SET price = %(price)s, qty = %(qty)s, notional = %(price)s * %(qty)s,
+                   status = %(status)s, fill_confirmed = TRUE
+             WHERE order_id = %(order_id)s AND action = 'buy' AND fill_confirmed IS FALSE
+            """,
+            dict(order_id=order_id, price=price, qty=qty, status=status),
+            critical=True,
+        )
+
+    def pending_entry_fills(self) -> Optional[list]:
+        """Provisional live buy rows still waiting for the broker's final fill:
+        [{order_id, symbol, requested_price, qty, ts}], or None if unreadable."""
+        if not self.enabled:
+            return []
+        try:
+            conn = self._psycopg2.connect(self.database_url, connect_timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Pending-fill lookup skipped (DB connect failed): %s", exc)
+            return None
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT order_id, symbol, requested_price, qty, ts FROM trades
+                         WHERE action = 'buy' AND fill_confirmed IS FALSE
+                           AND dry_run IS NOT TRUE AND order_id IS NOT NULL AND order_id <> ''
+                         ORDER BY ts
+                        """
+                    )
+                    cols = [d[0] for d in cur.description]
+                    return [_row_to_dict(cols, r) for r in cur.fetchall()]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Pending-fill lookup failed: %s", exc)
+            return None
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def record_closed_trade(self, *, symbol: str, qty: float, entry_price: float, exit_price: float,
                              pnl: float, pnl_pct: float, exit_reason: str,

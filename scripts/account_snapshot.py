@@ -81,7 +81,8 @@ def main() -> int:
             import psycopg2
 
             with psycopg2.connect(env["DATABASE_URL"], connect_timeout=10) as c, c.cursor() as cur:
-                cur.execute("SELECT ts, action, qty, price, order_id, status, entry_path, reason FROM trades "
+                cur.execute("SELECT ts, action, qty, price, order_id, status, entry_path, reason, "
+                            "requested_price, fill_confirmed FROM trades "
                             "WHERE symbol=%s AND ts >= COALESCE(%s::timestamptz, '-infinity') ORDER BY ts",
                             (sym, since))
                 report["db_trades"] = [list(map(str, r)) for r in cur.fetchall()]

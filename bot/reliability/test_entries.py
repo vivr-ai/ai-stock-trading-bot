@@ -37,6 +37,7 @@ import time
 from typing import Callable, Optional
 
 from ..trading.alpaca_client import WORKING_STATUSES, OrderOutcomeUnknown, OrderRejected
+from ..trading.fills import resolve_entry_fill
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +53,11 @@ class TestEntryRefused(RuntimeError):
 
 class TestEntryRunner:
     __test__ = False      # not a pytest test class
+    FILL_WAIT_S = 10.0    # DQ3: wait this long for the broker's final fill
     def __init__(self, broker, strategy, *, env: dict, state_dir: str, account_verified: bool,
                  universe, protection, lease_ok: Callable[[], bool], journal=None,
-                 market_open: Optional[Callable[[], bool]] = None, clock: Callable[[], float] = time.time):
+                 market_open: Optional[Callable[[], bool]] = None, clock: Callable[[], float] = time.time,
+                 sleep: Callable[[float], None] = time.sleep):
         if (env.get("BOT_ENVIRONMENT") or "").lower() != "staging":
             raise TestEntryRefused("test entries exist only when BOT_ENVIRONMENT=staging")
         if not account_verified:
@@ -69,6 +72,7 @@ class TestEntryRunner:
         self.journal = journal or (lambda kind, payload: None)
         self.market_open = market_open or (lambda: bool(getattr(broker, "is_market_open", lambda: False)()))
         self.clock = clock
+        self.sleep = sleep
         self.state_dir = state_dir
         os.makedirs(state_dir, exist_ok=True)
         self.state_path = os.path.join(state_dir, "test_entries.json")
@@ -195,11 +199,19 @@ class TestEntryRunner:
                 self.state["active"] = None
             self._save()
             return "entry failed"
+        # DQ3: the ledger gets Alpaca's actual fill (filled_avg_price /
+        # filled_qty), not the ask used for the price check.
+        fill = resolve_entry_fill(self.broker, order.order_id, req["ask"], QTY,
+                                  timeout_s=self.FILL_WAIT_S, sleep=self.sleep)
+        self._event("test_entry_fill", request=req["id"], symbol=req["symbol"], order_id=order.order_id,
+                    requested_price=req["ask"], fill_price=fill.price, fill_qty=fill.qty,
+                    status=fill.status, confirmed=fill.confirmed)
         self.strategy.recorder.record_trade(
-            action="buy", symbol=req["symbol"], qty=QTY, price=req["ask"], notional=req["ask"] * QTY,
+            action="buy", symbol=req["symbol"], qty=fill.qty, price=fill.price, notional=fill.notional,
             sentiment=None, stop_price=stop, take_profit=tp, reason=f"TEST entry {req['id']}",
             rationale="staging test entry (exit-system validation)", dry_run=False,
-            order_id=order.order_id, status=order.status, sector="TEST", entry_path="TEST")
+            order_id=order.order_id, status=fill.status, sector="TEST", entry_path="TEST",
+            requested_price=req["ask"], fill_confirmed=fill.confirmed)
         self.state["active"]["phase"] = "awaiting_protection"
         self._save()
         return "entered"

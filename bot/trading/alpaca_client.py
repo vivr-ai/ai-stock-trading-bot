@@ -923,6 +923,16 @@ class AlpacaBroker:
             return None
         return {r.get("symbol") for r in rows if r.get("symbol")}
 
+    def order_snapshot(self, order_id: str) -> "BrokerSnapshot":
+        """One order by Alpaca id (GET only): ok=True + the order dict, or
+        ok=False if it couldn't be read. Used to record a buy's actual fill
+        (status, filled_qty, filled_avg_price) - see bot/trading/fills.py."""
+        try:
+            row = self._raw("GET", f"/orders/{order_id}")
+            return BrokerSnapshot(True, row, "")
+        except Exception as exc:  # noqa: BLE001
+            return BrokerSnapshot(False, None, str(exc))
+
     def order_by_client_id(self, client_order_id: str) -> "BrokerSnapshot":
         """ok=True + data=order dict (found), ok=True + data=None (Alpaca says
         404 not found), ok=False (couldn't tell)."""
