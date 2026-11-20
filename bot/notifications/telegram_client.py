@@ -14,6 +14,7 @@ Design goals, matching the rest of the codebase's reliability posture:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
 
 logger = logging.getLogger("bot.notifications.telegram")
@@ -21,6 +22,22 @@ logger = logging.getLogger("bot.notifications.telegram")
 TELEGRAM_API_BASE = "https://api.telegram.org"
 # Telegram message cap is 4096 UTF-16 code units; stay comfortably under it.
 MAX_MESSAGE_LEN = 3800
+
+# The bot token is part of the API URL (/bot<token>/sendMessage), and
+# `requests` puts that URL into its exception text. Anything we log about a
+# send must go through redact() so the token never reaches the logs.
+_TOKEN_IN_URL = re.compile(r"/bot[^/\s'\"]+")
+_TOKEN_SHAPE = re.compile(r"\b\d{5,}:[A-Za-z0-9_-]{20,}\b")
+
+
+def redact(text, token: str = "") -> str:
+    """Remove a Telegram bot token from `text`: the exact token if known,
+    any /bot<...> URL segment, and anything shaped like a token."""
+    out = str(text)
+    if token:
+        out = out.replace(token, "<redacted>")
+    out = _TOKEN_IN_URL.sub("/bot<redacted>", out)
+    return _TOKEN_SHAPE.sub("<redacted>", out)
 
 
 class TelegramNotifier:
@@ -71,15 +88,16 @@ class TelegramNotifier:
                     return True
                 logger.warning(
                     "Telegram send failed (attempt %d/%d): HTTP %d %s",
-                    attempt, self.attempts, resp.status_code, resp.text[:300],
+                    attempt, self.attempts, resp.status_code,
+                    redact(resp.text[:300], self.bot_token),
                 )
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 logger.warning("Telegram send error (attempt %d/%d): %s",
-                                attempt, self.attempts, exc)
+                                attempt, self.attempts, redact(exc, self.bot_token))
         if last_exc:
             logger.warning("Telegram notification dropped after %d attempts: %s",
-                            self.attempts, last_exc)
+                            self.attempts, redact(last_exc, self.bot_token))
         return False
 
     def test(self) -> bool:
