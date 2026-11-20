@@ -313,6 +313,14 @@ class FillInfo:
     filled_at: Optional[str]
 
 
+def most_recent_bars(series, n: int):
+    """The newest `n` bars, oldest-to-newest, whatever order they arrived in."""
+    if not series:
+        return series
+    ordered = sorted(series, key=lambda b: b.timestamp)
+    return ordered[-n:] if n and n > 0 else ordered
+
+
 class AlpacaBroker:
     """`mode` picks which Alpaca account this connects to ("paper" -> Alpaca's
     paper endpoint; "dry_run"/"live" -> the real live endpoint, since dry-run
@@ -586,14 +594,22 @@ class AlpacaBroker:
             # instead of "unavailable". Pinning both to IEX keeps the
             # comparison apples-to-apples on the feed this account actually
             # has real-time access to.
+            # No `limit` on the request (21 Nov finding): with `start` set,
+            # Alpaca returns bars OLDEST-first and `limit` keeps the first N
+            # from `start`, so the newest bar was days old - verified on
+            # staging: limit=22 ended on 10 Nov when asked on 20 Nov, and
+            # limit=52 ended on 5 Nov. That made prev_close, change_pct, the
+            # SMAs and the volume average all stale. Fetch the whole window
+            # (a few dozen daily bars) and keep the most recent `limit`.
             bars_resp = self._retry(
                 lambda: self._data.get_stock_bars(
                     StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day,
-                                      start=start, limit=limit, feed=DataFeed.IEX)
+                                      start=start, feed=DataFeed.IEX)
                 ),
                 f"get_stock_bars({symbol})",
             )
             series = bars_resp.data.get(symbol) if hasattr(bars_resp, "data") else bars_resp[symbol]
+            series = most_recent_bars(series, limit)
         except Exception as exc:  # noqa: BLE001
             logger.warning("market_snapshot bars failed for %s: %s", symbol, exc)
             return MarketSnapshot(symbol, last, None, None, None, None, None, None)
