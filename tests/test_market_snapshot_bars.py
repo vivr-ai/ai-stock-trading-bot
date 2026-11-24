@@ -8,11 +8,22 @@ from types import SimpleNamespace
 
 import pytest
 
+import bot.trading.alpaca_client as ac
 from bot.trading.alpaca_client import AlpacaBroker, most_recent_bars
+
+# Fixed clock (Mon 23 Nov 2026, 17:00 UTC = 12:00 New York): with the
+# same-day-bar filter these tests would otherwise depend on the time of day
+# (between 00:00 and 05:00 UTC "yesterday in UTC" is still today in New York).
+NOW = datetime(2026, 11, 23, 17, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _fixed_clock(monkeypatch):
+    monkeypatch.setattr(ac, "_utcnow", lambda: NOW)
 
 
 def _bars(n_days=40):
-    today = datetime.now(timezone.utc).replace(hour=5, minute=0, second=0, microsecond=0)
+    today = NOW.replace(hour=5, minute=0, second=0, microsecond=0)
     out = []
     for i in range(n_days, 0, -1):                        # oldest first, ending yesterday
         d = today - timedelta(days=i)

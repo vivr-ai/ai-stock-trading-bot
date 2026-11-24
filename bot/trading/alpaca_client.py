@@ -313,6 +313,75 @@ class FillInfo:
     filled_at: Optional[str]
 
 
+def _utcnow() -> datetime:
+    """The current time (UTC). A function so tests can fix the clock."""
+    return datetime.now(timezone.utc)
+
+
+def _bar_session_date(bar, tz) -> date:
+    ts = bar.timestamp
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(tz).date()
+
+
+def completed_daily_bars(series, session_tz: str = "America/New_York", now: Optional[datetime] = None):
+    """Drop any daily bar dated on or after the CURRENT session date.
+
+    23 Nov 2026 finding: during an open session Alpaca's daily-bars endpoint
+    includes the still-forming bar for today, updated every minute. Kept, it
+    became `prev_close` (so change_pct was about 0 and the daily-drop filter
+    could never fire) and it leaked a partial day into the SMAs and the
+    volume average. The session date is taken in `session_tz` (New York),
+    never UTC or the operator's local date: Alpaca stamps daily bars at
+    00:00 New York time, and a UTC/Brisbane date would be a day ahead in the
+    New York evening. Consequence: from 16:00 to 24:00 New York time today's
+    (complete) bar is also excluded; the bot does not trade then.
+    """
+    if not series:
+        return series
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(session_tz)
+    today = (now or _utcnow()).astimezone(tz).date()
+    return [b for b in series if _bar_session_date(b, tz) < today]
+
+
+_DAILY_BARS_LOGGED: Set[tuple] = set()
+
+
+def _log_daily_bars_once(symbol: str, limit: int, session_tz: str, raw, used, snap_values: dict) -> None:
+    """Evidence line for the same-day-bar fix: at most twice per symbol/window
+    per New York session (once without and once with a forming bar dropped),
+    so market-hours behaviour can be verified from logs without a restart.
+    Logging only - never affects the calculation."""
+    try:
+        import json
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(session_tz)
+        session = _utcnow().astimezone(tz).date()
+        used_ids = {id(b) for b in (used or [])}
+        dropped = [b for b in (raw or []) if _bar_session_date(b, tz) >= session]
+        key = (symbol, limit, session, bool(dropped))
+        if key in _DAILY_BARS_LOGGED:
+            return
+        if any(k[2] != session for k in _DAILY_BARS_LOGGED):
+            _DAILY_BARS_LOGGED.clear()
+        _DAILY_BARS_LOGGED.add(key)
+        row = lambda b: [str(_bar_session_date(b, tz)), float(b.close), float(b.volume)]
+        ordered = sorted(raw or [], key=lambda b: b.timestamp)
+        logger.info("DAILY_BARS %s", json.dumps({
+            "symbol": symbol, "limit": limit, "ny_session_date": str(session),
+            "checked_at_utc": _utcnow().isoformat(timespec="seconds"),
+            "raw_n": len(ordered), "raw_newest": row(ordered[-1]) if ordered else None,
+            "dropped_on_or_after_session": [row(b) for b in dropped],
+            "used_n": len(used or []),
+            "used": [row(b) for b in ordered if id(b) in used_ids],
+            **snap_values,
+        }))
+    except Exception:  # noqa: BLE001 - evidence logging must never break trading
+        logger.debug("DAILY_BARS logging failed for %s", symbol, exc_info=True)
+
+
 def most_recent_bars(series, n: int):
     """The newest `n` bars, oldest-to-newest, whatever order they arrived in."""
     if not series:
@@ -537,8 +606,8 @@ class AlpacaBroker:
         change_pct is measured from the PREVIOUS DAY'S CLOSE, not today's
         open, so it captures overnight gaps — exactly the move that news
         creates. SMA/avg-volume are computed over COMPLETED prior days
-        (get_stock_bars with TimeFrame.Day never returns an in-progress
-        "today" bar, confirmed empirically - see today_volume below).
+        (get_stock_bars with TimeFrame.Day DOES include today's forming bar
+        mid-session; completed_daily_bars() removes it - see below).
         today's volume-so-far comes from a separate Snapshot call, so we're
         comparing it against a clean historical baseline instead of leaking
         a same-day bar into its own average.
@@ -580,7 +649,7 @@ class AlpacaBroker:
         # fail-closing on every single cycle (confirmed via the diagnostic
         # logging this replaced - see git history). ~1.6x calendar-day buffer
         # covers weekends; +5 extra days covers typical holiday clusters.
-        start = datetime.now(timezone.utc) - timedelta(days=int(limit * 1.6) + 5)
+        start = _utcnow() - timedelta(days=int(limit * 1.6) + 5)
         try:
             # feed=IEX pinned explicitly on BOTH this call and the snapshot
             # call below. Without it, get_stock_bars silently returns
@@ -609,7 +678,10 @@ class AlpacaBroker:
                 f"get_stock_bars({symbol})",
             )
             series = bars_resp.data.get(symbol) if hasattr(bars_resp, "data") else bars_resp[symbol]
-            series = most_recent_bars(series, limit)
+            # Completed sessions only (23 Nov finding, see completed_daily_bars):
+            # mid-session the response also contains today's forming bar.
+            raw_series = series
+            series = most_recent_bars(completed_daily_bars(series, session_tz), limit)
         except Exception as exc:  # noqa: BLE001
             logger.warning("market_snapshot bars failed for %s: %s", symbol, exc)
             return MarketSnapshot(symbol, last, None, None, None, None, None, None)
@@ -619,14 +691,12 @@ class AlpacaBroker:
                            "returned no bars for this symbol.", symbol, start.date(), limit)
             return MarketSnapshot(symbol, last, None, None, None, None, None, None)
 
-        # get_stock_bars(TimeFrame.Day) only ever returns COMPLETED trading
-        # days - Alpaca does not backfill an in-progress "today" bar into
-        # this endpoint, even mid-session (confirmed empirically: checking
-        # the last bar's date against today never matched, at any hour,
-        # across multiple trading days - that dead branch used to live
-        # here and silently left today_volume=None on every single call,
-        # which permanently fail-closed the volume-confirmation gate below
-        # for every symbol, every day). So every bar in `series` is history.
+        # Earlier versions said get_stock_bars(TimeFrame.Day) never returns an
+        # in-progress "today" bar. That was only ever observed with the old
+        # start+limit request, whose newest bar was days old. On 23 Nov 2026
+        # (staging, live session) the 50-day SMA moved with the price during
+        # the day, which only a forming bar can cause. completed_daily_bars()
+        # above removes it, so every bar in `series` is a completed session.
         history = series
 
         if len(history) < sma_period:
@@ -673,6 +743,14 @@ class AlpacaBroker:
         if len(history) >= 1:
             window = history[-volume_lookback_days:]
             avg_volume = sum(float(b.volume) for b in window) / len(window)
+
+        _log_daily_bars_once(symbol, limit, session_tz, raw_series, history, {
+            "sma_period": sma_period, "volume_lookback_days": volume_lookback_days,
+            "last": last, "prev_close": prev_close,
+            "change_pct": None if change_pct is None else round(change_pct, 4),
+            "sma": None if sma is None else round(sma, 4),
+            "avg_volume": None if avg_volume is None else round(avg_volume, 1),
+        })
 
         trend_sma = None
         if trend_sma_period and len(history) >= 1:
