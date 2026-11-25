@@ -301,6 +301,11 @@ class MarketSnapshot:
     # None otherwise (existing callers that don't ask for them are unaffected). ---
     trend_sma: Optional[float] = None   # long-horizon (e.g. 200-day) SMA of close, for the uptrend filter
     rsi: Optional[float] = None         # short-period (e.g. 2-day) Wilder RSI, intraday-updated via `last`
+    # Number of COMPLETED daily bars behind sma / avg_volume / trend_sma / rsi
+    # (Limitation 14). 0 when no bars came back; None only from callers or
+    # fakes that build a snapshot without it. Entry paths compare it with the
+    # lookback they need and block when it is short (fail-closed).
+    history_n: Optional[int] = None
 
 
 @dataclass
@@ -684,12 +689,12 @@ class AlpacaBroker:
             series = most_recent_bars(completed_daily_bars(series, session_tz), limit)
         except Exception as exc:  # noqa: BLE001
             logger.warning("market_snapshot bars failed for %s: %s", symbol, exc)
-            return MarketSnapshot(symbol, last, None, None, None, None, None, None)
+            return MarketSnapshot(symbol, last, None, None, None, None, None, None, history_n=0)
 
         if not series:
             logger.warning("market_snapshot: get_stock_bars(%s, start=%s, limit=%d) "
                            "returned no bars for this symbol.", symbol, start.date(), limit)
-            return MarketSnapshot(symbol, last, None, None, None, None, None, None)
+            return MarketSnapshot(symbol, last, None, None, None, None, None, None, history_n=0)
 
         # Earlier versions said get_stock_bars(TimeFrame.Day) never returns an
         # in-progress "today" bar. That was only ever observed with the old
@@ -783,7 +788,7 @@ class AlpacaBroker:
             symbol=symbol, last=last, prev_close=prev_close, change_pct=change_pct,
             sma=sma, avg_volume=avg_volume, today_volume=today_volume, volume_ratio=volume_ratio,
             expected_volume_so_far=expected_volume_so_far,
-            trend_sma=trend_sma, rsi=rsi,
+            trend_sma=trend_sma, rsi=rsi, history_n=len(history),
         )
 
     def max_high_since(self, symbol: str, since: datetime) -> Optional[float]:

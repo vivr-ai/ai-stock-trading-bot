@@ -61,6 +61,7 @@ Sell rule:
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -70,6 +71,23 @@ from typing import Optional, Set
 from ..sentiment.base import SentimentResult
 from ..universe.static_universe import sector_of
 from .fills import fill_from_order, resolve_entry_fill
+
+
+def _valid_number(x) -> bool:
+    """True for a usable market-data value: a real, finite number. 0 and 0.0
+    are valid (a flat day, no volume yet); None, NaN, +/-inf and non-numbers
+    are not. Limitation 14: missing or invalid inputs must block an entry,
+    never silently skip the check that needs them."""
+    return (isinstance(x, (int, float)) and not isinstance(x, bool)
+            and math.isfinite(x))
+
+
+def _short_history(snap, needed: int) -> bool:
+    """True when the snapshot says it was built from fewer completed daily
+    bars than `needed`. A snapshot without a count (history_n None, e.g. a
+    test fake) is not judged here; its missing values are caught elsewhere."""
+    n = getattr(snap, "history_n", None)
+    return n is not None and needed > 0 and n < needed
 
 logger = logging.getLogger(__name__)
 
@@ -355,10 +373,61 @@ class SentimentStrategy:
                                               reason=str(why)[:120])
         self._alert_entry_blocks(active_blocks)
 
+        new_entries_allowed = self._apply_market_filters(new_entries_allowed, cached_spy_snap)
+
+        # Current sector concentration, so we don't pile into one correlated group.
+        sector_counts = Counter(sector_of(s) for s in open_positions)
+
+        symbols = self.universe.get_universe(self.cfg.universe.top_n)
+        stats = CycleStats()
+
+        for symbol in symbols:
+            try:
+                exposure = self._process_symbol(
+                    symbol, acct, exposure, open_positions, pending,
+                    sector_counts, new_entries_allowed, stats, market_regime,
+                )
+            except Exception as exc:  # noqa: BLE001 - isolate per-symbol failures
+                logger.exception("Error processing %s: %s", symbol, exc,
+                                 extra={"symbol": symbol, "decision": "error"})
+
+        self._maybe_notify_shadow_verdict_ready()
+
+        self.summary_logger.log_cycle(
+            portfolio_value=acct["portfolio_value"],
+            open_positions=len(open_positions),
+            exposure=exposure,
+            stats=stats,
+        )
+        self.last_cycle_outcome = "ok"
+
+    def _apply_market_filters(self, new_entries_allowed: bool, cached_spy_snap) -> bool:
+        """SPY daily-drop and regime filters for NEW entries only (exits and
+        broker protection are never gated here). Returns whether new entries
+        stay allowed. Missing, invalid or short-history inputs block
+        (Limitation 14, fail-closed). Moved out of run_cycle unchanged apart
+        from those checks, so it can be tested directly."""
         # Market filter 1: if the broad market is down hard today, don't open longs.
         if new_entries_allowed and self.cfg.strategy.market_filter_max_drop_pct > 0:
             mkt = self.broker.market_change_pct(self.cfg.strategy.market_filter_symbol)
-            if mkt is not None and mkt <= -self.cfg.strategy.market_filter_max_drop_pct:
+            if not _valid_number(mkt):
+                # Limitation 14: no usable daily change for the market proxy
+                # means the daily-drop check cannot be evaluated - block all
+                # new entries instead of skipping it. Exits are unaffected.
+                logger.warning(
+                    "Market filter: %s daily change unavailable or invalid (%r); "
+                    "pausing new entries (fail-closed).",
+                    self.cfg.strategy.market_filter_symbol, mkt,
+                    extra={"decision": "block_new_entries", "reason": "market_change_unavailable",
+                           "symbol": self.cfg.strategy.market_filter_symbol},
+                )
+                self.recorder.record_decision(
+                    symbol=self.cfg.strategy.market_filter_symbol, decision="block_new_entries",
+                    reason="market_change_unavailable",
+                )
+                new_entries_allowed = False
+                self._entry_block_reason = self._entry_block_reason or "market_change_unavailable"
+            elif mkt <= -self.cfg.strategy.market_filter_max_drop_pct:
                 logger.warning(
                     "Market filter: %s down %.2f%% today; pausing new entries.",
                     self.cfg.strategy.market_filter_symbol, mkt,
@@ -380,7 +449,26 @@ class SentimentStrategy:
             # this cycle (same symbol/sma_period/volume_lookback_days) rather
             # than hitting the API again for the same data.
             spy_snap = cached_spy_snap
-            if spy_snap is None or spy_snap.sma is None:
+            if spy_snap is not None and _short_history(spy_snap, self.cfg.strategy.market_regime_ma_period):
+                # Limitation 14: an SMA over fewer completed sessions than the
+                # regime period is not the regime SMA - block, don't trust it.
+                logger.warning(
+                    "Market regime filter: %s has only %s completed daily bar(s) for its "
+                    "%d-day SMA; pausing new entries (fail-closed).",
+                    self.cfg.strategy.market_filter_symbol, spy_snap.history_n,
+                    self.cfg.strategy.market_regime_ma_period,
+                    extra={"decision": "block_new_entries", "reason": "regime_history_insufficient",
+                           "symbol": self.cfg.strategy.market_filter_symbol,
+                           "history_n": spy_snap.history_n},
+                )
+                self.recorder.record_decision(
+                    symbol=self.cfg.strategy.market_filter_symbol, decision="block_new_entries",
+                    reason="regime_history_insufficient",
+                )
+                new_entries_allowed = False
+                self._entry_block_reason = self._entry_block_reason or "regime_history_insufficient"
+            elif (spy_snap is None or not _valid_number(spy_snap.sma) or spy_snap.sma <= 0
+                    or not _valid_number(spy_snap.last) or spy_snap.last <= 0):
                 logger.warning(
                     "Market regime filter: could not read %s's %d-day SMA; "
                     "pausing new entries (fail-closed).",
@@ -409,32 +497,7 @@ class SentimentStrategy:
                 )
                 new_entries_allowed = False
                 self._entry_block_reason = self._entry_block_reason or "below_market_regime_sma"
-
-        # Current sector concentration, so we don't pile into one correlated group.
-        sector_counts = Counter(sector_of(s) for s in open_positions)
-
-        symbols = self.universe.get_universe(self.cfg.universe.top_n)
-        stats = CycleStats()
-
-        for symbol in symbols:
-            try:
-                exposure = self._process_symbol(
-                    symbol, acct, exposure, open_positions, pending,
-                    sector_counts, new_entries_allowed, stats, market_regime,
-                )
-            except Exception as exc:  # noqa: BLE001 - isolate per-symbol failures
-                logger.exception("Error processing %s: %s", symbol, exc,
-                                 extra={"symbol": symbol, "decision": "error"})
-
-        self._maybe_notify_shadow_verdict_ready()
-
-        self.summary_logger.log_cycle(
-            portfolio_value=acct["portfolio_value"],
-            open_positions=len(open_positions),
-            exposure=exposure,
-            stats=stats,
-        )
-        self.last_cycle_outcome = "ok"
+        return new_entries_allowed
 
     def _alert_entry_blocks(self, active: dict) -> None:
         """Safety-gate entry blocks (lease, protection status): alert at once
@@ -1260,7 +1323,20 @@ class SentimentStrategy:
         cfg = self.cfg.strategy
 
         runup = snap.change_pct
-        if runup is not None and runup > cfg.max_intraday_runup_pct:
+        if not _valid_number(runup) or not _valid_number(snap.last) or snap.last <= 0:
+            # Limitation 14: the run-up guard cannot be evaluated without a
+            # usable daily change - block this symbol instead of skipping it.
+            logger.info("BUY %s (momentum) skipped: daily change unavailable or invalid "
+                        "(change %r, price %r; fail-closed)", symbol, runup, snap.last,
+                        extra={"symbol": symbol, "decision": "buy_skipped",
+                               "reason": "change_unavailable"})
+            self.recorder.record_decision(symbol=symbol, decision="buy_skipped",
+                                          reason="change_unavailable",
+                                          sentiment_score=sentiment.score,
+                                          sentiment_label=sentiment.label,
+                                          entry_path="sentiment_momentum")
+            return None
+        if runup > cfg.max_intraday_runup_pct:
             logger.info("BUY %s (momentum) skipped: already up %.1f%% since prev close (> %.1f%%); "
                         "news likely priced in", symbol, runup, cfg.max_intraday_runup_pct,
                         extra={"symbol": symbol, "decision": "buy_skipped",
@@ -1271,7 +1347,19 @@ class SentimentStrategy:
             return None
 
         if cfg.require_price_above_sma:
-            if snap.sma is None:
+            if _short_history(snap, cfg.sma_period):
+                logger.info("BUY %s (momentum) skipped: only %s completed daily bar(s) for the "
+                            "%d-day SMA (fail-closed)", symbol, snap.history_n, cfg.sma_period,
+                            extra={"symbol": symbol, "decision": "buy_skipped",
+                                   "reason": "sma_history_insufficient",
+                                   "history_n": snap.history_n})
+                self.recorder.record_decision(symbol=symbol, decision="buy_skipped",
+                                              reason="sma_history_insufficient",
+                                              sentiment_score=sentiment.score,
+                                              sentiment_label=sentiment.label,
+                                              entry_path="sentiment_momentum")
+                return None
+            if not _valid_number(snap.sma) or snap.sma <= 0:
                 logger.info("BUY %s (momentum) skipped: %d-day SMA unavailable (fail-closed)",
                             symbol, cfg.sma_period,
                             extra={"symbol": symbol, "decision": "buy_skipped",
@@ -1301,8 +1389,24 @@ class SentimentStrategy:
         )
         if cfg.min_volume_ratio <= 0:
             volume_component = 1.0  # gate disabled
-        elif snap.volume_ratio is None:
-            volume_component = 0.0  # unconfirmable -> no credit (fail-closed, same spirit as before)
+        elif (_short_history(snap, cfg.volume_lookback_days)
+              or not _valid_number(snap.volume_ratio) or snap.volume_ratio < 0):
+            # Limitation 14: "no credit" was not fail-closed - with the default
+            # weights sentiment + headlines alone can reach the buy score, so a
+            # missing volume input could still let an entry through. Missing,
+            # invalid or short-history volume now blocks the symbol. A valid
+            # ratio of 0 (no volume yet) still just earns no credit.
+            reason = ("volume_history_insufficient" if _short_history(snap, cfg.volume_lookback_days)
+                      else "volume_unavailable")
+            logger.info("BUY %s (momentum) skipped: volume input unusable (%s; ratio %r, "
+                        "history %s bar(s); fail-closed)", symbol, reason, snap.volume_ratio,
+                        getattr(snap, "history_n", None),
+                        extra={"symbol": symbol, "decision": "buy_skipped", "reason": reason})
+            self.recorder.record_decision(symbol=symbol, decision="buy_skipped", reason=reason,
+                                          sentiment_score=sentiment.score,
+                                          sentiment_label=sentiment.label,
+                                          entry_path="sentiment_momentum")
+            return None
         else:
             volume_component = min(snap.volume_ratio / cfg.min_volume_ratio, 1.0)
 
@@ -1348,7 +1452,15 @@ class SentimentStrategy:
         oversold and are worth recording when they block an entry)."""
         cfg = self.cfg.strategy
 
-        if snap.trend_sma is None:
+        needed = max(cfg.reversion_trend_sma_period or 0, (cfg.rsi_period or 0) + 1)
+        if _short_history(snap, needed):
+            logger.info("BUY %s (reversion) skipped: only %s completed daily bar(s); %d needed "
+                        "(fail-closed)", symbol, snap.history_n, needed,
+                        extra={"symbol": symbol, "decision": "reversion_skipped",
+                               "reason": "history_insufficient", "history_n": snap.history_n})
+            return None
+        if (not _valid_number(snap.trend_sma) or snap.trend_sma <= 0
+                or not _valid_number(snap.last) or snap.last <= 0):
             logger.info("BUY %s (reversion) skipped: %d-day trend SMA unavailable (fail-closed)",
                         symbol, cfg.reversion_trend_sma_period,
                         extra={"symbol": symbol, "decision": "reversion_skipped",
@@ -1356,7 +1468,7 @@ class SentimentStrategy:
             return None
         if snap.last <= snap.trend_sma:
             return None  # not in a long-term uptrend - routine, not worth logging every cycle
-        if snap.rsi is None:
+        if not _valid_number(snap.rsi):
             logger.info("BUY %s (reversion) skipped: %d-period RSI unavailable (fail-closed)",
                         symbol, cfg.rsi_period,
                         extra={"symbol": symbol, "decision": "reversion_skipped",
@@ -1366,7 +1478,7 @@ class SentimentStrategy:
             return None  # not oversold - no signal, routine
 
         if cfg.reversion_min_volume_ratio > 0 and (
-            snap.volume_ratio is None or snap.volume_ratio < cfg.reversion_min_volume_ratio
+            not _valid_number(snap.volume_ratio) or snap.volume_ratio < cfg.reversion_min_volume_ratio
         ):
             volume_txt = f"{snap.volume_ratio:.2f}x" if snap.volume_ratio is not None else "unavailable"
             logger.info(
